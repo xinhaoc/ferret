@@ -21,9 +21,15 @@ Module growth plan:
 from __future__ import annotations
 
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from .task_spec import parse_kernel_output
+from .task_spec import (
+    TaskSpec,
+    compute_score,
+    parse_kernel_output,
+    should_advance_stage,
+)
 
 
 def get_best_results(workspace_path: str | Path) -> dict[str, float]:
@@ -73,14 +79,74 @@ def get_best_results(workspace_path: str | Path) -> dict[str, float]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Standalone CLI for testing — `python3 -m ferret.state /path/to/workspace`
+# RunState — a snapshot of "where are we right now"
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class RunState:
+    """Snapshot of the agent's current progress against a spec.
+
+    Every field is computed together from the same (workspace, spec) pair, so a
+    caller that holds a RunState can trust all fields are consistent with each
+    other (unlike reading them one-by-one with separate calls where the best
+    kernel could change between calls).
+    """
+    stage: str                                       # "REPRODUCE" or "OPTIMIZE"
+    score: float                                     # aggregate per spec.scoring
+    results: dict[str, float] = field(default_factory=dict)  # {"Q1": 31.1, ...}
+    ratios: dict[str, float] = field(default_factory=dict)   # {"Q1": 0.907, ...}
+    worst_config: str = ""                           # config name with lowest ratio
+    has_any_kernel: bool = False                     # False on a fresh workspace
+
+
+def compute_state(workspace_path: str | Path, spec: TaskSpec) -> RunState:
+    """Build a RunState by combining git-tagged results with a task spec.
+
+    Flow:
+      1. Read the latest tag's per-config TFLOPS (get_best_results)
+      2. Compute per-config ratios + aggregate score per spec.scoring
+      3. Decide REPRODUCE/OPTIMIZE via spec.stage_gate
+      4. Identify the bottleneck config (lowest ratio)
+
+    Fresh workspace with no tags → stage=REPRODUCE, score=0, everything empty.
+    This is the signal to _first_turn that the agent is starting from scratch.
+    """
+    results = get_best_results(workspace_path)
+
+    if not results:
+        return RunState(
+            stage="REPRODUCE",
+            score=0.0,
+            has_any_kernel=False,
+        )
+
+    score, ratios = compute_score(results, spec)
+    advance = should_advance_stage(score, ratios, spec)
+    worst = min(ratios, key=ratios.get) if ratios else ""
+
+    return RunState(
+        stage="OPTIMIZE" if advance else "REPRODUCE",
+        score=score,
+        results=results,
+        ratios=ratios,
+        worst_config=worst,
+        has_any_kernel=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Standalone CLI for testing — `python3 -m ferret.state /path/to/workspace [task.yaml]`
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def _main() -> int:
     import sys
     if len(sys.argv) < 2:
-        print("usage: python3 -m ferret.state /path/to/workspace", file=sys.stderr)
+        print(
+            "usage: python3 -m ferret.state /path/to/workspace [task.yaml]",
+            file=sys.stderr,
+        )
         return 2
     ws = sys.argv[1]
     if not Path(ws).exists():
@@ -90,14 +156,43 @@ def _main() -> int:
         print(f"ERROR: no .git in workspace: {ws}", file=sys.stderr)
         return 1
 
+    # Always show the raw results first
     results = get_best_results(ws)
     if not results:
         print(f"no tagged improvements in {ws}")
         return 0
-
     print(f"latest tag's per-config TFLOPS:")
     for k, v in results.items():
         print(f"  {k}: {v}")
+
+    # If a task.yaml was provided, also show the full RunState
+    if len(sys.argv) >= 3:
+        from .task_spec import load_task_spec
+
+        spec_path = sys.argv[2]
+        if not Path(spec_path).exists():
+            print(f"ERROR: task spec not found: {spec_path}", file=sys.stderr)
+            return 1
+        spec = load_task_spec(spec_path)
+        state = compute_state(ws, spec)
+
+        print()
+        print(f"RunState vs {spec.name}:")
+        print(f"  stage           : {state.stage}")
+        print(f"  score           : {state.score:.3f} (via {spec.scoring})")
+        print(f"  worst_config    : {state.worst_config or '(none)'}")
+        print(f"  has_any_kernel  : {state.has_any_kernel}")
+        print(f"  per-config ratios (vs spec baselines):")
+        for cfg in spec.configs:
+            tflops = state.results.get(cfg.name, 0.0)
+            ratio = state.ratios.get(cfg.name, 0.0)
+            marker = " ✓" if ratio >= cfg.target_ratio else (
+                "  ← WORST" if cfg.name == state.worst_config else ""
+            )
+            print(
+                f"    {cfg.name}: {tflops:6.1f} / {cfg.baseline_tflops:6.1f} "
+                f"= {ratio*100:5.1f}% (target {cfg.target_ratio*100:.0f}%){marker}"
+            )
     return 0
 
 

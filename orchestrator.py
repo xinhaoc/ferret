@@ -109,9 +109,24 @@ class CudaOrchestratorV2:
         self._log_step_fn = _log_step
         self.main_agent.step_callback = _log_step
 
-        # Baseline config (from CLI args)
+        # Baseline config (from CLI args — legacy, will be removed in step 7
+        # when main.py takes task.yaml as the sole source of truth)
         self._baseline_source = baseline_source
         self._baseline_tflops = baseline_tflops
+
+        # Structured task spec — loaded if workspace/task.yaml is present.
+        # None in legacy mode. Not yet consumed by any other code path;
+        # steps 5/6 will wire it into prompt rendering, step 7 will make it
+        # the sole source (dropping --baseline-* CLI args).
+        self.spec = None
+        task_yaml = ws_path / "task.yaml"
+        if task_yaml.exists():
+            from .task_spec import load_task_spec
+            self.spec = load_task_spec(task_yaml)
+            logger.info(
+                f"Loaded task spec: {self.spec.name} "
+                f"({len(self.spec.configs)} configs, scoring={self.spec.scoring})"
+            )
 
         # State
         self.consecutive_failures = 0

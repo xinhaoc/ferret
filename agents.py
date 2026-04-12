@@ -18,7 +18,8 @@ from .tools.profiler import extract_kernel_names
 def create_optimizer(
     client,
     model_name: str,
-    workspace,
+    workspace_path: Path,
+    kernel_path: Path,
     doc_loader,
     compiler,
     tester,
@@ -27,19 +28,18 @@ def create_optimizer(
     kernel_read_flag: dict,
 ) -> ReActAgent:
     """Create the main optimizer agent with all tools."""
-    ws = workspace
     doc = doc_loader
     sh = sh_fn
 
     _kernel_cache = {"content": None}
 
     async def _read_kernel_from_disk() -> str:
-        content = ws.current_kernel
+        content = kernel_path.read_text() if kernel_path.exists() else ""
         _kernel_cache["content"] = content
         return content
 
     async def _write_kernel_to_disk(code: str) -> None:
-        ws.save_kernel(code)
+        kernel_path.write_text(code)
         _kernel_cache["content"] = code
 
     # -- Tools --
@@ -79,7 +79,7 @@ def create_optimizer(
         content = await _read_kernel_from_disk()
         return content or "No kernel.cu found."
 
-    ws_abs = str(workspace.path.resolve())
+    ws_abs = str(workspace_path.resolve())
 
     async def run_ncu(kernel_name: str = "") -> str:
         """Run full ncu profiling on current compiled kernel binary."""

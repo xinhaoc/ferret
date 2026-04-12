@@ -21,7 +21,6 @@ from pathlib import Path
 
 import yaml
 
-from .workspace import Workspace
 from .cost_tracker import CostTracker
 from .state import RunState, compute_state
 from .tools.compiler import Compiler
@@ -57,14 +56,11 @@ class CudaOrchestratorV2:
         stall_threshold: int = 4,
         log_dir: str | Path | None = None,
     ):
-        # Minimal workspace — just ensure the directory exists.
-        # Don't use Workspace() constructor which creates lineage/ and attempts/ (V1 leftovers).
-        ws_path = Path(workspace_path)
-        ws_path.mkdir(parents=True, exist_ok=True)
-
-        # Still use Workspace for spec/notes/kernel path helpers
-        self.workspace = Workspace.__new__(Workspace)
-        self.workspace.path = ws_path
+        # Workspace paths — plain Path attributes, no class wrapper.
+        # (v3 used Workspace.__new__ to bypass V1's lineage/attempts dirs.)
+        self.workspace_path = Path(workspace_path)
+        self.workspace_path.mkdir(parents=True, exist_ok=True)
+        self.kernel_path = self.workspace_path / "kernel.cu"
         self.agent_root = Path(agent_root)
         self.sh = sh_fn
         self.arch = arch
@@ -74,8 +70,8 @@ class CudaOrchestratorV2:
         self._model_name = model_name
 
         # Infrastructure
-        self.doc_loader = DocLoader(self.agent_root, workspace_path=self.workspace.path)
-        ws_abs = str(self.workspace.path.resolve())
+        self.doc_loader = DocLoader(self.agent_root, workspace_path=self.workspace_path)
+        ws_abs = str(self.workspace_path.resolve())
         self.compiler = Compiler(sh_fn, arch=arch, agent_root=str(self.agent_root), cwd=ws_abs)
         gpu_prefix = f"eval $({self.agent_root}/pick_gpu.sh) && " if (self.agent_root / "pick_gpu.sh").exists() else ""
         self.tester = Tester(sh_fn, gpu_prefix=gpu_prefix, cwd=ws_abs)
@@ -140,7 +136,8 @@ class CudaOrchestratorV2:
         from .agents import create_optimizer
         return create_optimizer(
             self._client, self._model_name,
-            self.workspace, self.doc_loader, self.compiler, self.tester,
+            self.workspace_path, self.kernel_path,
+            self.doc_loader, self.compiler, self.tester,
             self.sh, self.agent_root, self._kernel_read_flag,
         )
 
@@ -148,7 +145,7 @@ class CudaOrchestratorV2:
 
     async def _get_best_tflops(self) -> float:
         """Get best TFLOPS from git tags. Parses commit messages for TFLOPS: lines."""
-        ws_abs = str(self.workspace.path.resolve())
+        ws_abs = str(self.workspace_path.resolve())
         stdout, _, code = await self.sh(f"cd {ws_abs} && git tag 2>/dev/null")
         if code != 0 or not stdout.strip():
             return 0.0
@@ -181,7 +178,7 @@ class CudaOrchestratorV2:
 
     def _get_baseline_tflops(self) -> float:
         """Read baseline TFLOPS from workspace/.baseline_tflops (written by agent)."""
-        f = self.workspace.path / ".baseline_tflops"
+        f = self.workspace_path / ".baseline_tflops"
         if f.exists():
             try:
                 return float(f.read_text().strip())
@@ -205,12 +202,12 @@ class CudaOrchestratorV2:
         logger.info(f"Starting CUDA optimization: {task}")
         start = time.time()
 
-        has_kernel = self.workspace.kernel_path.exists()
+        has_kernel = self.kernel_path.exists()
 
         if self.spec is not None:
             # Structured mode — describe state via compute_state (not the
             # misleading single-float max). Shows per-config picture at startup.
-            state = compute_state(self.workspace.path, self.spec)
+            state = compute_state(self.workspace_path, self.spec)
             if state.has_any_kernel:
                 ratios_str = ", ".join(
                     f"{k}={v*100:.0f}%" for k, v in state.ratios.items()
@@ -269,9 +266,9 @@ class CudaOrchestratorV2:
             if result.goal_reached:
                 logger.info(f"GOAL REACHED!")
                 break
-            if (self.workspace.path / "STOP").exists():
+            if (self.workspace_path / "STOP").exists():
                 logger.info("STOP file detected.")
-                (self.workspace.path / "STOP").unlink()
+                (self.workspace_path / "STOP").unlink()
                 break
 
             if result.improved:
@@ -311,7 +308,7 @@ class CudaOrchestratorV2:
 
     async def _read_git_history(self, max_chars: int = 4000) -> str:
         """Return commit subject+body dump from workspace/.git, truncated."""
-        ws_abs = str(self.workspace.path.resolve())
+        ws_abs = str(self.workspace_path.resolve())
         out, _, _ = await self.sh(
             f"cd {ws_abs} && git log --format='%s%n%b' 2>/dev/null"
         )
@@ -324,17 +321,15 @@ class CudaOrchestratorV2:
         per-config header + constraints + hints + (optional) git history.
         Legacy mode: unchanged from v3 — two templates switched on has_kernel.
         """
-        ws = self.workspace
-
         # Machine environment (both modes)
-        env_file = ws.path.parent / "env.md"
+        env_file = self.workspace_path.parent / "env.md"
         env_section = ""
         if env_file.exists():
             env_section = f"\n## Machine Environment\n{env_file.read_text()[:2000]}\n"
 
         if self.spec is not None:
             # Structured path — single template, spec-driven
-            state = compute_state(ws.path, self.spec)
+            state = compute_state(self.workspace_path, self.spec)
             git_history = await self._read_git_history()
             shapes_block = yaml.dump(self.spec.shapes, default_flow_style=False).rstrip()
 
@@ -399,7 +394,7 @@ class CudaOrchestratorV2:
             best = await self._get_best_tflops()
 
             if has_kernel:
-                ws_abs = str(ws.path.resolve())
+                ws_abs = str(self.workspace_path.resolve())
                 git_log_out, _, _ = await self.sh(f"cd {ws_abs} && git log --format='%s%n%b' 2>/dev/null")
                 git_history = git_log_out[:4000] if git_log_out else "No git history yet."
 
@@ -408,13 +403,17 @@ class CudaOrchestratorV2:
 
                 task_section = f"## Task\n{task}\n\n" if task and not task.startswith("Resume from") else ""
 
+                # Inline spec.yaml read (v3's Workspace.spec property)
+                spec_yaml_file = self.workspace_path / "spec.yaml"
+                legacy_spec = spec_yaml_file.read_text() if spec_yaml_file.exists() else ""
+
                 prompt = (
                     f"## Resuming\n\n"
                     f"**Stage: {stage}**"
                     f"{' — your best is < 90% of baseline, focus on reproducing baseline architecture' if stage == 'REPRODUCE' else ''}\n\n"
                     f"{env_section}"
                     f"{task_section}"
-                    f"## Spec\n{ws.spec}\n\n"
+                    f"## Spec\n{legacy_spec}\n\n"
                     f"{baseline_hint}"
                     f"## Git History (what was tried — read carefully before starting)\n{git_history}\n\n"
                     f"Best: {best:.1f} TFLOPS"
@@ -507,7 +506,7 @@ class CudaOrchestratorV2:
         """
         if self.spec is not None:
             # Structured path — use compute_state + per-config rendering
-            state = compute_state(self.workspace.path, self.spec)
+            state = compute_state(self.workspace_path, self.spec)
             header = self._render_state_header(iteration, state)
             constraints = self._render_constraints_block()
 
@@ -591,7 +590,7 @@ class CudaOrchestratorV2:
         the worst-config focus signal. Legacy mode: unchanged from v3.
         """
         if self.spec is not None:
-            state = compute_state(self.workspace.path, self.spec)
+            state = compute_state(self.workspace_path, self.spec)
             stage = state.stage
             constraints = self._render_constraints_block()
             focus = (

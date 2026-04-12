@@ -272,58 +272,148 @@ class CudaOrchestratorV2:
 
     # ── Turns ──
 
-    async def _first_turn(self, task: str, has_kernel: bool):
-        """Single turn to load context. No forced multi-turn sequence."""
-        ws = self.workspace
-        stage = await self._current_stage()
-        baseline = self._get_baseline_tflops()
-        best = await self._get_best_tflops()
+    def _render_hints_block(self) -> str:
+        """Build the '## Hints (read once, then forget)' block.
 
-        # Machine environment
+        Injected into the first-turn prompt only. On subsequent iterations the
+        agent no longer sees these — prevents bias from hints rotting over long
+        sessions. Returns '' if no spec or no hints.
+        """
+        if self.spec is None or not self.spec.hints:
+            return ""
+        lines = ["## Hints (read once, then forget)"]
+        for h in self.spec.hints:
+            lines.append(f"- {h}")
+        return "\n".join(lines) + "\n\n"
+
+    async def _read_git_history(self, max_chars: int = 4000) -> str:
+        """Return commit subject+body dump from workspace/.git, truncated."""
+        ws_abs = str(self.workspace.path.resolve())
+        out, _, _ = await self.sh(
+            f"cd {ws_abs} && git log --format='%s%n%b' 2>/dev/null"
+        )
+        return out[:max_chars] if out else ""
+
+    async def _first_turn(self, task: str, has_kernel: bool):
+        """Single turn to load context. No forced multi-turn sequence.
+
+        Structured mode (self.spec set): builds one template from spec fields +
+        per-config header + constraints + hints + (optional) git history.
+        Legacy mode: unchanged from v3 — two templates switched on has_kernel.
+        """
+        ws = self.workspace
+
+        # Machine environment (both modes)
         env_file = ws.path.parent / "env.md"
         env_section = ""
         if env_file.exists():
             env_section = f"\n## Machine Environment\n{env_file.read_text()[:2000]}\n"
 
-        if has_kernel:
-            # Inject actual git log so agent sees what was tried
-            ws_abs = str(ws.path.resolve())
-            git_log_out, _, _ = await self.sh(f"cd {ws_abs} && git log --format='%s%n%b' 2>/dev/null")
-            git_history = git_log_out[:4000] if git_log_out else "No git history yet."
+        if self.spec is not None:
+            # Structured path — single template, spec-driven
+            from .state import compute_state
+            state = compute_state(ws.path, self.spec)
+            git_history = await self._read_git_history()
 
-            baseline_src = getattr(self, '_baseline_source', '')
-            baseline_hint = f"Baseline source: `{baseline_src}` — you are at {best/baseline*100:.0f}% of baseline, read it to close the gap.\n" if baseline_src and baseline > 0 and stage == "REPRODUCE" else ""
+            import yaml as _yaml
+            shapes_block = _yaml.dump(self.spec.shapes, default_flow_style=False).rstrip()
 
-            # If user provided a task on resume, inject it (overrides default focus)
-            task_section = f"## Task\n{task}\n\n" if task and not task.startswith("Resume from") else ""
+            parts = [
+                f"# Task: {self.spec.name}",
+                f"GPU: {self.spec.gpu} ({self.spec.arch}) | "
+                f"Precision: {self.spec.precision}",
+                "",
+                "## Description",
+                self.spec.description.rstrip(),
+                "",
+                "## Shapes",
+                shapes_block,
+                "",
+                f"## Baseline reference",
+                f"`{self.spec.baseline.source}`",
+                "",
+                env_section.rstrip(),
+                "",
+                self._render_state_header(0, state),
+                "",
+                self._render_constraints_block().rstrip(),
+                "",
+                self._render_hints_block().rstrip(),
+            ]
 
-            prompt = (
-                f"## Resuming\n\n"
-                f"**Stage: {stage}**"
-                f"{' — your best is < 90% of baseline, focus on reproducing baseline architecture' if stage == 'REPRODUCE' else ''}\n\n"
-                f"{env_section}"
-                f"{task_section}"
-                f"## Spec\n{ws.spec}\n\n"
-                f"{baseline_hint}"
-                f"## Git History (what was tried — read carefully before starting)\n{git_history}\n\n"
-                f"Best: {best:.1f} TFLOPS"
-                f"{f' (baseline: {baseline:.1f}, {best/baseline*100:.0f}%)' if baseline > 0 else ''}\n\n"
-                f"Read the git history above. "
-                f"{'Your job is to reproduce the baseline. Try your best to read the baseline source, read the current kernel, find the differences, fix them.' if stage == 'REPRODUCE' else 'Now your job is to go beyond the baseline. Do not just copy the baseline approach — explore different architectures, instruction sets, and techniques. Read workspace/progress.md for previous plans and untried ideas. Read docs and references you have not read before (e.g. docs/patterns/, docs/ptx-isa-9.2/, or other codebases in resources/ like ThunderKittens, DeepGemm, CUTLASS).'}"
-            )
+            if git_history:
+                parts.extend([
+                    "",
+                    "## Git history (what was tried — read carefully before starting)",
+                    git_history.rstrip(),
+                    "",
+                ])
+                if state.stage == "REPRODUCE":
+                    parts.append(
+                        "You are resuming. Read the git history, read the current "
+                        "kernel, find the architectural gap with the baseline "
+                        f"source (`{self.spec.baseline.source}`), and close it."
+                    )
+                else:
+                    parts.append(
+                        "You are resuming in OPTIMIZE. Read workspace/progress.md "
+                        "for plans and untried ideas. Then profile (run_ncu, "
+                        "read_sass) and attack the score bottleneck. Read docs "
+                        "and references you have not read before."
+                    )
+            else:
+                # Fresh workspace, no kernel yet
+                parts.extend([
+                    "",
+                    "New task — no prior kernel. Follow the 'Getting started' "
+                    "steps in your system prompt. Spec is THIS file "
+                    "(workspace/task.yaml) — do not modify it. Save your first "
+                    "correct kernel with git.",
+                ])
+
+            prompt = "\n".join(p for p in parts if p is not None)
         else:
-            # New task
-            prompt = (
-                f"## New Task\n\n{task}\n\n"
-                f"**Stage: REPRODUCE**\n\n"
-                f"{env_section}"
-                f"Follow the 'Getting started' steps in your system prompt:\n"
-                f"1. Read the architecture doc for the target GPU\n"
-                f"2. Measure baselines\n"
-                f"3. Write spec.yaml (see examples/specs/ for format)\n"
-                f"4. Study references and write your first kernel\n\n"
-                f"Work through these steps. Save your first correct kernel with git."
-            )
+            # Legacy path — unchanged from v3 (preserved until step 7)
+            stage = await self._current_stage()
+            baseline = self._get_baseline_tflops()
+            best = await self._get_best_tflops()
+
+            if has_kernel:
+                ws_abs = str(ws.path.resolve())
+                git_log_out, _, _ = await self.sh(f"cd {ws_abs} && git log --format='%s%n%b' 2>/dev/null")
+                git_history = git_log_out[:4000] if git_log_out else "No git history yet."
+
+                baseline_src = getattr(self, '_baseline_source', '')
+                baseline_hint = f"Baseline source: `{baseline_src}` — you are at {best/baseline*100:.0f}% of baseline, read it to close the gap.\n" if baseline_src and baseline > 0 and stage == "REPRODUCE" else ""
+
+                task_section = f"## Task\n{task}\n\n" if task and not task.startswith("Resume from") else ""
+
+                prompt = (
+                    f"## Resuming\n\n"
+                    f"**Stage: {stage}**"
+                    f"{' — your best is < 90% of baseline, focus on reproducing baseline architecture' if stage == 'REPRODUCE' else ''}\n\n"
+                    f"{env_section}"
+                    f"{task_section}"
+                    f"## Spec\n{ws.spec}\n\n"
+                    f"{baseline_hint}"
+                    f"## Git History (what was tried — read carefully before starting)\n{git_history}\n\n"
+                    f"Best: {best:.1f} TFLOPS"
+                    f"{f' (baseline: {baseline:.1f}, {best/baseline*100:.0f}%)' if baseline > 0 else ''}\n\n"
+                    f"Read the git history above. "
+                    f"{'Your job is to reproduce the baseline. Try your best to read the baseline source, read the current kernel, find the differences, fix them.' if stage == 'REPRODUCE' else 'Now your job is to go beyond the baseline. Do not just copy the baseline approach — explore different architectures, instruction sets, and techniques. Read workspace/progress.md for previous plans and untried ideas. Read docs and references you have not read before (e.g. docs/patterns/, docs/ptx-isa-9.2/, or other codebases in resources/ like ThunderKittens, DeepGemm, CUTLASS).'}"
+                )
+            else:
+                prompt = (
+                    f"## New Task\n\n{task}\n\n"
+                    f"**Stage: REPRODUCE**\n\n"
+                    f"{env_section}"
+                    f"Follow the 'Getting started' steps in your system prompt:\n"
+                    f"1. Read the architecture doc for the target GPU\n"
+                    f"2. Measure baselines\n"
+                    f"3. Write spec.yaml (see examples/specs/ for format)\n"
+                    f"4. Study references and write your first kernel\n\n"
+                    f"Work through these steps. Save your first correct kernel with git."
+                )
 
         self._log_conversation("prompt", prompt, "first-turn")
         await self._retry_agent(self.main_agent, prompt, label="first-turn")

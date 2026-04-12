@@ -19,8 +19,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
+
 from .workspace import Workspace
 from .cost_tracker import CostTracker
+from .state import RunState, compute_state
 from .tools.compiler import Compiler
 from .tools.tester import Tester
 from .tools.doc_loader import DocLoader
@@ -201,13 +204,31 @@ class CudaOrchestratorV2:
         start = time.time()
 
         has_kernel = self.workspace.kernel_path.exists()
-        best = await self._get_best_tflops()
-        stage = await self._current_stage()
 
-        if has_kernel and best > 0:
-            logger.info(f"Resuming ({best:.1f} TFLOPS) — stage: {stage}")
+        if self.spec is not None:
+            # Structured mode — describe state via compute_state (not the
+            # misleading single-float max). Shows per-config picture at startup.
+            state = compute_state(self.workspace.path, self.spec)
+            if state.has_any_kernel:
+                ratios_str = ", ".join(
+                    f"{k}={v*100:.0f}%" for k, v in state.ratios.items()
+                )
+                logger.info(
+                    f"Resuming — stage: {state.stage}, score: {state.score:.3f} "
+                    f"via {self.spec.scoring} ({ratios_str})"
+                )
+            else:
+                logger.info(
+                    f"New task ({self.spec.name}) — starting in {state.stage}"
+                )
         else:
-            logger.info(f"New task — starting in {stage}")
+            # Legacy mode — unchanged from v3
+            best = await self._get_best_tflops()
+            stage = await self._current_stage()
+            if has_kernel and best > 0:
+                logger.info(f"Resuming ({best:.1f} TFLOPS) — stage: {stage}")
+            else:
+                logger.info(f"New task — starting in {stage}")
 
         # First turn: give context
         await self._first_turn(task, has_kernel)
@@ -311,12 +332,9 @@ class CudaOrchestratorV2:
 
         if self.spec is not None:
             # Structured path — single template, spec-driven
-            from .state import compute_state
             state = compute_state(ws.path, self.spec)
             git_history = await self._read_git_history()
-
-            import yaml as _yaml
-            shapes_block = _yaml.dump(self.spec.shapes, default_flow_style=False).rstrip()
+            shapes_block = yaml.dump(self.spec.shapes, default_flow_style=False).rstrip()
 
             parts = [
                 f"# Task: {self.spec.name}",
@@ -427,6 +445,21 @@ class CudaOrchestratorV2:
         current TFLOPS vs its baseline, with ✓ marker for configs above their
         target_ratio and ← WORST marker for the score bottleneck.
         """
+        # Fresh workspace (no tagged kernel yet) — don't render a table of zeros.
+        # Show the baseline targets instead so the agent knows what to aim for.
+        if not state.has_any_kernel:
+            lines = [
+                f"## Iteration {iteration} — {state.stage} stage (no kernel yet)",
+                "",
+                "No tagged improvement in workspace/.git. Targets to reach:",
+            ]
+            for cfg in self.spec.configs:
+                lines.append(
+                    f"  {cfg.name}: baseline {cfg.baseline_tflops:.1f} TFLOPS "
+                    f"(target {cfg.target_ratio*100:.0f}%)"
+                )
+            return "\n".join(lines)
+
         lines = [
             f"## Iteration {iteration} — {state.stage} stage "
             f"(score: {state.score:.3f} via {self.spec.scoring})",
@@ -472,7 +505,6 @@ class CudaOrchestratorV2:
         """
         if self.spec is not None:
             # Structured path — use compute_state + per-config rendering
-            from .state import compute_state
             state = compute_state(self.workspace.path, self.spec)
             header = self._render_state_header(iteration, state)
             constraints = self._render_constraints_block()
@@ -550,30 +582,53 @@ class CudaOrchestratorV2:
         )
 
     async def _handle_stall(self):
-        """When stuck — force research before next iteration."""
-        stage = await self._current_stage()
+        """When stuck — force research before next iteration.
+
+        Structured mode: stage comes from compute_state (correct), constraints
+        block is re-injected (same as _iterate), and the stall prompt includes
+        the worst-config focus signal. Legacy mode: unchanged from v3.
+        """
+        if self.spec is not None:
+            state = compute_state(self.workspace.path, self.spec)
+            stage = state.stage
+            constraints = self._render_constraints_block()
+            focus = (
+                f"\nCurrent bottleneck: {state.worst_config} "
+                f"(ratio {state.ratios.get(state.worst_config, 0.0)*100:.1f}%). "
+                f"Research should target this config first.\n"
+                if state.worst_config else ""
+            )
+        else:
+            # Legacy — unchanged from v3
+            stage = await self._current_stage()
+            constraints = ""
+            focus = ""
 
         if stage == "REPRODUCE":
-            prompt = (
+            body = (
                 f"## STALLED in REPRODUCE stage\n\n"
                 f"Your recent attempts are not making progress toward the baseline.\n\n"
                 f"1. Study a DIFFERENT reference implementation than what you've been reading\n"
                 f"2. Compare your kernel structure to the reference — what's different?\n"
                 f"3. The gap is structural, not a tuning issue. What architectural decision is wrong?\n"
-                f"4. Update progress.md: add to Tried and Untried (Hard) sections\n\n"
+                f"4. Update progress.md: add to Tried and Untried (Hard) sections\n"
+                f"{focus}\n"
                 f"Do NOT edit kernel.cu in this turn. Only research and plan."
             )
         else:
-            prompt = (
+            body = (
                 f"## STALLED in OPTIMIZE stage\n\n"
                 f"Recent optimizations are not producing gains.\n\n"
                 f"1. Deep profile: run_ncu(), read_sass()\n"
                 f"2. Compare your SASS to reference — what instructions differ?\n"
                 f"3. Review git log — what's been tried and why it didn't help\n"
                 f"4. Consider reverting to an earlier version for a different direction\n"
-                f"5. Update progress.md: add to Tried and Untried (Hard) sections\n\n"
+                f"5. Update progress.md: add to Tried and Untried (Hard) sections\n"
+                f"{focus}\n"
                 f"Do NOT edit kernel.cu in this turn. Only research and plan."
             )
+
+        prompt = f"{constraints}{body}" if constraints else body
 
         self._log_conversation("prompt", prompt, "stall-research")
         await self._retry_agent(self.main_agent, prompt, label="stall-research")

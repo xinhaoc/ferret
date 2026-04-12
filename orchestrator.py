@@ -328,36 +328,123 @@ class CudaOrchestratorV2:
         self._log_conversation("prompt", prompt, "first-turn")
         await self._retry_agent(self.main_agent, prompt, label="first-turn")
 
-    async def _iterate(self, iteration: int) -> IterResult:
-        """One iteration. Prompt depends on stage."""
-        stage = await self._current_stage()
-        baseline = self._get_baseline_tflops()
-        best = await self._get_best_tflops()
-        pct = f"{best/baseline*100:.0f}% of baseline" if baseline > 0 else "unknown"
-        baseline_hint = f"Baseline source: `{self._baseline_source}` — you are at {pct}, read it to close the gap.\n" if getattr(self, '_baseline_source', '') else ""
+    # ── Prompt rendering helpers (structured mode) ──
 
-        if stage == "REPRODUCE":
-            prompt = (
-                f"## Iteration {iteration} — REPRODUCE stage ({pct})\n\n"
-                f"Best: {best:.1f} TFLOPS. Baseline: {baseline:.1f} TFLOPS. At {pct}.\n\n"
-                f"{baseline_hint}"
-                f"You are NOT optimizing yet. Do NOT profile with ncu.\n"
-                f"Focus on reproducing the baseline's architecture:\n"
-                f"- If your attempt fails, compare to the baseline source line by line and fix the difference\n\n"
-                f"Save improvements with git commit + tag. Save failed attempts with git commit (no tag).\n"
-                f"Revert after failure: `cd workspace && git checkout $(git describe --tags --abbrev=0) -- kernel.cu`\n"
+    def _render_state_header(self, iteration: int, state) -> str:
+        """Build the 'Iteration N — stage / per-config table / worst' text block.
+
+        Used when self.spec is set (structured mode). Shows every config's
+        current TFLOPS vs its baseline, with ✓ marker for configs above their
+        target_ratio and ← WORST marker for the score bottleneck.
+        """
+        lines = [
+            f"## Iteration {iteration} — {state.stage} stage "
+            f"(score: {state.score:.3f} via {self.spec.scoring})",
+            "",
+            "Per-config status:",
+        ]
+        for cfg in self.spec.configs:
+            tflops = state.results.get(cfg.name, 0.0)
+            ratio = state.ratios.get(cfg.name, 0.0)
+            if ratio >= cfg.target_ratio:
+                marker = " ✓"
+            elif cfg.name == state.worst_config:
+                marker = "  ← WORST"
+            else:
+                marker = ""
+            lines.append(
+                f"  {cfg.name}: {tflops:6.1f} / {cfg.baseline_tflops:6.1f} "
+                f"= {ratio*100:5.1f}% (target {cfg.target_ratio*100:.0f}%){marker}"
             )
+        if state.worst_config and state.ratios.get(state.worst_config, 0.0) < 1.0:
+            lines.append("")
+            lines.append(f"Focus on {state.worst_config} — it is the score bottleneck.")
+        return "\n".join(lines)
+
+    def _render_constraints_block(self) -> str:
+        """Build the 'Constraints (enforced every iteration)' block.
+
+        Re-injected every iteration so constraints cannot be forgotten in long
+        sessions. Returns '' if no constraints or no spec.
+        """
+        if self.spec is None or not self.spec.constraints:
+            return ""
+        lines = ["## Constraints (enforced every iteration)"]
+        for c in self.spec.constraints:
+            lines.append(f"- {c}")
+        return "\n".join(lines) + "\n\n"
+
+    async def _iterate(self, iteration: int) -> IterResult:
+        """One iteration. Prompt depends on stage.
+
+        Structured mode (self.spec set): uses compute_state for a per-config
+        view and re-injects constraints. Legacy mode: unchanged from v3.
+        """
+        if self.spec is not None:
+            # Structured path — use compute_state + per-config rendering
+            from .state import compute_state
+            state = compute_state(self.workspace.path, self.spec)
+            header = self._render_state_header(iteration, state)
+            constraints = self._render_constraints_block()
+
+            if state.stage == "REPRODUCE":
+                advice = (
+                    "You are NOT optimizing yet. Do NOT profile with ncu.\n"
+                    "Focus on reproducing the baseline's architecture:\n"
+                    "- If your attempt fails, compare to the baseline source "
+                    "line by line and fix the difference\n"
+                )
+            else:
+                advice = (
+                    "Read workspace/progress.md first.\n"
+                    "- If an idea keeps appearing in 'Untried (Hard)', stop "
+                    "avoiding it. Save a checkpoint version, then commit to it. "
+                    "Debugging a hard approach for many iterations is fine.\n"
+                    "- If an approach keeps appearing in 'Tried', stop "
+                    "repeating it. You are stuck in a loop. Try something "
+                    "fundamentally different.\n"
+                    "- Read a doc or reference you haven't read before "
+                    "(e.g. `docs/patterns/`, `docs/ptx-isa-9.2/`, or other "
+                    "codebases in `resources/` like ThunderKittens, DeepGemm, "
+                    "CUTLASS).\n"
+                )
+            footer = (
+                "\nSave improvements with git commit + tag. Save failed "
+                "attempts with git commit (no tag).\n"
+                "Revert after failure: "
+                "`cd workspace && git checkout $(git describe --tags --abbrev=0) -- kernel.cu`\n"
+            )
+            prompt = f"{header}\n\n{constraints}{advice}{footer}"
         else:
-            prompt = (
-                f"## Iteration {iteration} — OPTIMIZE stage ({pct} of baseline)\n\n"
-                f"Best: {best:.1f} TFLOPS. Baseline: {baseline:.1f} TFLOPS.\n\n"
-                f"Read workspace/progress.md first.\n"
-                f"- If an idea keeps appearing in 'Untried (Hard)', stop avoiding it. Save a checkpoint version, then commit to it. Debugging a hard approach for many iterations is fine.\n"
-                f"- If an approach keeps appearing in 'Tried', stop repeating it. You are stuck in a loop. Try something fundamentally different.\n"
-                f"- Read a doc or reference you haven't read before (e.g. `docs/patterns/`, `docs/ptx-isa-9.2/`, or other codebases in `resources/` like ThunderKittens, DeepGemm, CUTLASS).\n\n"
-                f"Save improvements with git commit + tag. Save failed attempts with git commit (no tag).\n"
-                f"Revert after failure: `cd workspace && git checkout $(git describe --tags --abbrev=0) -- kernel.cu`\n"
-            )
+            # Legacy path — unchanged from v3 (preserved until step 7)
+            stage = await self._current_stage()
+            baseline = self._get_baseline_tflops()
+            best = await self._get_best_tflops()
+            pct = f"{best/baseline*100:.0f}% of baseline" if baseline > 0 else "unknown"
+            baseline_hint = f"Baseline source: `{self._baseline_source}` — you are at {pct}, read it to close the gap.\n" if getattr(self, '_baseline_source', '') else ""
+
+            if stage == "REPRODUCE":
+                prompt = (
+                    f"## Iteration {iteration} — REPRODUCE stage ({pct})\n\n"
+                    f"Best: {best:.1f} TFLOPS. Baseline: {baseline:.1f} TFLOPS. At {pct}.\n\n"
+                    f"{baseline_hint}"
+                    f"You are NOT optimizing yet. Do NOT profile with ncu.\n"
+                    f"Focus on reproducing the baseline's architecture:\n"
+                    f"- If your attempt fails, compare to the baseline source line by line and fix the difference\n\n"
+                    f"Save improvements with git commit + tag. Save failed attempts with git commit (no tag).\n"
+                    f"Revert after failure: `cd workspace && git checkout $(git describe --tags --abbrev=0) -- kernel.cu`\n"
+                )
+            else:
+                prompt = (
+                    f"## Iteration {iteration} — OPTIMIZE stage ({pct} of baseline)\n\n"
+                    f"Best: {best:.1f} TFLOPS. Baseline: {baseline:.1f} TFLOPS.\n\n"
+                    f"Read workspace/progress.md first.\n"
+                    f"- If an idea keeps appearing in 'Untried (Hard)', stop avoiding it. Save a checkpoint version, then commit to it. Debugging a hard approach for many iterations is fine.\n"
+                    f"- If an approach keeps appearing in 'Tried', stop repeating it. You are stuck in a loop. Try something fundamentally different.\n"
+                    f"- Read a doc or reference you haven't read before (e.g. `docs/patterns/`, `docs/ptx-isa-9.2/`, or other codebases in `resources/` like ThunderKittens, DeepGemm, CUTLASS).\n\n"
+                    f"Save improvements with git commit + tag. Save failed attempts with git commit (no tag).\n"
+                    f"Revert after failure: `cd workspace && git checkout $(git describe --tags --abbrev=0) -- kernel.cu`\n"
+                )
 
         best_before = await self._get_best_tflops()
         self._log_conversation("prompt", prompt, f"iter-{iteration}")

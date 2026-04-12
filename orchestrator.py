@@ -49,6 +49,7 @@ class CudaOrchestratorV2:
         workspace_path: str | Path,
         sh_fn,
         agent_root: str | Path,
+        task_yaml: str | Path | None = None,
         baseline_source: str = "",
         baseline_tflops: float = 0.0,
         arch: str = "sm_100a",
@@ -117,18 +118,19 @@ class CudaOrchestratorV2:
         self._baseline_source = baseline_source
         self._baseline_tflops = baseline_tflops
 
-        # Structured task spec — loaded if workspace/task.yaml is present.
-        # None in legacy mode. Not yet consumed by any other code path;
-        # steps 5/6 will wire it into prompt rendering, step 7 will make it
-        # the sole source (dropping --baseline-* CLI args).
+        # Structured task spec — explicit task_yaml path wins, otherwise default
+        # to workspace/task.yaml. None (legacy mode) when neither exists.
         self.spec = None
-        task_yaml = ws_path / "task.yaml"
-        if task_yaml.exists():
+        resolved_task_yaml = (
+            Path(task_yaml) if task_yaml is not None else ws_path / "task.yaml"
+        )
+        if resolved_task_yaml.exists():
             from .task_spec import load_task_spec
-            self.spec = load_task_spec(task_yaml)
+            self.spec = load_task_spec(resolved_task_yaml)
             logger.info(
                 f"Loaded task spec: {self.spec.name} "
-                f"({len(self.spec.configs)} configs, scoring={self.spec.scoring})"
+                f"({len(self.spec.configs)} configs, scoring={self.spec.scoring}) "
+                f"from {resolved_task_yaml}"
             )
 
         # State

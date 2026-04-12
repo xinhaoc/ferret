@@ -2,17 +2,25 @@
 
 Usage:
     cd ~/repos
-    python -m ferret.main "Write MLA decode for B200, beat CUTLASS by 10%"
-    python -m ferret.main --resume
+    python -m ferret.main tasks/mla-mtp-decode-q1to4-kv4096.yaml
+
+The task.yaml file is the sole source of truth for what the agent should
+optimize: problem description, shapes, per-config baselines, constraints,
+hints, budget. See tasks/template.yaml for the schema.
+
+Resume is automatic: if the workspace directory contains a .git with tags,
+ferret picks up from the latest tagged kernel. No --resume flag needed.
 """
 
 import argparse
 import asyncio
 import logging
 import os
+import sys
 from pathlib import Path
 
-# Paths
+from .task_spec import load_task_spec
+
 AGENT_ROOT = Path(__file__).parent.resolve()
 
 logging.basicConfig(
@@ -47,45 +55,72 @@ async def shell_local(cmd: str) -> tuple[str, str, int]:
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="ferret — autonomous CUDA kernel optimization agent")
-    parser.add_argument("task", nargs="?", default="")
-    parser.add_argument("--workspace", default="workspace")
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--max-iterations", type=int, default=100)
-    parser.add_argument("--model", default=None)
-    parser.add_argument("--arch", default=None)
-    parser.add_argument("--baseline-source", required=True,
-                        help="Path to baseline source code in resources/ (e.g. resources/flashinfer-0.6.7/)")
-    parser.add_argument("--baseline-tflops", type=float, default=0.0,
-                        help="Baseline TFLOPS fallback (agent writes workspace/.baseline_tflops automatically)")
+    parser = argparse.ArgumentParser(
+        description="ferret — autonomous CUDA kernel optimization agent",
+    )
+    parser.add_argument(
+        "task_yaml",
+        help="Path to the task spec YAML (see tasks/template.yaml for schema)",
+    )
+    parser.add_argument(
+        "--workspace",
+        default="workspace",
+        help="Workspace directory for kernel.cu, progress.md, .git (default: ./workspace)",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        help="Override spec.budget.max_iterations",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Override env FERRET_MODEL (default: claude-opus-4-6)",
+    )
+    parser.add_argument(
+        "--arch",
+        default=None,
+        help="Override env FERRET_ARCH (default: sm_100a)",
+    )
     args = parser.parse_args()
+
+    # Load + validate the spec up front — fail fast before burning API tokens
+    # on a typo.
+    task_yaml_path = Path(args.task_yaml).resolve()
+    if not task_yaml_path.exists():
+        parser.error(f"task spec not found: {task_yaml_path}")
+    try:
+        spec = load_task_spec(task_yaml_path)
+    except ValueError as e:
+        parser.error(f"invalid task spec: {e}")
+
+    # Validate the baseline source path referenced by the spec exists, relative
+    # to the agent root (where resources/ lives). Agent will read this during
+    # the run, so catch the typo now.
+    baseline_path = AGENT_ROOT / spec.baseline.source
+    if not baseline_path.exists():
+        parser.error(
+            f"baseline source not found: {baseline_path} "
+            f"(referenced from {task_yaml_path})"
+        )
+
+    # Workspace dir
+    ws_path = Path(args.workspace)
+    if not ws_path.is_absolute():
+        ws_path = AGENT_ROOT / ws_path
 
     model = args.model or os.environ.get("FERRET_MODEL", "claude-opus-4-6")
     arch = args.arch or os.environ.get("FERRET_ARCH", "sm_100a")
+    max_iterations = args.max_iterations or spec.budget.max_iterations
 
-    ws_path = AGENT_ROOT / args.workspace
-
-    # Validate baseline source path
-    baseline_path = AGENT_ROOT / args.baseline_source
-    if not baseline_path.exists():
-        parser.error(f"Baseline source not found: {baseline_path}")
-
-    logger.info(f"Agent root: {AGENT_ROOT}")
-    logger.info(f"Workspace: {ws_path}")
-    logger.info(f"Baseline: {args.baseline_source} @ {args.baseline_tflops} TFLOPS")
-
-    sh = shell_local
-
-    if not args.task and not args.resume:
-        parser.error("Provide a task or use --resume")
-
-    task = args.task
-    if args.resume and not task:
-        spec_path = ws_path / "spec.yaml"
-        if spec_path.exists():
-            task = f"Resume from {ws_path}"
-        else:
-            parser.error("No spec.yaml found. Provide a task.")
+    logger.info(f"Agent root   : {AGENT_ROOT}")
+    logger.info(f"Workspace    : {ws_path}")
+    logger.info(f"Task spec    : {task_yaml_path}")
+    logger.info(f"Task name    : {spec.name}")
+    logger.info(f"GPU / arch   : {spec.gpu} / {arch}")
+    logger.info(f"Configs      : {[c.name for c in spec.configs]} (scoring={spec.scoring})")
+    logger.info(f"Budget       : {max_iterations} iter / {spec.budget.max_wall_minutes}min / {spec.budget.max_tokens:,} tokens")
 
     from lithos.models import AnthropicChatClient
     client = AnthropicChatClient()
@@ -95,15 +130,15 @@ async def main():
         client=client,
         model_name=model,
         workspace_path=str(ws_path),
-        sh_fn=sh,
+        sh_fn=shell_local,
         agent_root=AGENT_ROOT,
-        baseline_source=args.baseline_source,
-        baseline_tflops=args.baseline_tflops,
+        task_yaml=task_yaml_path,
         arch=arch,
-        max_iterations=args.max_iterations,
+        max_iterations=max_iterations,
     )
 
-    await orchestrator.run(task)
+    # Structured mode — task parameter is informational only (spec is authority).
+    await orchestrator.run(task=spec.name)
 
 
 if __name__ == "__main__":

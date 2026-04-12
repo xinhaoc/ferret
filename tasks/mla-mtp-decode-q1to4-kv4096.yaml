@@ -1,0 +1,141 @@
+# ferret task spec — MLA multi-token decode (Q_LEN 1..4, KV=4096)
+#
+# Status as of this commit (2026-04-12):
+#   Current best   : workspace v004 — Q1=31.1, Q2=54.7, Q3=70.6, Q4=87.7 TFLOPS
+#   Baseline       : trtllm_batch_decode_with_kv_cache_mla (trtllm-gen backend)
+#   Win           : Q4 already 9.9% above baseline
+#   Gap           : Q1 ~10% behind, Q2 ~13% behind — min_ratio = 0.874
+#   Next moves    : FlashDecoding++ atomic-merge fusion (reduce is 33% of Q1 time)
+#
+# This is the canonical worked example for the new structured-spec format.
+# Copy to workspace/task.yaml on the machine running ferret.
+
+name: mla-mtp-decode-q1to4-kv4096
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    DeepSeek V3 MLA multi-token prediction decode kernel.
+    Computes attention for Q_LEN ∈ {1, 2, 3, 4} consecutive query tokens
+    against a paged KV cache. Q_LEN > 1 needs causal masking across the
+    query dimension: each query q attends to KV positions ≤ (kv_len - Q_LEN + q).
+
+    Layout:
+      Q : [B, Q_LEN, NUM_HEADS, D_K]   (D_K = kv_lora_rank + qk_rope_dim = 512+64)
+      KV: [B, KV_LEN, D_K]              (shared across heads — the MLA trick)
+      O : [B, Q_LEN, NUM_HEADS, D_V]   (D_V = kv_lora_rank = 512)
+
+    Q_LEN=3 is supported by the caller via padding to Q_LEN=4 (no kernel
+    changes needed). Q_LEN ≥ 5 is out of scope — would need a different
+    M-blocking strategy and will be a separate task.
+
+    Output must match trtllm_batch_decode_with_kv_cache_mla bit-for-bit
+    within max relative error < 5e-3. The reference lives in
+    resources/flashinfer-0.6.7 (FlashInfer calls into the trtllm-gen cubin).
+
+  shapes:
+    NUM_HEADS: 128
+    D_K: 576              # kv_lora_rank (512) + qk_rope_dim (64)
+    D_V: 512              # kv_lora_rank
+    KV_LEN: 4096
+    BATCH: 1
+
+# Baselines are pre-measured from a prior trtllm-gen benchmark run. Not
+# re-measuring per ferret run — set pre_measured: false if you want the
+# agent to re-measure each startup.
+baseline:
+  source: resources/flashinfer-0.6.7
+  command: ""            # empty = don't run; trust pre_measured numbers below
+  pre_measured: true
+
+configs:
+  # Q1: current 31.1, trtllm 34.3. Stretch target = match trtllm (target 1.0).
+  # min_ratio aggregate scoring means this config can block stage advance.
+  - name: Q1
+    args: { Q_LEN: 1 }
+    baseline_tflops: 34.3
+    target_ratio: 1.00
+    weight: 1.0
+
+  # Q2: current 54.7, trtllm 62.6. Same story as Q1.
+  - name: Q2
+    args: { Q_LEN: 2 }
+    baseline_tflops: 62.6
+    target_ratio: 1.00
+    weight: 1.0
+
+  # Q4: current 87.7 (already 9.9% above trtllm's 79.8). Target 1.0 acts as
+  # a guardrail — a regression below 79.8 would break the spec even though
+  # Q4 is the easiest config.
+  - name: Q4
+    args: { Q_LEN: 4 }
+    baseline_tflops: 79.8
+    target_ratio: 1.00
+    weight: 0.5
+
+# min_ratio: aggregate = min of per-config ratios. Want all three in range.
+# Weighted_avg would let a Q4 outlier mask Q1 regression. Focus mode would
+# ignore Q4 entirely. min_ratio is the honest choice for this task.
+scoring: min_ratio
+
+# Architecturally v004 already reproduces trtllm's pipeline (split-K +
+# tcgen05 + fused softmax + reduce kernel). We are NOT re-discovering the
+# architecture — we are in tuning territory. Drop stage_gate.ratio to 0.85
+# so compute_state puts us in OPTIMIZE from iteration 0 and the agent
+# reaches for ncu / SASS / atomic-merge instead of re-reading the
+# baseline source for the 20th time.
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+# Re-injected into every iteration prompt by the orchestrator. These are
+# framework-integration hard rules — NOT guidance the agent can choose to
+# ignore, even if the profiler suggests otherwise.
+constraints:
+  - "Single CUDA stream only. The kernel will run inside a framework that
+     manages its own streams — no cudaStreamCreate, no cudaEventRecord overlap,
+     no concurrent kernels via multi-stream. Default stream or caller's
+     stream only."
+  - "No CUDA graphs. Focus on kernel-level optimization, not launch overhead."
+  - "No cta_group::2 (2-CTA cluster MMA). trtllm uses it, but the downstream
+     framework does not support 2-CTA and we must match their constraints.
+     cta_group::1 only."
+  - "No reshape kernels before the main MLA kernel. Q must be loaded
+     directly from [Q_LEN, NUM_HEADS, D_K] layout via TMA descriptors.
+     The caller will not pre-permute."
+  - "Output must be bit-compatible with the baseline (max relative error
+     < 5e-3 across all configs)."
+
+# Injected into the first iteration prompt only. Nudges to unstick the agent
+# from dead ends. Every hint biases the search — use sparingly.
+hints:
+  - "Starting point: examples/mla-mtp-decode-q1to8-kv4096/v004_q1q2_microopt.cu
+     is the current best. Copy to workspace/kernel.cu and work from there.
+     Do not start from scratch."
+  - "Reduce kernel is 33% of Q1 wall time. The biggest untapped architectural
+     win is fusing the split-K reduction into the main kernel via FlashDecoding++
+     atomic-merge pattern: each split-K block atomically updates a global
+     (m, ℓ, O) tuple with a spinlock + online softmax merge. No reference in
+     resources/ implements this — you compose it from ptx atom.global.sys
+     + cas-loop primitives. See docs/ptx-isa-9.2/ for atom semantics."
+  - "Micro-optimizations (template specialization, cache-streaming stores,
+     register shaving) are exhausted at v004. Further gains need either
+     (a) fused reduce (above) or (b) M=64 .ws mode with Layout E TMEM
+     addressing. Agent attempted M=64 Layout F 8 times in prior sessions
+     and hit the TMEM lane-mapping wall — (a) is the lower-risk bet."
+
+# Budget caps — every iteration checks all three.
+budget:
+  max_iterations: 60
+  max_wall_minutes: 90
+  max_tokens: 2000000
+
+# Kernel host code must emit a line matching result_format so the orchestrator
+# can parse per-config TFLOPS. Current v004 kernel uses the printf format
+# (parser format 2); adding a KERNEL_RESULT JSON line one-liner upgrades it
+# to format 1.
+output:
+  result_format: kernel_result_json
+  result_keys: [Q1, Q2, Q4]

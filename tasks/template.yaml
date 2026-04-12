@@ -1,0 +1,168 @@
+# =============================================================================
+# Task spec template for the CUDA agent (V3+)
+#
+# This file is the SINGLE source of truth for what the agent should optimize.
+# Copy it to workspace/task.yaml, edit, and run:
+#
+#     python3 main_v2.py workspace/task.yaml
+#
+# The agent reads this file at startup. It does NOT generate spec.yaml itself
+# anymore — every field below is user input, not agent inference.
+#
+# Sections marked [REQUIRED] must be present. [OPTIONAL] sections have defaults.
+# =============================================================================
+
+# ----- [REQUIRED] Identity --------------------------------------------------
+name: mla-mtp-decode-q1to4-kv4096   # used for tags, log paths, example dir name
+gpu: B200                            # B200 | H100 | A100
+arch: sm_100a                        # nvcc -gencode arch
+precision: BF16                      # BF16 | FP16 | FP8 | FP32
+
+# ----- [REQUIRED] Problem description ---------------------------------------
+# `description` is free text — it's what the agent reads to understand the
+# math. Be specific about the operation, the layout, and any non-obvious
+# semantics (causal masking, normalization, etc.).
+problem:
+  description: |
+    DeepSeek V3 MLA multi-token prediction decode kernel.
+    Computes attention for Q_LEN consecutive query tokens against a paged KV
+    cache. Q_LEN > 1 needs causal masking across the query dimension only
+    (each query attends to all KV positions up to its own).
+
+    Layout:
+      Q : [B, Q_LEN, NUM_HEADS, D_K]   (D_K = qk_nope_dim + qk_rope_dim)
+      KV: [B, KV_LEN, D_K]              (kv_lora_rank + qk_rope_dim, shared
+                                         across heads — that's the "MLA" trick)
+      O : [B, Q_LEN, NUM_HEADS, D_V]
+
+    Output must match flashinfer's trtllm_batch_decode_with_kv_cache_mla
+    bit-for-bit (within numerical tolerance ~5e-3 max relative error).
+
+  # Machine-checkable shape facts. Used to size buffers, generate harness code.
+  shapes:
+    NUM_HEADS: 128
+    D_K: 576              # kv_lora_rank (512) + qk_rope_dim (64)
+    D_V: 512              # kv_lora_rank
+    KV_LEN: 4096
+    BATCH: 1
+
+# ----- [REQUIRED] Baseline --------------------------------------------------
+# How to measure the reference number(s) the agent compares against.
+#
+# Two modes:
+#   (a) `command:` — agent runs this once at startup and parses the output.
+#       The command must print numbers in the same key=value form the kernel
+#       uses (see `result_format` below).
+#   (b) `pre_measured: true` — you already know the baseline numbers and have
+#       filled them into each `configs[].baseline_tflops`. Agent skips the run.
+#
+# `source:` is the path to the reference implementation the agent can read
+# while reproducing. It MUST exist or the agent stops with an error.
+baseline:
+  source: resources/flashinfer-0.6.7
+  command: python3 baselines/run_trtllm_mtp.py --kv 4096
+  pre_measured: true        # set false if you want the agent to (re)measure
+
+# ----- [REQUIRED] Configurations --------------------------------------------
+# Each config is one (shape, baseline) pair. The agent's job is to make the
+# kernel hit the target_ratio for every config (or just for `focus_config`,
+# depending on `scoring`).
+#
+# args: passed to the kernel harness (template params, runtime args, both).
+# baseline_tflops: the number to compare against. Required if pre_measured.
+# target_ratio: 1.0 means "match baseline", 0.95 means "within 5%",
+#               1.20 means "beat baseline by 20%".
+# weight: only used by `scoring: weighted_avg`. Ignored otherwise.
+configs:
+  - name: Q1
+    args: { Q_LEN: 1 }
+    baseline_tflops: 34.3       # trtllm-gen on B200
+    target_ratio: 0.95
+    weight: 1.0
+
+  - name: Q2
+    args: { Q_LEN: 2 }
+    baseline_tflops: 62.6
+    target_ratio: 0.95
+    weight: 1.0
+
+  - name: Q4
+    args: { Q_LEN: 4 }
+    baseline_tflops: 79.8
+    target_ratio: 1.00          # already winning, just don't regress
+    weight: 0.5
+
+# ----- [REQUIRED] Scoring policy --------------------------------------------
+# How to combine per-config ratios into a single number that drives:
+#   - which kernel is "best" (replaces git-tag heuristics)
+#   - when to advance from REPRODUCE → OPTIMIZE
+#   - regression detection
+#
+# Options:
+#   min_ratio       — score = min(ratio_i). Strict. Use when you want every
+#                     config to be good. Default for multi-config tasks.
+#   weighted_avg    — score = sum(weight_i * ratio_i) / sum(weight_i). Allows
+#                     trading: a big win on Q1 can offset a small loss on Q4.
+#   focus           — score = ratio[focus_config]. Other configs act as
+#                     guardrails: if any drops below its target_ratio it's a
+#                     regression even if focus improved.
+scoring: min_ratio
+focus_config: Q1                # only used when scoring == focus
+
+# ----- [REQUIRED] Stage gate ------------------------------------------------
+# When does the agent leave REPRODUCE and enter OPTIMIZE?
+#   ratio:  aggregate score (per `scoring`) must reach this value
+#   strict: also require every config to clear its own target_ratio
+stage_gate:
+  ratio: 0.90
+  strict: false
+
+# ----- [OPTIONAL] Constraints -----------------------------------------------
+# Hard rules the agent must follow. These are re-injected into every iteration
+# prompt — they do NOT get forgotten in long sessions like prose constraints
+# in `description` do.
+#
+# Use this for:
+#   - Framework integration requirements ("no multi-stream", "single-buffer
+#     output", "no in-place ops")
+#   - Hardware features that are off-limits ("no cta_group::2" because the
+#     downstream framework doesn't support it)
+#   - Output format requirements
+constraints:
+  - "Single CUDA stream only — kernel will run inside a framework that
+     manages its own streams. No cudaStreamCreate, no cudaEvent overlap."
+  - "No CUDA graphs."
+  - "No cta_group::2 (2-CTA cluster MMA) — framework integration unsupported."
+  - "No reshape kernels — Q must be loaded directly from
+     [Q_LEN, NUM_HEADS, D_K] via TMA. Caller will not pre-permute."
+  - "Output must be bit-compatible with the baseline (max rel err < 5e-3)."
+
+# ----- [OPTIONAL] Hints -----------------------------------------------------
+# Soft suggestions. Injected into the FIRST iteration prompt only — meant to
+# unstick the agent from known dead ends or point at known-good references.
+# Use sparingly: every hint biases the search.
+hints:
+  - "trtllm-gen uses cta_group::2 + adaptive tile sizes. Without 2-CTA the
+     ceiling for Q8 is roughly half trtllm. Aim for parity at Q1-Q4."
+  - "examples/mla-mtp-decode-q1to8-kv4096/v004_q1q2_microopt.cu is the
+     current best for Q1-Q4. Start from it or beat it."
+  - "Reduce kernel is 33% of Q1 wall time. Fusing it via FlashDecoding++
+     atomic merge (lock + online softmax merge) is the biggest untapped win."
+
+# ----- [OPTIONAL] Run budget ------------------------------------------------
+# Stops to keep the agent from running forever.
+budget:
+  max_iterations: 60          # outer loop iterations (each = one full attempt)
+  max_wall_minutes: 90        # hard wall-clock cap
+  max_tokens: 2000000         # cumulative token budget across all turns
+
+# ----- [OPTIONAL] Output --------------------------------------------------
+# Where the agent should print results, and in what format.
+# The kernel host code MUST emit a line matching `result_format` so the
+# orchestrator can parse it. Default: a JSON line prefixed with KERNEL_RESULT.
+#
+# Example expected line from the kernel binary:
+#   KERNEL_RESULT {"Q1": 31.0, "Q2": 54.7, "Q4": 87.7}
+output:
+  result_format: kernel_result_json
+  result_keys: [Q1, Q2, Q4]   # which keys must appear in the JSON

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Environment
+.env
+.env.*
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Agent runtime state (per-run, not source)
+workspace/
+*.log
+cache_trace.jsonl
+tool_calls.jsonl
+conversation.jsonl
+file_reads.json
+
+# Build artifacts
+*.cubin
+*.so
+*.o
+kernel            # compiled kernel binary in workspace
+kernel.cubin
+
+# TODO: planned submodules — these are vendored library sources the agent
+# searches for reference code. Keeping them local for now; will convert to
+# git submodules once the set stabilizes. Do not commit to the ferret repo.
+resources/

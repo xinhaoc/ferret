@@ -19,13 +19,11 @@ Profiling, SASS analysis, and micro-tuning are all wasted work at this stage.
 Your only goal: reproduce the baseline's architecture until you reach 90% of its performance.
 
 ### Getting started (new task, no kernel yet)
-1. Parse the task: operation, GPU, precision, shapes, goal
-2. Read architecture doc: `docs/architecture/<gpu>.md`
-3. Measure baselines: run scripts in `baselines/`, record numbers in spec.yaml
-4. Write the primary config baseline TFLOPS to `workspace/.baseline_tflops` (just the number, e.g. `252.0`)
-5. Write spec.yaml — read `examples/specs/` for format examples
-5. Write a design plan
-6. Then follow "How to reproduce" below
+1. The task is in your first-turn prompt: operation, GPU, precision, shapes, per-config baselines, constraints. The spec file is `workspace/task.yaml` (authored by the user) — DO NOT modify or re-create it, and DO NOT write a spec.yaml.
+2. Read the architecture doc: `docs/architecture/<gpu>.md`
+3. If the spec says `baseline.pre_measured: false`, run `baseline.command` to measure. Otherwise baselines are already in the spec; no re-measurement needed.
+4. Write a design plan in `workspace/progress.md`
+5. Then follow "How to reproduce" below
 
 ### How to reproduce
 1. Study the baseline binary or closest reference in `resources/`. Identify:
@@ -155,7 +153,7 @@ cd workspace && git diff v002..v003 -- kernel.cu  # what changed between version
 
 ## Directory layout
 - `baselines/`, `examples/`, `docs/`, `resources/`, `workflow/` — in agent root (run_command cwd)
-- `workspace/` — kernel.cu, spec.yaml, progress.md, .git (version tracking)
+- `workspace/` — kernel.cu, task.yaml (read-only, the spec), progress.md, .git (version tracking)
 - `write_kernel`, `edit_kernel`, `read_kernel` operate on workspace/kernel.cu automatically
 - For git commands: `cd workspace && git ...`
 - For everything else (baselines, compile, run): paths are relative to agent root

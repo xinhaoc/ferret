@@ -278,12 +278,28 @@ class CudaOrchestratorV2:
                 if self.consecutive_failures >= self.stall_threshold:
                     await self._handle_stall()
 
-            # Context check
+            # Budget checks — spec.budget in structured mode, fixed fallback otherwise
+            if self.spec is not None:
+                max_tokens = self.spec.budget.max_tokens
+                max_wall_seconds = self.spec.budget.max_wall_minutes * 60
+            else:
+                max_tokens = 500_000
+                max_wall_seconds = 0  # 0 = disabled
+
             usage = getattr(self.main_agent, 'usage', {})
             total_input = sum(usage.get(k, 0) for k in
                               ['prompt_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'])
-            if total_input > 500_000:
-                logger.warning(f"Context at {total_input:,} tokens. Stopping.")
+            if total_input > max_tokens:
+                logger.warning(
+                    f"Token budget exceeded: {total_input:,} > {max_tokens:,}. Stopping."
+                )
+                break
+            if max_wall_seconds and (time.time() - start) > max_wall_seconds:
+                elapsed_min = (time.time() - start) / 60
+                logger.warning(
+                    f"Wall-time budget exceeded: {elapsed_min:.1f} min > "
+                    f"{self.spec.budget.max_wall_minutes} min. Stopping."
+                )
                 break
 
         elapsed = time.time() - start

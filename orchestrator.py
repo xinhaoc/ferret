@@ -115,7 +115,7 @@ class CudaOrchestratorV2:
         # to workspace/task.yaml. None (legacy mode) when neither exists.
         self.spec = None
         resolved_task_yaml = (
-            Path(task_yaml) if task_yaml is not None else ws_path / "task.yaml"
+            Path(task_yaml) if task_yaml is not None else self.workspace_path / "task.yaml"
         )
         if resolved_task_yaml.exists():
             from .task_spec import load_task_spec
@@ -125,6 +125,12 @@ class CudaOrchestratorV2:
                 f"({len(self.spec.configs)} configs, scoring={self.spec.scoring}) "
                 f"from {resolved_task_yaml}"
             )
+            # Ensure workspace/task.yaml exists so the agent can inspect it
+            # (matches what prompts.py tells the agent: "spec is workspace/task.yaml").
+            # Don't overwrite if the workspace copy is the same path as the source.
+            workspace_copy = self.workspace_path / "task.yaml"
+            if workspace_copy.resolve() != resolved_task_yaml.resolve():
+                workspace_copy.write_text(resolved_task_yaml.read_text())
 
         # State
         self.consecutive_failures = 0

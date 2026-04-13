@@ -62,11 +62,11 @@
 | Repo | Focus |
 |---|---|
 | `cutlass-4.4.2` | GEMM templates, CuTe layouts |
-| `flash-attention-fa4-v4.0.0.beta4` | Attention kernels (Ampere + Hopper) |
-| `flashinfer-0.6.7` | Inference attention, PagedKV, allreduce |
+| `flash-attention-fa4-v4.0.0.beta8` | Attention kernels (Ampere + Hopper) |
+| `flashinfer-0.6.7.post3` | Inference attention, PagedKV, allreduce |
 | `flashmla-main` | DeepSeek MLA kernel |
-| `deepgemm-2.1.1` | DeepSeek FP8 GEMM with fine-grained scaling |
+| `deepgemm-2.1.1.post3` | DeepSeek FP8 GEMM with fine-grained scaling |
 | `thunderkittens-main` | Tile-based CUDA kernel framework |
 | `triton-3.6.0` | GPU compiler, tutorials, Proton profiler |
-| `nccl-2.29.7` | Multi-GPU collective communication |
+| `nccl-2.29.7-1` | Multi-GPU collective communication |
 | `tensorrt-llm-1.2.0` | LLM inference kernels (cpp/ only) |

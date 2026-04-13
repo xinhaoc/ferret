@@ -188,7 +188,7 @@ static constexpr int NUM_WARPS = (NUM_CONSUMERS + 1) * 4;  // 12 warps
 
 ### FlashAttention
 
-From `flash-attention-fa4-v4.0.0.beta4/hopper/flash_fwd_kernel_sm90.h`:
+From `flash-attention-fa4-v4.0.0.beta8/hopper/flash_fwd_kernel_sm90.h`:
 
 ```cpp
 int warp_group_idx = cutlass::canonical_warp_group_idx();
@@ -208,7 +208,7 @@ if (warp_group_idx == 0) {  // Producer
 
 ### DeepGemm
 
-From `deepgemm-2.1.1/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh`:
+From `deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh`:
 
 ```cpp
 __global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
@@ -230,7 +230,7 @@ When 2+ consumer warpgroups exist, they alternate to avoid shared memory content
 
 ### FlashAttention named barrier pingpong
 
-From `flash-attention-fa4-v4.0.0.beta4/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp`:
+From `flash-attention-fa4-v4.0.0.beta8/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp`:
 
 ```cpp
 enum class FwdNamedBarriers {

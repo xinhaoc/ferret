@@ -82,7 +82,7 @@ class DocLoader:
 
         Examples:
             grep_reference("tcgen05.mma", "resources/cutlass-4.4.2/include/cute/arch")
-            grep_reference("blockscaled", "resources/deepgemm-2.1.1")
+            grep_reference("blockscaled", "resources/deepgemm-2.1.1.post3")
         """
         import subprocess
         search_path = str(self.root / path) if path else str(self.resources_dir)

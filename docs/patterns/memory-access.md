@@ -47,7 +47,7 @@ arranged so that consecutive threads in a warp map to consecutive elements along
 that contiguous dimension:
 
 ```cpp
-// Source: flash-attention-fa4-v4.0.0.beta4/hopper/mainloop_fwd_sm80.hpp
+// Source: flash-attention-fa4-v4.0.0.beta8/hopper/mainloop_fwd_sm80.hpp
 
 // Stride _1 on the d dimension ensures contiguous memory along head dim
 using StrideQK = cute::Stride<int64_t, _1, int64_t, int64_t>;  // (seqlen, d, head, batch)
@@ -152,7 +152,7 @@ Flash Attention FA2 on SM80 uses `SM80_CP_ASYNC_CACHEGLOBAL` to do 128-bit async
 copies from global memory directly to shared memory, bypassing registers:
 
 ```cpp
-// Source: flash-attention-fa4-v4.0.0.beta4/csrc/flash_attn/src/kernel_traits.h
+// Source: flash-attention-fa4-v4.0.0.beta8/csrc/flash_attn/src/kernel_traits.h
 
 // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
 // from the same address by the same threadblock. This is slightly faster.
@@ -215,7 +215,7 @@ Q/K/V tiles into shared memory. The swizzle parameters are computed from
 the tile dimensions:
 
 ```cpp
-// Source: flash-attention-fa4-v4.0.0.beta4/hopper/mainloop_fwd_sm80.hpp
+// Source: flash-attention-fa4-v4.0.0.beta8/hopper/mainloop_fwd_sm80.hpp
 
 static constexpr int kBytePerRow = kHeadDim * sizeof(Element);
 static constexpr int kBlockKGmem = (kBytePerRow % 128 == 0 ? 128 : (kBytePerRow % 64 == 0 ? 64 : 32)) / sizeof(Element);
@@ -303,7 +303,7 @@ enum class CacheHintSm90 : uint64_t {
 ```
 
 ```cpp
-// Source: flash-attention-fa4-v4.0.0.beta4/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
+// Source: flash-attention-fa4-v4.0.0.beta8/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
 
 // K/V are streamed over repeatedly — keep in L2 cache as long as possible
 copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write),
@@ -410,7 +410,7 @@ Flash Attention on SM80 uses cp.async with CACHEGLOBAL policy and multi-stage
 pipelining to overlap loads with computation:
 
 ```cpp
-// Source: flash-attention-fa4-v4.0.0.beta4/hopper/mainloop_fwd_sm80.hpp
+// Source: flash-attention-fa4-v4.0.0.beta8/hopper/mainloop_fwd_sm80.hpp
 
 // Each thread independently copies a 128-bit chunk with cp.async
 using GmemCopyAtom = Copy_Atom<std::conditional_t<
@@ -472,7 +472,7 @@ DeepGemm (used in DeepSeek inference) wraps TMA with multicast support.
 When running with clusters, only CTA 0 issues the multicast TMA:
 
 ```cpp
-// Source: deepgemm-2.1.1/deep_gemm/include/deep_gemm/common/sm90_utils.cuh
+// Source: deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/common/sm90_utils.cuh
 
 __device__ __forceinline__ void
 tma_copy(void const* desc_ptr, uint64_t* barrier_ptr, void* smem_ptr,
@@ -495,7 +495,7 @@ in the kernel. The `tma_load_K` descriptor encodes the K tensor's memory layout
 so the kernel needs only tile coordinates, not pointer arithmetic:
 
 ```cpp
-// Source: flash-attention-fa4-v4.0.0.beta4/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
+// Source: flash-attention-fa4-v4.0.0.beta8/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
 
 // --- Host side: create TMA descriptor ---
 Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K), args.shape_K, args.stride_K);
@@ -522,7 +522,7 @@ The epilogue uses TMA store to write the output O tile from shared memory back
 to global memory. Only one elected thread per warp issues the TMA store:
 
 ```cpp
-// Source: flash-attention-fa4-v4.0.0.beta4/hopper/epilogue_fwd.hpp
+// Source: flash-attention-fa4-v4.0.0.beta8/hopper/epilogue_fwd.hpp
 
 Tensor mO = params.tma_store_O.get_tma_tensor(params.shape_O)(_, _, bidh, bidb, split_idx);
 Tensor gO = local_tile(mO, select<0, 1>(TileShape_MNK_PV{}), make_coord(m_block, _0{}));
@@ -543,7 +543,7 @@ Flash Attention's backward pass uses `cp.reduce.async.bulk` to atomically
 accumulate gradient tiles from shared memory into global memory:
 
 ```cpp
-// Source: flash-attention-fa4-v4.0.0.beta4/hopper/copy_sm90_bulk_reduce.hpp
+// Source: flash-attention-fa4-v4.0.0.beta8/hopper/copy_sm90_bulk_reduce.hpp
 
 struct SM90_BULK_REDUCE_ADD {
   CUTE_HOST_DEVICE static void

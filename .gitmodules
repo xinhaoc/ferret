@@ -1,0 +1,30 @@
+[submodule "resources/documentsass"]
+	path = resources/documentsass
+	url = https://github.com/0xD0GF00D/DocumentSASS.git
+[submodule "resources/flashmla-main"]
+	path = resources/flashmla-main
+	url = https://github.com/deepseek-ai/FlashMLA.git
+[submodule "resources/thunderkittens-main"]
+	path = resources/thunderkittens-main
+	url = https://github.com/HazyResearch/ThunderKittens.git
+[submodule "resources/nccl-2.29.7-1"]
+	path = resources/nccl-2.29.7-1
+	url = https://github.com/NVIDIA/nccl.git
+[submodule "resources/deepgemm-2.1.1.post3"]
+	path = resources/deepgemm-2.1.1.post3
+	url = https://github.com/deepseek-ai/DeepGEMM.git
+[submodule "resources/flash-attention-fa4-v4.0.0.beta8"]
+	path = resources/flash-attention-fa4-v4.0.0.beta8
+	url = https://github.com/Dao-AILab/flash-attention.git
+[submodule "resources/flashinfer-0.6.7.post3"]
+	path = resources/flashinfer-0.6.7.post3
+	url = https://github.com/flashinfer-ai/flashinfer.git
+[submodule "resources/cutlass-4.4.2"]
+	path = resources/cutlass-4.4.2
+	url = https://github.com/NVIDIA/cutlass.git
+[submodule "resources/triton-3.6.0"]
+	path = resources/triton-3.6.0
+	url = https://github.com/triton-lang/triton.git
+[submodule "resources/tensorrt-llm-1.2.0"]
+	path = resources/tensorrt-llm-1.2.0
+	url = https://github.com/NVIDIA/TensorRT-LLM.git

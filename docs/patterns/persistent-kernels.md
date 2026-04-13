@@ -25,7 +25,7 @@ each CTA:
 
 ## DeepGemm: stride-based scheduler
 
-From `deepgemm-2.1.1/deep_gemm/include/deep_gemm/common/scheduler.cuh`:
+From `deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/common/scheduler.cuh`:
 
 ```cpp
 __device__ __forceinline__ bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {

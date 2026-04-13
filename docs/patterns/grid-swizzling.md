@@ -104,7 +104,7 @@ static int32_t get_log_swizzle_size(int problem_ctas_m, int problem_ctas_n, int 
 
 ## DeepGemm: L2-Optimized Group Size
 
-From `deepgemm-2.1.1/deep_gemm/include/deep_gemm/common/scheduler.cuh`:
+From `deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/common/scheduler.cuh`:
 
 ```cpp
 template <...>

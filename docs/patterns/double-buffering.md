@@ -118,7 +118,7 @@ struct PipelineState {
 
 ## FlashAttention: Overlapped QK/PV GEMMs (2-stage)
 
-From `flash-attention-fa4-v4.0.0.beta4/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp`:
+From `flash-attention-fa4-v4.0.0.beta8/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp`:
 
 FlashAttention uses `kStages=2` with separate K and V pipelines. The key innovation is **IntraWGOverlap**: the consumer interleaves QK and PV GEMMs across iterations.
 

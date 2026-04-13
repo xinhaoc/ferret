@@ -2,7 +2,7 @@
 
 ## Warp-Level Reduction
 
-From `flash-attention-fa4-v4.0.0.beta4/hopper/utils.h`:
+From `flash-attention-fa4-v4.0.0.beta8/hopper/utils.h`:
 
 ```cpp
 template<typename T>
@@ -41,7 +41,7 @@ FlashAttention uses `Allreduce<4>` for online softmax — in SM90's WGMMA layout
 
 ## Block-Level Reduction (Cross-Warp)
 
-From `flashinfer-0.6.7/include/flashinfer/norm.cuh` (RMSNorm kernel):
+From `flashinfer-0.6.7.post3/include/flashinfer/norm.cuh` (RMSNorm kernel):
 
 ```cpp
 // Step 1: Each thread accumulates over its elements
@@ -76,7 +76,7 @@ Pattern: thread-local accumulate → warp shuffle → shared memory → warp 0 r
 
 The key algorithmic enabler for fused attention. Computes softmax incrementally across K-tiles without materializing the full N×N attention matrix.
 
-From `flash-attention-fa4-v4.0.0.beta4/hopper/softmax.h`:
+From `flash-attention-fa4-v4.0.0.beta8/hopper/softmax.h`:
 
 ### State: running max and sum per row
 
@@ -187,7 +187,7 @@ Constraint: entire row fits in SRAM (BLOCK_SIZE = next_power_of_2(n_cols)). Pers
 
 ## RMSNorm (FlashInfer)
 
-From `flashinfer-0.6.7/include/flashinfer/norm.cuh`:
+From `flashinfer-0.6.7.post3/include/flashinfer/norm.cuh`:
 
 ```cpp
 // Launch: one block per row, dim3(32, num_warps)

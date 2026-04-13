@@ -78,7 +78,7 @@ Standard attention: `O = softmax(Q @ K^T) @ V` in 3 kernels. The N×N attention 
 
 ### The fused loop
 
-From `flash-attention-fa4-v4.0.0.beta4/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp`, the `fwd_step` lambda:
+From `flash-attention-fa4-v4.0.0.beta8/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp`, the `fwd_step` lambda:
 
 ```cpp
 auto fwd_step = [&](int const n_block, auto mask_fn, auto check_inf_type) {

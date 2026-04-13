@@ -154,7 +154,7 @@ struct matmul_template {
 
 ## Real Example: DeepGemm FP8 GEMM (Hopper)
 
-From `deepgemm-2.1.1/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh`:
+From `deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh`:
 
 ```cpp
 // WGMMA atom: 64×N×32 for FP8 (e4m3 × e4m3 → FP32)

@@ -30,7 +30,8 @@ file_reads.json
 kernel            # compiled kernel binary in workspace
 kernel.cubin
 
-# TODO: planned submodules — these are vendored library sources the agent
-# searches for reference code. Keeping them local for now; will convert to
-# git submodules once the set stabilizes. Do not commit to the ferret repo.
-resources/
+# Vendored library sources live in resources/ as git submodules — committed
+# via .gitmodules. Their internal build artifacts are ignored below.
+resources/**/__pycache__/
+resources/**/*.pyc
+resources/**/build/

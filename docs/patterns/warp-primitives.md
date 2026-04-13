@@ -6,7 +6,7 @@
 
 In SM90's WGMMA layout, each row of the attention score matrix is split across 4 threads. FlashAttention uses `Allreduce<4>` for row-wise max and sum:
 
-From `flash-attention-fa4-v4.0.0.beta4/hopper/softmax.h`:
+From `flash-attention-fa4-v4.0.0.beta8/hopper/softmax.h`:
 
 ```cpp
 // quad_allreduce_ reduces across 4 threads sharing an attention score row
@@ -26,7 +26,7 @@ Called in the online softmax with `MaxOp<float>` for row-max and `SumOp<float>` 
 
 When `stmatrix` hardware support is missing, FlashInfer uses `__shfl_sync` to reconstruct tile data across lanes:
 
-From `flashinfer-0.6.7/include/flashinfer/mma.cuh`:
+From `flashinfer-0.6.7.post3/include/flashinfer/mma.cuh`:
 
 ```cpp
 const uint32_t tx = threadIdx.x;
@@ -49,7 +49,7 @@ Each thread shuffles register values to the appropriate lane to reconstruct the 
 
 ### FlashAttention: Warp-Cooperative Binary Search
 
-From `flash-attention-fa4-v4.0.0.beta4/hopper/tile_scheduler.hpp`:
+From `flash-attention-fa4-v4.0.0.beta8/hopper/tile_scheduler.hpp`:
 
 ```cpp
 int batch_idx_in_group = __popc(__ballot_sync(0xffffffff,
@@ -62,7 +62,7 @@ Each lane holds data for a different batch element. `__ballot_sync` creates a bi
 
 ### NCCL: Integer Division via Ballot
 
-From `nccl-2.29.7/src/device/sendrecv.h`:
+From `nccl-2.29.7-1/src/device/sendrecv.h`:
 
 ```cpp
 // Fastest way to compute warp-uniform division x/y in [0,32):
@@ -85,7 +85,7 @@ Each lane checks its tile elements for NaN, `__ballot_sync` aggregates — any s
 
 ### NCCL: Role Detection Mask
 
-From `nccl-2.29.7/src/device/prims_simple.h`:
+From `nccl-2.29.7-1/src/device/prims_simple.h`:
 
 ```cpp
 uint32_t mask = __ballot_sync(~0u,

@@ -310,7 +310,7 @@ if (is_leader_cta && elect_one_sync())
 // Non-leader CTA (rank 1): just arrive, no byte expectation
 if (!is_leader_cta && elect_one_sync())
     full_barriers[s]->arrive(0u);
-// See: deepgemm-2.1.1/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh lines 243-246
+// See: deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh lines 243-246
 ```
 
 Key details:

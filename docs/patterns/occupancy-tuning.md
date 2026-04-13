@@ -29,7 +29,7 @@ See `docs/profiling/gpu-specs.md` for exact limits per architecture.
 
 ### DeepGemm: 1 block per SM (maximum registers)
 
-From `deepgemm-2.1.1/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh`:
+From `deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh`:
 
 ```cpp
 __global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
@@ -69,7 +69,7 @@ Hopper can dynamically redistribute registers between warp groups at runtime via
 
 ### FlashAttention: Producer gets 24, consumer gets 240
 
-From `flash-attention-fa4-v4.0.0.beta4/hopper/flash_fwd_kernel_sm90.h`:
+From `flash-attention-fa4-v4.0.0.beta8/hopper/flash_fwd_kernel_sm90.h`:
 
 ```cpp
 // Computed based on number of MMA warpgroups and whether TMA is used
@@ -92,7 +92,7 @@ Producer only needs 24 registers (just issuing TMA commands). Consumer gets 240 
 
 ### DeepGemm: 48 for TMA, 224 for math
 
-From `deepgemm-2.1.1/deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh`:
+From `deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh`:
 
 ```cpp
 constexpr uint32_t kNumTMARegisters = 48;
@@ -109,7 +109,7 @@ cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
 ### Standard opt-in (>48KB)
 
-From `flash-attention-fa4-v4.0.0.beta4/hopper/flash_bwd_launch_template.h`:
+From `flash-attention-fa4-v4.0.0.beta8/hopper/flash_bwd_launch_template.h`:
 
 ```cpp
 if (smem_size >= 48 * 1024) {
@@ -171,7 +171,7 @@ Used at runtime to choose the best GEMM tile configuration: returns 0 for infeas
 
 ### FlashInfer: Occupancy-driven grid sizing
 
-From `flashinfer-0.6.7/include/flashinfer/norm.cuh`:
+From `flashinfer-0.6.7.post3/include/flashinfer/norm.cuh`:
 
 ```cpp
 int num_blocks_per_sm = 0, num_sms = 0;

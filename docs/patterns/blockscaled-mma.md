@@ -501,5 +501,5 @@ The `--expt-relaxed-constexpr` flag is required for CUTLASS headers. You only ne
 | ThunderKittens | `resources/thunderkittens-main/kernels/gemm/nvfp4_b200/nvfp4_b200_gemm.cu` | Full custom kernel with kittens.cuh, 2-CTA cluster |
 | CUTLASS 72a | `resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm/72a_blackwell_nvfp4_bf16_gemm.cu` | CUTLASS builder, BF16 output |
 | CUTLASS 72b | Same directory, `72b_blackwell_nvfp4_nvfp4_gemm.cu` | CUTLASS builder, FP4 output with output scales |
-| FlashInfer | `resources/flashinfer-0.6.7/include/flashinfer/gemm/fp4_gemm_template_sm100.h` | CUTLASS-based template |
+| FlashInfer | `resources/flashinfer-0.6.7.post3/include/flashinfer/gemm/fp4_gemm_template_sm100.h` | CUTLASS-based template |
 | CUTLASS blockscaled MMA | `resources/cutlass-4.4.2/include/cutlass/gemm/collective/sm100_blockscaled_mma_warpspecialized.hpp` | Internal MMA implementation |

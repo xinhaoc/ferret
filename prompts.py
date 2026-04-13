@@ -182,6 +182,14 @@ Shared cluster. Before any benchmark/profiling:
 eval $(./pick_gpu.sh)
 ```
 
+## Benchmarking — read before measuring anything
+- Use cudaEvents (start.record / kernel / end.record / sync) — not CPU clock.
+- Warmup ≥ 20 iters before timing. Median of ≥ 100 iters, not mean.
+- L2 cache flush between iters: read a >100MB junk buffer (B200 L2 = 96MB).
+  Without flush, weights ≤ 100MB stay hot — your "perf" reflects L2 hits, not HBM.
+  This silently lies on shapes < 100MB and is the #1 measurement bug.
+- Pick a quiet GPU first: `eval $(./pick_gpu.sh)`. Other users' jobs distort timing.
+
 ## Forbidden patterns
 - "complex to implement" / "multi-iteration project" / "next run should..." — implement it NOW
 - "Let me start simple with CUDA cores" — dead end, hard performance ceiling

@@ -243,8 +243,20 @@ class CudaOrchestratorV2:
                 empty_iterations = 0
             except Exception as e:
                 err_str = str(e)
-                if "too long" in err_str or "too many tokens" in err_str.lower():
-                    logger.warning(f"Context limit hit. Resetting agent...")
+                err_lower = err_str.lower()
+                # Reset on: (a) context overflow, (b) the known malformed-message
+                # 400 that hits when memory contains an empty-content assistant
+                # turn at high message counts. v3 lithos had this same bug; the
+                # fix is identical — discard corrupted memory, replay first-turn.
+                is_context = "too long" in err_str or "too many tokens" in err_lower
+                is_malformed = (
+                    "invalid_request_error" in err_lower
+                    and "messages." in err_lower
+                    and "content" in err_lower
+                )
+                if is_context or is_malformed:
+                    reason = "context limit" if is_context else "malformed message 400"
+                    logger.warning(f"{reason} — resetting agent and replaying first-turn")
                     self.main_agent = self._make_optimizer()
                     self.main_agent.step_callback = self._log_step_fn
                     await self._first_turn(task, has_kernel=True)

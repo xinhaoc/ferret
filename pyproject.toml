@@ -1,0 +1,14 @@
+[project]
+name = "ferret"
+version = "0.1.0"
+description = "Autonomous CUDA kernel optimization agent with structured task specs and per-config scoring"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "lithosai-motus>=0.2.0",
+    "pyyaml>=6.0",
+]
+
+# Note: ferret is currently run in place (python -m ferret.main ...) rather
+# than installed. A src/ferret/ restructure is future work; until then this
+# file declares metadata + deps but is not a buildable distribution.

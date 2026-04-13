@@ -173,5 +173,5 @@ def create_optimizer(
             "think": FunctionTool(think),
         },
         max_steps=80,
-        cache_policy=CachePolicy.AUTO_1H,
+        cache_policy=CachePolicy.STATIC,
     )

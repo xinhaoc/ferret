@@ -303,6 +303,16 @@ class CudaOrchestratorV2:
         final_best = await self._get_best_tflops()
         logger.info(f"Done in {elapsed/60:.1f} min. Best: {final_best:.1f} TFLOPS")
 
+        # Dump motus execution trace so we can diagnose any crashes offline.
+        # Purely observational — doesn't change agent behavior.
+        try:
+            trace_path = self.workspace_path / "motus_trace.json"
+            trace = self.main_agent.get_execution_trace()
+            trace_path.write_text(json.dumps(trace, default=str, indent=2))
+            logger.info(f"motus trace → {trace_path}")
+        except Exception as e:
+            logger.warning(f"could not dump motus trace: {e}")
+
     # ── Turns ──
 
     def _render_hints_block(self) -> str:

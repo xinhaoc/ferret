@@ -95,6 +95,22 @@ FlashInfer, FlashMLA, ThunderKittens, TRT-LLM, Triton) are gitignored and will
 become git submodules. For now, copy them locally into `ferret/resources/`
 before running.
 
+## Submodule maintenance
+
+Before committing after any submodule change (bump, rename, add, remove):
+
+```bash
+python scripts/check_resource_refs.py           # must exit 0
+python scripts/check_resource_refs.py --verbose # shows per-submodule ref counts
+```
+
+The script walks every `*.md` and `*.py` under the repo and verifies that each
+`resources/<submodule>/<path>` reference resolves to an existing file in the
+pinned submodule. It also detects drift between `.gitmodules` and the on-disk
+`resources/` tree (submodules declared but not cloned, orphan directories,
+renamed without updating `.gitmodules`). Exit code 0 when clean, 1 on any
+issue. Zero dependencies — stdlib only.
+
 ## How the run loop works
 
 1. `main.py` loads + validates `task.yaml`, checks the baseline source path

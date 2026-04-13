@@ -14,7 +14,10 @@ cd ../..
 git mv resources/<old-name> resources/<new-name>   # if the version suffix changes
 git add resources/<new-name>
 # then update every reference in docs/ and tools/doc_loader.py to the new suffix
+python scripts/check_resource_refs.py              # verify nothing is stale
 ```
+
+`scripts/check_resource_refs.py` walks all `*.md` + `*.py` under the repo and verifies every `resources/<name>/<path>` reference resolves to an existing file in the pinned submodule. It also detects drift between `.gitmodules` and on-disk directories (renamed, orphaned, uncloned). Run it after any submodule change; exits 1 on any issue.
 
 Current pins:
 

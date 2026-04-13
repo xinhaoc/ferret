@@ -174,5 +174,4 @@ def create_optimizer(
         },
         max_steps=80,
         cache_policy=CachePolicy.AUTO_1H,
-        memory_type="compact",
     )

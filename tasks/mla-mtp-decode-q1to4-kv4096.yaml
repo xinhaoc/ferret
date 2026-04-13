@@ -33,7 +33,7 @@ problem:
 
     Output must match trtllm_batch_decode_with_kv_cache_mla bit-for-bit
     within max relative error < 5e-3. The reference lives in
-    resources/flashinfer-0.6.7 (FlashInfer calls into the trtllm-gen cubin).
+    resources/flashinfer-0.6.7.post3 (FlashInfer calls into the trtllm-gen cubin).
 
   shapes:
     NUM_HEADS: 128
@@ -46,7 +46,7 @@ problem:
 # re-measuring per ferret run — set pre_measured: false if you want the
 # agent to re-measure each startup.
 baseline:
-  source: resources/flashinfer-0.6.7
+  source: resources/flashinfer-0.6.7.post3
   command: ""            # empty = don't run; trust pre_measured numbers below
   pre_measured: true
 

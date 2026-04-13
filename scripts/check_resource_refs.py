@@ -98,7 +98,11 @@ def collect_refs(
 ) -> dict[str, set[tuple[str, str]]]:
     """Walk the tree, return {submodule: {(subpath, source-file)}}."""
     refs: dict[str, set[tuple[str, str]]] = defaultdict(set)
-    for f in list(root.rglob("*.md")) + list(root.rglob("*.py")):
+    extensions = ("*.md", "*.py", "*.yaml", "*.yml")
+    files: list[Path] = []
+    for ext in extensions:
+        files.extend(root.rglob(ext))
+    for f in files:
         # Skip anything inside resources/ itself or inside git metadata
         rel = f.relative_to(root)
         if rel.parts and (rel.parts[0] == "resources" or rel.parts[0] == ".git"):

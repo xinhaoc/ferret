@@ -59,7 +59,7 @@ problem:
 # `source:` is the path to the reference implementation the agent can read
 # while reproducing. It MUST exist or the agent stops with an error.
 baseline:
-  source: resources/flashinfer-0.6.7
+  source: resources/flashinfer-0.6.7.post3
   command: python3 baselines/run_trtllm_mtp.py --kv 4096
   pre_measured: true        # set false if you want the agent to (re)measure
 

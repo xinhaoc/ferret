@@ -1,0 +1,106 @@
+# ferret task spec — Qwen3-8B decode-phase linear projections on B200
+#
+# Status (2026-04-13):
+#   baseline_tflops values below are ESTIMATES from HBM physics (~6 TB/s
+#   effective bandwidth on B200 → ~4–5.5 TFLOPS per config depending on
+#   weight size). They will be WRONG by 5–20%. The first-iteration hint
+#   tells the agent to run `baselines/run_decode_linear_baseline.py`
+#   as its first action and use the measured numbers for its own
+#   judgment. After the first run, update this file with measured values.
+#
+# Goal: beat trtllm-gen by 10% across all 5 shapes (target_ratio=1.10).
+
+name: qwen3-8b-decode-linear-b200
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    Qwen3-8B decode-phase linear projections. Single-token (M=1), memory-bound.
+
+      out[1, N] = in[1, K] @ weight[N, K]^T  (+residual for O and Down projections)
+
+    bf16 input, bf16 weight, bf16 output, fp32 accumulator.
+
+    The 5 projections differ only in (N, K) and whether a residual add is
+    fused. All are HBM-bandwidth-bound (weight streaming dominates arithmetic).
+    B200 peak HBM ~8 TB/s; practical ~6 TB/s effective for bf16 reads after
+    cache/contention overhead. Theoretical TFLOPS ceiling for M=1 GEMV at
+    6 TB/s ≈ 6.0.
+
+    Kernel layout freedom: agent may use ONE unified templated kernel with
+    runtime shape dispatch, OR multiple __global__ kernels in the same
+    kernel.cu with host-side selection. LMHead (N=153600) will likely want
+    different tiling than QKV (N=6144). Agent decides.
+
+    Residual fusion: for O and Down, out += in. Fold into the GEMV
+    epilogue — do NOT launch a separate kernel for the add.
+
+  shapes:
+    M: 1
+
+baseline:
+  source: resources/tensorrt-llm-1.2.0/cpp/tensorrt_llm/kernels/trtllmGenKernels/gemm
+  command: "python3 baselines/run_decode_linear_baseline.py --backend trtllm_gen"
+  pre_measured: true    # estimates below; agent re-measures live in iter 0
+
+configs:
+  - name: QKV
+    args: { M: 1, N: 6144, K: 4096, residual: false }
+    baseline_tflops: 4.5   # ESTIMATE — 48MB weight, HBM-bound
+    target_ratio: 1.10
+    weight: 1.0
+
+  - name: O
+    args: { M: 1, N: 4096, K: 4096, residual: true }
+    baseline_tflops: 4.0   # ESTIMATE — 32MB weight
+    target_ratio: 1.10
+    weight: 1.0
+
+  - name: GateUp
+    args: { M: 1, N: 24576, K: 4096, residual: false }
+    baseline_tflops: 5.0   # ESTIMATE — 192MB weight
+    target_ratio: 1.10
+    weight: 1.0
+
+  - name: Down
+    args: { M: 1, N: 4096, K: 12288, residual: true }
+    baseline_tflops: 5.0   # ESTIMATE — 96MB weight, longer K
+    target_ratio: 1.10
+    weight: 1.0
+
+  - name: LMHead
+    args: { M: 1, N: 153600, K: 4096, residual: false }
+    baseline_tflops: 5.5   # ESTIMATE — 1.2GB weight, fully HBM-saturated
+    target_ratio: 1.10
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only — kernel runs inside a framework managing its own streams. No cudaStreamCreate, no cudaEventRecord overlap."
+  - "No CUDA graphs. Focus on kernel-level optimization, not launch overhead."
+  - "cta_group::2 (2-CTA cluster MMA) IS ALLOWED for this task. Use it if it helps throughput on large-N cases like LMHead."
+  - "Output bit-compatible with the baseline: max relative error < 5e-3 across all 5 configs."
+  - "Residual fusion is in-kernel epilogue only — do not launch a separate add kernel for O/Down."
+
+hints:
+  - "FIRST ACTION: run `baselines/run_decode_linear_baseline.py` to establish the real trtllm-gen numbers. The baseline_tflops values in this spec are rough physics estimates and may be off by 5-20%. Record the measured numbers in progress.md and judge your kernel against those, not the spec estimates."
+  - "The baseline script's trtllm_gen backend is a stub — it raises NotImplementedError. Your job during REPRODUCE is to either (a) implement it by calling into resources/flashinfer-0.6.7.post3/include/flashinfer/gemm/tgv_gemm.cuh (the sm100 BF16 decode-linear GEMM using CUTLASS primitives), or (b) fall back to --backend cublas (torch.matmul, reasonable proxy). For (a) the canonical CUTLASS pattern is in resources/cutlass-4.4.2/examples/93_blackwell_low_latency_gqa/tgv_gqa.cuh."
+  - "M=1 makes this memory-bound. Vectorized BF16 weight loads (cp.async.bulk / TMA) and K-dim tiling matter more than MMA throughput. Consider CTA-cooperative weight loading for LMHead's N=153600 — a single CTA streaming 1.2GB is ~150us at best."
+  - "For split-K strategies, the output is small (N elements), so a separate reduction kernel is cheap. Don't overthink it."
+  - "Free to use multiple __global__ functions in kernel.cu with host dispatch. Small-N (O, QKV) may want warp-wide GEMV; large-N (LMHead, GateUp) may want CTA/cluster-level GEMV with multicast."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 90
+  max_tokens: 2000000
+
+output:
+  result_format: kernel_result_json
+  result_keys: [QKV, O, GateUp, Down, LMHead]

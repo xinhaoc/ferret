@@ -122,7 +122,7 @@ async def main():
     logger.info(f"Configs      : {[c.name for c in spec.configs]} (scoring={spec.scoring})")
     logger.info(f"Budget       : {max_iterations} iter / {spec.budget.max_wall_minutes}min / {spec.budget.max_tokens:,} tokens")
 
-    from lithos.models import AnthropicChatClient
+    from motus.models import AnthropicChatClient
     client = AnthropicChatClient()
 
     from .orchestrator import CudaOrchestratorV2

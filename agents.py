@@ -7,9 +7,9 @@
 
 from pathlib import Path
 
-from lithos.agent import ReActAgent
-from lithos.models.base import CachePolicy
-from lithos.tools import FunctionTool
+from motus.agent import ReActAgent
+from motus.models.base import CachePolicy
+from motus.tools import FunctionTool
 
 from .prompts import OPTIMIZER_PROMPT
 from .tools.profiler import extract_kernel_names

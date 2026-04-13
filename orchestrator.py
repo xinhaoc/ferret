@@ -24,7 +24,6 @@ import yaml
 from .cost_tracker import CostTracker
 from .state import RunState, compute_state
 from .tools.compiler import Compiler
-from .tools.tester import Tester
 from .tools.doc_loader import DocLoader
 
 logger = logging.getLogger("ferret")
@@ -73,8 +72,6 @@ class CudaOrchestratorV2:
         self.doc_loader = DocLoader(self.agent_root, workspace_path=self.workspace_path)
         ws_abs = str(self.workspace_path.resolve())
         self.compiler = Compiler(sh_fn, arch=arch, agent_root=str(self.agent_root), cwd=ws_abs)
-        gpu_prefix = f"eval $({self.agent_root}/pick_gpu.sh) && " if (self.agent_root / "pick_gpu.sh").exists() else ""
-        self.tester = Tester(sh_fn, gpu_prefix=gpu_prefix, cwd=ws_abs)
 
         # Cost tracking
         log_path = Path(log_dir or workspace_path) / "cache_trace.jsonl"
@@ -137,7 +134,7 @@ class CudaOrchestratorV2:
         return create_optimizer(
             self._client, self._model_name,
             self.workspace_path, self.kernel_path,
-            self.doc_loader, self.compiler, self.tester,
+            self.doc_loader, self.compiler,
             self.sh, self.agent_root, self._kernel_read_flag,
         )
 

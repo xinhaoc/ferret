@@ -22,7 +22,6 @@ def create_optimizer(
     kernel_path: Path,
     doc_loader,
     compiler,
-    tester,
     sh_fn,
     agent_root: Path,
     kernel_read_flag: dict,

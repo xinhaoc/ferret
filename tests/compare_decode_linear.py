@@ -176,17 +176,14 @@ def load_flashinfer() -> Backend:
             fn = getattr(mod, fn_name, None)
             if fn is not None:
                 def call(x, w, r, out, N, K, _fn=fn):
-                    # tgv_gemm_sm100 expects B in [K, N] layout (mat1[M,K] @
-                    # mat2[K,N]). Our kernel takes w in [N, K]; transpose once
-                    # per unique w (cached by data_ptr so same w reuses across
-                    # the 200 benchmark iters).
-                    if getattr(call, '_wt_ptr', None) != w.data_ptr():
-                        call._wt_ptr = w.data_ptr()
-                        call._wt_kn = w.t().contiguous()
-                    w_kn = call._wt_kn
+                    # tgv_gemm_sm100 signature:
+                    #   a: (M, K) row-major, b: (K, N) COLUMN-major, bias: (N,)
+                    # Our w is (N, K) row-major — .t() gives a (K, N) VIEW that
+                    # is column-major (same underlying data). Must NOT be made
+                    # contiguous, or it becomes row-major and fails.
+                    w_col = w.t()  # (K, N), column-major view of (N, K) row-major
 
-                    # bias is REQUIRED positional. When no residual, pass a
-                    # cached zero tensor of shape [N].
+                    # bias is (N,); residual is (1, N) → flatten.
                     if r is not None:
                         bias = r.view(-1)
                     else:
@@ -199,10 +196,7 @@ def load_flashinfer() -> Backend:
                             )
                         bias = call._zero_cache[bkey]
 
-                    try:
-                        y = _fn(x, w_kn, bias)
-                    except TypeError:
-                        y = _fn(x, w_kn, bias=bias)
+                    y = _fn(x, w_col, bias)
                     out.copy_(y.view(1, N) if y.dim() == 1 else y)
                     return out
                 return Backend("flashinfer_tgv", True, call_fn=call,

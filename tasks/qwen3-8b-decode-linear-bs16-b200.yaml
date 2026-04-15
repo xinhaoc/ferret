@@ -1,0 +1,118 @@
+# ferret task spec — Qwen3-8B decode linear at M=16 on B200
+#
+# Target: beat CUTLASS (Blackwell BF16 GEMM) by 30% across all 5 projections
+# at batch size M=16 (typical for speculative decoding / small-batch serving).
+#
+# No pre-set baseline_tflops — agent measures CUTLASS itself via its own
+# benchmark harness and emits KERNEL_RESULT_REFERENCE. This keeps the
+# REPRODUCE stage honest: agent can't cheat the stage gate with an
+# artificially low estimate.
+
+name: qwen3-8b-decode-linear-bs16-b200
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    Qwen3-8B decode-phase linear projections at batch size M=16 on B200.
+    BF16 input, BF16 weight, BF16 output, FP32 accumulator.
+
+      out[16, N] = in[16, K] @ weight[N, K]^T   (+ residual for O, Down)
+
+    The 5 Qwen3-8B projections at M=16:
+      QKV     N=6144    K=4096   (no residual)
+      O       N=4096    K=4096   (+residual)
+      GateUp  N=24576   K=4096   (no residual)
+      Down    N=4096    K=12288  (+residual)
+      LMHead  N=153600  K=4096   (no residual)
+
+    Unlike the M=1 decode case, M=16 makes tensor cores the right tool.
+    tcgen05's minimum MMA tile is M=64, so padding from M=16 wastes
+    only 4x of the lanes (vs 64x waste at M=1). A well-tuned tcgen05
+    kernel should beat CUDA-core FMA by 3-5x on these shapes. Expect
+    the winning kernel to use tcgen05, cluster MMA (cta_group::2), and
+    TMA bulk async loads.
+
+    Kernel layout freedom: one unified kernel with runtime dispatch, OR
+    multiple __global__ kernels in kernel.cu with host-side selection.
+    kernel.cu may #include <cutlass/...> headers — CUTLASS is available
+    in resources/cutlass-4.4.2/, header-only. Self-containment is not
+    required this task.
+
+    Residual (O, Down): fuse into the GEMM epilogue. Do not launch a
+    separate add kernel.
+
+  shapes:
+    M: 16
+
+baseline:
+  # Two CUTLASS BF16 GEMM candidates — agent is expected to benchmark
+  # BOTH during REPRODUCE and use whichever is faster as the reference.
+  # See hints below for the full instruction.
+  source: resources/cutlass-4.4.2/examples
+
+configs:
+  - name: QKV
+    args: { M: 16, N: 6144, K: 4096, residual: false }
+    target_ratio: 1.30
+    weight: 1.0
+
+  - name: O
+    args: { M: 16, N: 4096, K: 4096, residual: true }
+    target_ratio: 1.30
+    weight: 1.0
+
+  - name: GateUp
+    args: { M: 16, N: 24576, K: 4096, residual: false }
+    target_ratio: 1.30
+    weight: 1.0
+
+  - name: Down
+    args: { M: 16, N: 4096, K: 12288, residual: true }
+    target_ratio: 1.30
+    weight: 1.0
+
+  - name: LMHead
+    args: { M: 16, N: 153600, K: 4096, residual: false }
+    target_ratio: 1.30
+    weight: 1.0
+
+# min_ratio: every config must clear 1.30x — one straggler fails the
+# whole task. Weighted_avg would let a big win on LMHead mask a loss
+# on O, which would be dishonest.
+scoring: min_ratio
+
+# REPRODUCE must actually happen this time. 0.9 means the kernel has to
+# reach 90% of CUTLASS (measured, not estimated) before OPTIMIZE
+# engages. A dumb CUDA-core FMA GEMM at M=16 will get maybe 20-30% of
+# tcgen05 CUTLASS — so the agent stays in REPRODUCE until it ports
+# tensor cores. That's the point.
+stage_gate:
+  ratio: 0.9
+  strict: false
+
+constraints:
+  - "Single CUDA stream only — kernel runs inside a framework managing its own streams. No cudaStreamCreate, no cudaEventRecord overlap."
+  - "No CUDA graphs."
+  - "cta_group::2 (2-CTA cluster MMA) IS ALLOWED and likely required to beat CUTLASS at LMHead's large N."
+  - "Output bit-compatible with the CUTLASS baseline: max relative error < 5e-3 across all 5 configs."
+  - "Residual fusion is in-kernel epilogue only — no separate add kernel for O/Down."
+
+hints:
+  - "FIRST ACTION during REPRODUCE: write a benchmark harness (call it baselines/cutlass_bench.cu or similar) that runs TWO CUTLASS BF16 GEMM variants on all 5 shapes at M=16, measures TFLOPS with L2-flush + median-of-200 methodology, and reports which is faster per shape. Candidates:
+      (a) resources/cutlass-4.4.2/examples/71_blackwell_gemm_with_collective_builder/71_blackwell_gemm_with_collective_builder.cu — uses CollectiveBuilder, templated (instantiate with cutlass::bfloat16_t for A, B, C; float for accumulator)
+      (b) resources/cutlass-4.4.2/examples/74_blackwell_gemm_streamk/ — stream-K scheduler; better for shapes with few output tiles (LMHead has huge N, may not help)
+    Record the winner per shape in progress.md. Use THAT winner's numbers as KERNEL_RESULT_REFERENCE going forward. Stay consistent — don't switch reference mid-run."
+  - "CUTLASS is header-only; you can #include it from kernel.cu if you want, OR hand-write tcgen05 PTX. Your call. Keep in mind the baseline is CUTLASS — going CUTLASS-to-CUTLASS is a fair fight, hand-written PTX may beat it if you tune well."
+  - "At M=16 the tcgen05 mma instruction wants M>=64. You'll pad M=16 → M=64 (4x compute waste) unless you're clever. cta_group::2 helps LMHead (N=153600 → split across 2 CTAs per cluster). For O (N=4096), ordinary 1-CTA tcgen05 is probably enough."
+  - "Shapes span 3 orders of magnitude in weight size (O 32MB ← LMHead 1.2GB). What's optimal for O is NOT optimal for LMHead. Use multiple __global__ kernels with host-side dispatch if needed — it's allowed."
+  - "Key references beyond CUTLASS examples 71/74: docs/ptx-isa-9.2/09-instruction-set/parallel-synchronization-and-communication-instructions.md (tcgen05 mma/wait), resources/flashinfer-0.6.7.post3/include/flashinfer/gemm/tgv_gemm.cuh (a working sm100 BF16 GEMM using CUTLASS primitives — close to what you need to build)."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [QKV, O, GateUp, Down, LMHead]

@@ -499,8 +499,9 @@ class CudaOrchestratorV2:
         current TFLOPS vs its baseline, with ✓ marker for configs above their
         target_ratio and ← WORST marker for the score bottleneck.
         """
-        # Fresh workspace (no tagged kernel yet) — don't render a table of zeros.
-        # Fresh workspace OR no reference measured yet — show targets only
+        # Three branches: no kernel yet → show targets; have kernel but no
+        # reference measured → show kernel numbers + nag for KERNEL_RESULT_REFERENCE;
+        # both present → full per-config table with ratios.
         if not state.has_any_kernel:
             lines = [
                 f"## Iteration {iteration} — {state.stage} stage (no kernel yet)",

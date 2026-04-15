@@ -4,11 +4,14 @@ Loads workspace/task.yaml into a structured TaskSpec object with validation.
 Standalone — imports nothing from orchestrator. Safe to test in isolation.
 
 Usage:
-    from .task_spec import load_task_spec, compute_score, parse_kernel_output
+    from .task_spec import (
+        load_task_spec, compute_score, parse_kernel_output, parse_reference_output,
+    )
 
     spec = load_task_spec("workspace/task.yaml")
-    results = parse_kernel_output(kernel_stdout)
-    score, ratios = compute_score(results, spec)
+    results = parse_kernel_output(commit_body)              # KERNEL_RESULT
+    reference = parse_reference_output(commit_body)         # KERNEL_RESULT_REFERENCE
+    score, ratios = compute_score(results, reference, spec) # ratio = kernel/reference
 
 Standalone test:
     python3 task_spec.py tasks/template.yaml

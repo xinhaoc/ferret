@@ -176,16 +176,30 @@ def load_flashinfer() -> Backend:
             fn = getattr(mod, fn_name, None)
             if fn is not None:
                 def call(x, w, r, out, N, K, _fn=fn):
-                    # tgv_gemm signature varies. Typical: tgv_gemm(a, b, out=...)
-                    # where b is [N, K] and out is [M, N]. The residual is
-                    # applied externally unless the fn supports it directly.
-                    y = _fn(x, w)
+                    # tgv_gemm_sm100(A, B, bias, ...) — bias is REQUIRED positional.
+                    # When no residual, pass a zero-tensor to match our kernel's
+                    # epilogue behavior (kernel adds nothing when residual=nullptr).
                     if r is not None:
-                        y = y + r
-                    out.copy_(y)
+                        bias = r.view(-1)  # flatten [1,N] -> [N] for bias
+                    else:
+                        # Cache the zero bias per config to avoid per-call alloc
+                        key = (x.device.index, N)
+                        if not hasattr(call, '_zero_cache'):
+                            call._zero_cache = {}
+                        if key not in call._zero_cache:
+                            call._zero_cache[key] = torch.zeros(
+                                N, dtype=torch.bfloat16, device=x.device,
+                            )
+                        bias = call._zero_cache[key]
+                    try:
+                        y = _fn(x, w, bias)
+                    except TypeError:
+                        # Some versions accept a 4th dtype arg or kwargs. Try kwargs.
+                        y = _fn(x, w, bias=bias)
+                    out.copy_(y.view(1, N) if y.dim() == 1 else y)
                     return out
                 return Backend("flashinfer_tgv", True, call_fn=call,
-                               reason=f"{mod_name}.{fn_name}")
+                               reason=f"{mod_name}.{fn_name} (bias fused; zero when no residual)")
         except (ImportError, AttributeError):
             continue
     return Backend(

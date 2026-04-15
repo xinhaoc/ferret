@@ -99,7 +99,6 @@ hints:
 budget:
   max_iterations: 60
   max_wall_minutes: 90
-  max_tokens: 2000000
 
 output:
   result_format: kernel_result_json

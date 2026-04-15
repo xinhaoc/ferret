@@ -59,7 +59,9 @@ class StageGate:
 class Budget:
     max_iterations: int = 100
     max_wall_minutes: int = 120
-    max_tokens: int = 2_000_000
+    # max_tokens removed: it conflated cumulative billing with per-call context.
+    # Per-call context is now handled in orchestrator via
+    # agent.context_window_usage at a 500K reset threshold.
 
 
 @dataclass
@@ -225,8 +227,8 @@ def load_task_spec(path: str | Path) -> TaskSpec:
         budget = Budget(
             max_iterations=int(bg_data.get("max_iterations", 100)),
             max_wall_minutes=int(bg_data.get("max_wall_minutes", 120)),
-            max_tokens=int(bg_data.get("max_tokens", 2_000_000)),
         )
+        # max_tokens silently ignored if present in old yaml — see Budget docstring
     except (TypeError, ValueError) as e:
         raise ValueError(f"task spec.budget contains invalid number: {e}") from e
 

@@ -130,7 +130,6 @@ hints:
 budget:
   max_iterations: 60
   max_wall_minutes: 90
-  max_tokens: 2000000
 
 # Kernel host code must emit a line matching result_format so the orchestrator
 # can parse per-config TFLOPS. Current v004 kernel uses the printf format

@@ -120,7 +120,7 @@ async def main():
     logger.info(f"Task name    : {spec.name}")
     logger.info(f"GPU / arch   : {spec.gpu} / {arch}")
     logger.info(f"Configs      : {[c.name for c in spec.configs]} (scoring={spec.scoring})")
-    logger.info(f"Budget       : {max_iterations} iter / {spec.budget.max_wall_minutes}min / {spec.budget.max_tokens:,} tokens")
+    logger.info(f"Budget       : {max_iterations} iter / {spec.budget.max_wall_minutes}min")
 
     from motus.models import AnthropicChatClient
     client = AnthropicChatClient()

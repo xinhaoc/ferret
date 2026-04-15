@@ -154,7 +154,6 @@ hints:
 budget:
   max_iterations: 60          # outer loop iterations (each = one full attempt)
   max_wall_minutes: 90        # hard wall-clock cap
-  max_tokens: 2000000         # cumulative token budget across all turns
 
 # ----- [OPTIONAL] Output --------------------------------------------------
 # Where the agent should print results, and in what format.

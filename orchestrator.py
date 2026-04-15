@@ -293,22 +293,34 @@ class CudaOrchestratorV2:
                 if self.consecutive_failures >= self.stall_threshold:
                     await self._handle_stall()
 
-            # Budget checks — spec.budget in structured mode, fixed fallback otherwise
+            # Per-call context check: if the agent's working memory has grown
+            # to where the next API call's payload would approach Anthropic's
+            # 1M ceiling, reset agent (clear memory, replay first-turn) so we
+            # don't cascade failed calls. Half the ceiling = safe margin.
+            #
+            # Uses estimated_tokens from motus's context_window_usage — this
+            # measures the *current* memory snapshot (what one outgoing call
+            # would carry), NOT cumulative billing across calls.
+            try:
+                estimated = self.main_agent.context_window_usage.get(
+                    "estimated_tokens", 0
+                )
+            except Exception:
+                estimated = 0
+            if estimated > 500_000:
+                logger.warning(
+                    f"Working memory at {estimated:,} tokens (>500K) — "
+                    f"resetting agent before approaching 1M per-call ceiling"
+                )
+                self.main_agent = self._make_optimizer()
+                self.main_agent.step_callback = self._log_step_fn
+                await self._first_turn(task, has_kernel=True)
+
+            # Wall-time budget (still spec-driven if present)
             if self.spec is not None:
-                max_tokens = self.spec.budget.max_tokens
                 max_wall_seconds = self.spec.budget.max_wall_minutes * 60
             else:
-                max_tokens = 500_000
                 max_wall_seconds = 0  # 0 = disabled
-
-            usage = getattr(self.main_agent, 'usage', {})
-            total_input = sum(usage.get(k, 0) for k in
-                              ['prompt_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'])
-            if total_input > max_tokens:
-                logger.warning(
-                    f"Token budget exceeded: {total_input:,} > {max_tokens:,}. Stopping."
-                )
-                break
             if max_wall_seconds and (time.time() - start) > max_wall_seconds:
                 elapsed_min = (time.time() - start) / 60
                 logger.warning(

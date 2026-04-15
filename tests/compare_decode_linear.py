@@ -1,19 +1,47 @@
 #!/usr/bin/env python3
 """Compare ferret's v011 decode-linear kernel against CUDA-core cuBLAS,
-tensor-core cuBLAS, and (optionally) flashinfer's tgv_gemm on sm100.
+tensor-core-hint cuBLAS, and (optionally) flashinfer's tgv_gemm on sm100.
 
-Same methodology across all backends:
-  - L2 flush (128MB buffer zeroed) between every timed iteration
-  - 20 warmup + median of 200 iters
-  - cudaEvent timing
-  - Correctness check vs torch.matmul fp32 reference
+Fairness invariants (read before trusting the numbers):
+
+  1. Same GPU. pick_gpu.sh before running. All backends run on that GPU
+     in the same process.
+  2. Same per-iter L2 flush. 128MB zero-write between every timed iter so
+     weights are cold HBM for every backend. B200 L2 is 96MB; 128MB
+     guarantees eviction even for small weights (QKV's 48MB would
+     otherwise stay hot across iters and inflate TFLOPS 2-3x).
+  3. Same warmup + iter counts (default 100 warmup, median of 200).
+     flashinfer's AutoTuner needs the extra warmup — 20 wasn't enough.
+  4. Same methodology: cudaEvent start/stop + cudaStreamSynchronize.
+  5. Fused residual on all backends:
+     - ours: kernel epilogue (single kernel, single HBM pass)
+     - cuBLAS: torch.addmm (cublasGemmEx with beta=1, single kernel)
+     - flashinfer: bias arg passed to tgv_gemm (single kernel)
+     Using matmul + separate add would unfairly penalize cuBLAS on O
+     and Down (residual configs) with an extra kernel launch + HBM
+     round-trip per iter.
+  6. Output tensor reused across calls on all backends (out= kwarg).
+     Avoids per-call torch.empty overhead that would otherwise inflate
+     flashinfer timings at the ~us scale.
+  7. No extra transposes in the timed path. flashinfer needs column-
+     major [K,N]; we pass w.t() which is a VIEW (no copy) of the
+     [N,K] row-major storage. Zero overhead.
+  8. Correctness: each backend's first call is compared vs fp32
+     torch.matmul reference. rel_err < 5e-3 required (matches task.yaml).
+
+Methodology differences from bench.cu that ferret agent uses internally:
+  - bench.cu calls cublasGemmEx directly; we call torch.addmm which
+    dispatches to cublasGemmEx under the hood. Kernel SELECTION inside
+    cuBLAS may differ (different heuristic inputs). Not a fairness
+    issue, just a note: our cublas numbers may differ slightly from
+    bench.cu's cublas numbers (observed ~0-15% spread).
 
 Run:
     cd ~/repos/ferret/workspace
-    # build the kernel as a shared lib first:
     nvcc -O3 -std=c++17 -arch=sm_100a --use_fast_math -Xcompiler -fPIC \\
          -shared -o kernel.so kernel.cu
     cd ~/repos/ferret
+    eval $(./pick_gpu.sh)   # claim a free GPU on shared cluster
     python3 tests/compare_decode_linear.py --so workspace/kernel.so
 
 Optional: install flashinfer for tgv_gemm (tcgen05-based sm100 BF16 GEMM):
@@ -21,8 +49,8 @@ Optional: install flashinfer for tgv_gemm (tcgen05-based sm100 BF16 GEMM):
 
 Exit codes:
     0  all backends passed correctness
-    1  compile error / missing files
-    2  one of the required backends failed
+    1  required kernel.so missing
+    2  correctness threshold not met
 """
 
 from __future__ import annotations
@@ -102,53 +130,45 @@ def load_ours(so_path: Path) -> Backend:
 
 
 def load_cublas_default() -> Backend:
-    """cuBLAS through torch.matmul. At M=1 BF16, cuBLAS dispatches to a
-    CUDA-core GEMV path (tensor cores waste lanes). This matches what
-    bench.cu measures by default."""
+    """cuBLAS through torch. At M=1 BF16, cuBLAS dispatches to a CUDA-core
+    GEMV path (tensor cores waste lanes).
+
+    Residual fairness: use torch.addmm for residual configs, which becomes
+    a single cublasGemmEx call with beta=1 (fused). Using matmul+add
+    instead would double-count one extra kernel launch + HBM round-trip
+    per iter, unfairly penalizing cuBLAS on O and Down.
+
+    Output reuse: pass out= on both paths to avoid per-call allocation.
+    """
     def call(x, w, r, out, N, K):
-        # torch.matmul produces a new tensor; copy into out for consistent
-        # output-buffer semantics with the other backends.
-        y = torch.matmul(x, w.t())
         if r is not None:
-            y = y + r
-        out.copy_(y)
+            # out = r + x @ w.T in one cublasGemmEx call (beta=1 fused)
+            torch.addmm(r.view(1, N), x, w.t(), out=out)
+        else:
+            torch.matmul(x, w.t(), out=out)
         return out
     return Backend("cublas_default", True, call_fn=call)
 
 
 def load_cublas_tensor_core() -> Backend:
-    """Force cuBLAS to use a tensor-core algorithm via cublasLt.
+    """cuBLAS with `allow_bf16_reduced_precision_reduction=True`.
 
-    At M=1, cuBLAS default will NOT use tensor cores (wastes lanes). To
-    measure the tensor-core path as a reference, we explicitly request a
-    tensor-op compute type (CUBLAS_COMPUTE_32F_FAST_16BF) with a
-    heuristic that prefers TC-enabled kernels. cuBLAS may still fall back
-    to non-TC if no TC kernel matches — the comparison tells you whether
-    forcing TC helps or hurts at M=1.
-
-    Implementation via torch's low-level cublas handle is fragile, so we
-    use torch.nn.functional's bf16 matmul with torch's tf32/fp16 autotune
-    flags flipped — which routes through cuBLAS's tensor-core algos on
-    Blackwell when the shape permits.
+    Same fused-residual convention as cublas_default (torch.addmm).
+    At M=1 this hint usually does NOT change dispatch (cuBLAS picks
+    CUDA cores regardless). If the numbers match cublas_default, you've
+    learned the hint isn't surfacing through torch at this shape.
     """
-    # torch respects allow_bf16_reduced_precision_reduction which enables
-    # tensor cores for BF16 matmul where possible.
-    old_bf16 = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 
     def call(x, w, r, out, N, K):
-        y = torch.matmul(x, w.t())
         if r is not None:
-            y = y + r
-        out.copy_(y)
+            torch.addmm(r.view(1, N), x, w.t(), out=out)
+        else:
+            torch.matmul(x, w.t(), out=out)
         return out
 
-    # NOTE: this only actually uses tensor cores if cuBLAS picks a TC
-    # algorithm. For M=1 it often doesn't — this row then reports
-    # numbers indistinguishable from cublas_default. That's informative:
-    # tells you torch's cuBLAS wrapper doesn't force TC at M=1.
     return Backend("cublas_tc_hint", True,
-                   reason="torch bf16_reduced_precision_reduction on (may or may not take TC path at M=1)",
+                   reason="torch bf16_reduced_precision_reduction on (fair residual fusion)",
                    call_fn=call)
 
 

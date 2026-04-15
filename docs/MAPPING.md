@@ -47,6 +47,7 @@ Current pins:
 - `triton-3.6.0` — `python/tutorials/06-fused-attention.py`
 
 ### GEMM / Matrix Multiply
+- `examples/tcgen05-gemm/` — hand-written PTX tcgen05 BF16 GEMM reference kernels (`00_sm80_baseline.cu` → `07_tuned_final.cu`): TMA, mbarrier pipeline, warp specialization, 2-SM cluster MMA, persistent scheduler. `common.h` has the inline PTX MMA/TMA wrappers. Start here for self-contained tcgen05 kernels — no CUTLASS includes.
 - `cutlass-4.4.2` — `include/cutlass/gemm/kernel/` (40+ variants), CuTe GEMM tutorials, collective mainloops
 - `deepgemm-2.1.1.post3` — `deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh`, `sm90_fp8_gemm_*.cuh`, `sm100_bf16_gemm.cuh`, `sm100_fp8_gemm_*.cuh`
 - `tensorrt-llm-1.2.0` — `cpp/tensorrt_llm/thop/fp8PerTensorScalingTrtllmGenGemm.cpp`, `fp8BlockScalingGemm.cpp`, `fp4Gemm.cpp`, `weightOnlyQuantGemm.cpp`
@@ -62,11 +63,13 @@ Current pins:
 - `thunderkittens-main` — `include/ops/thread/memory/tile/tma.cuh`, `include/ops/group/util/tma_cluster.cuh`
 
 ### Warp Specialization / Async Pipeline
+- `examples/tcgen05-gemm/04_warp_specialization.cu` — minimal SM100 warp-specialized BF16 GEMM (load/MMA/store warps, named barriers). `03_pipelining_mbarrier.cu` for the pre-WS mbarrier pipeline.
 - `flash-attention-fa4-v4.0.0.beta8` — `hopper/flash_fwd_kernel_sm90.h` (producer/consumer warps, register redistribution), `hopper/named_barrier.hpp`, `hopper/sm90_pipeline_no_cluster.hpp`
 - `cutlass-4.4.2` — `include/cutlass/pipeline/sm90_pipeline.hpp` (PipelineTmaAsync), `include/cutlass/pipeline/sm100_pipeline.hpp` (PipelineUmmaAsync), `include/cutlass/gemm/collective/sm90_mma_tma_gmma_ss_warpspecialized.hpp`
 - `flashmla-main` — Warp specialization in SM90/SM100 MLA kernels
 
 ### Tensor Cores (MMA/WGMMA/tcgen05)
+- `examples/tcgen05-gemm/common.h` — inline PTX wrappers for tcgen05 MMA, tmem alloc/dealloc, TMA descriptor build, mbarrier. Copy-paste ready.
 - `cutlass-4.4.2` — `include/cute/arch/mma_sm80.hpp` (SM80 mma.sync), `include/cute/arch/mma_sm90_gmma.hpp` (SM90 wgmma), `include/cute/arch/mma_sm100.hpp` (SM100 tcgen05), `include/cute/atom/mma_traits_sm90_gmma.hpp`
 - `flash-attention-fa4-v4.0.0.beta8` — WGMMA usage in Hopper attention kernels
 - `thunderkittens-main` — `include/ops/thread/mma/tcgen05.cuh` (Blackwell), tile MMA abstractions
@@ -99,6 +102,7 @@ Current pins:
 - `deepgemm-2.1.1.post3` — `deep_gemm/include/deep_gemm/common/reduction.cuh`
 
 ### Inline PTX / SASS
+- `examples/tcgen05-gemm/common.h` — minimal inline-asm wrappers for `tcgen05.mma`, `tcgen05.alloc/dealloc/commit`, `cp.async.bulk.tensor` (TMA), `mbarrier.*` — self-contained, no library deps.
 - `cutlass-4.4.2` — `include/cute/arch/` (PTX wrappers for every operation), `include/cutlass/arch/` (barrier, memory, register reconfig)
 - `flash-attention-fa4-v4.0.0.beta8` — `hopper/named_barrier.hpp`, `hopper/utils.h`, `csrc/flash_attn/src/utils.h` (conversion, ReLU via PTX)
 - `flashinfer-0.6.7.post3` — `include/flashinfer/utils.cuh`, `include/flashinfer/mma.cuh`, `include/flashinfer/pos_enc.cuh`
@@ -124,6 +128,7 @@ Hardware dynamic tile distribution via `clusterlaunchcontrol.try_cancel` PTX (Bl
 
 ### Cluster-cooperative MMA (cta_group::2)
 Two SMs cooperatively execute a single MMA via DSMEM, effectively doubling M per instruction (Blackwell SM100+).
+- `examples/tcgen05-gemm/05_two_sm_cluster_mma.cu` — minimal hand-written 2-SM cluster tcgen05 GEMM (no CUTLASS).
 - `deepgemm-2.1.1.post3` — `deep_gemm/include/deep_gemm/common/sm100_utils.cuh` (struct `SM100_MMA_F16BF16_2x1SM_SS` has the `tcgen05.mma.cta_group::2.kind::f16` inline PTX; also `MXF8F6F4_2x1SM_SS` variant)
 - `deepgemm-2.1.1.post3` — `deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh` (full kernel using the 2x1SM MMA)
 - `cutlass-4.4.2` — `include/cute/atom/mma_traits_sm100.hpp`, `include/cute/arch/mma_sm100_umma.hpp` (CuTe abstractions)

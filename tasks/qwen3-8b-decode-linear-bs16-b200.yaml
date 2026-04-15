@@ -36,9 +36,6 @@ problem:
 
     Kernel layout freedom: one unified kernel with runtime dispatch, OR
     multiple __global__ kernels in kernel.cu with host-side selection.
-    kernel.cu may #include <cutlass/...> headers — CUTLASS is available
-    in resources/cutlass-4.4.2/, header-only. Self-containment is not
-    required this task.
 
     Residual (O, Down): fuse into the GEMM epilogue. Do not launch a
     separate add kernel.
@@ -98,16 +95,6 @@ constraints:
   - "cta_group::2 (2-CTA cluster MMA) IS ALLOWED and likely required to beat CUTLASS at LMHead's large N."
   - "Output bit-compatible with the CUTLASS baseline: max relative error < 5e-3 across all 5 configs."
   - "Residual fusion is in-kernel epilogue only — no separate add kernel for O/Down."
-
-hints:
-  - "FIRST ACTION during REPRODUCE: write a benchmark harness (call it baselines/cutlass_bench.cu or similar) that runs TWO CUTLASS BF16 GEMM variants on all 5 shapes at M=16, measures TFLOPS with L2-flush + median-of-200 methodology, and reports which is faster per shape. Candidates:
-      (a) resources/cutlass-4.4.2/examples/71_blackwell_gemm_with_collective_builder/71_blackwell_gemm_with_collective_builder.cu — uses CollectiveBuilder, templated (instantiate with cutlass::bfloat16_t for A, B, C; float for accumulator)
-      (b) resources/cutlass-4.4.2/examples/74_blackwell_gemm_streamk/ — stream-K scheduler; better for shapes with few output tiles (LMHead has huge N, may not help)
-    Record the winner per shape in progress.md. Use THAT winner's numbers as KERNEL_RESULT_REFERENCE going forward. Stay consistent — don't switch reference mid-run."
-  - "CUTLASS is header-only; you can #include it from kernel.cu if you want, OR hand-write tcgen05 PTX. Your call. Keep in mind the baseline is CUTLASS — going CUTLASS-to-CUTLASS is a fair fight, hand-written PTX may beat it if you tune well."
-  - "At M=16 the tcgen05 mma instruction wants M>=64. You'll pad M=16 → M=64 (4x compute waste) unless you're clever. cta_group::2 helps LMHead (N=153600 → split across 2 CTAs per cluster). For O (N=4096), ordinary 1-CTA tcgen05 is probably enough."
-  - "Shapes span 3 orders of magnitude in weight size (O 32MB ← LMHead 1.2GB). What's optimal for O is NOT optimal for LMHead. Use multiple __global__ kernels with host-side dispatch if needed — it's allowed."
-  - "Key references beyond CUTLASS examples 71/74: docs/ptx-isa-9.2/09-instruction-set/parallel-synchronization-and-communication-instructions.md (tcgen05 mma/wait), resources/flashinfer-0.6.7.post3/include/flashinfer/gemm/tgv_gemm.cuh (a working sm100 BF16 GEMM using CUTLASS primitives — close to what you need to build)."
 
 budget:
   max_iterations: 60

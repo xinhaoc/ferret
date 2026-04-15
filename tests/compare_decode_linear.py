@@ -177,13 +177,13 @@ def load_flashinfer() -> Backend:
             if fn is not None:
                 def call(x, w, r, out, N, K, _fn=fn):
                     # tgv_gemm_sm100 signature:
-                    #   a: (M, K) row-major, b: (K, N) COLUMN-major, bias: (N,)
+                    #   a: (M, K) row-major, b: (K, N) COLUMN-major, bias: (N,),
+                    #   pdl=False, out=None
                     # Our w is (N, K) row-major — .t() gives a (K, N) VIEW that
                     # is column-major (same underlying data). Must NOT be made
                     # contiguous, or it becomes row-major and fails.
-                    w_col = w.t()  # (K, N), column-major view of (N, K) row-major
+                    w_col = w.t()
 
-                    # bias is (N,); residual is (1, N) → flatten.
                     if r is not None:
                         bias = r.view(-1)
                     else:
@@ -196,8 +196,10 @@ def load_flashinfer() -> Backend:
                             )
                         bias = call._zero_cache[bkey]
 
-                    y = _fn(x, w_col, bias)
-                    out.copy_(y.view(1, N) if y.dim() == 1 else y)
+                    # Reuse 'out' tensor (shaped [1,N]) — flashinfer expects
+                    # (M, N) = (1, N) which matches. pdl=True enables the
+                    # persistent-data-loader fast path.
+                    _fn(x, w_col, bias, pdl=True, out=out)
                     return out
                 return Backend("flashinfer_tgv", True, call_fn=call,
                                reason=f"{mod_name}.{fn_name} (bias fused; zero when no residual)")
@@ -261,7 +263,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--so", default="workspace/kernel.so",
                         help="Path to compiled kernel.so (default: workspace/kernel.so)")
-    parser.add_argument("--warmup", type=int, default=20)
+    # 100 warmup: flashinfer's AutoTuner may need many iters to settle on a
+    # per-shape kernel choice. If 100 still looks noisy, try --warmup 300.
+    parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--rtol", type=float, default=5e-3,
                         help="Per-config rel-err threshold (default 5e-3, matches task spec)")

@@ -359,6 +359,24 @@ class CudaOrchestratorV2:
             lines.append(f"- {h}")
         return "\n".join(lines) + "\n\n"
 
+    def _render_references_block(self) -> str:
+        """Build the '## References (read during REPRODUCE)' block.
+
+        These are architectural templates — code the agent should read to learn
+        how to write the kernel. Distinct from `baseline.source`, which is the
+        scoring target. Returns '' if no references declared.
+        """
+        if self.spec is None or not self.spec.references:
+            return ""
+        lines = [
+            "## References (read during REPRODUCE)",
+            "Architectural templates — study these to learn how to build the kernel. "
+            "These are NOT the scoring baseline; do not measure against them.",
+        ]
+        for r in self.spec.references:
+            lines.append(f"- `{r}`")
+        return "\n".join(lines) + "\n\n"
+
     async def _read_git_history(self, max_chars: int = 4000) -> str:
         """Return commit subject+body dump from workspace/.git, truncated."""
         ws_abs = str(self.workspace_path.resolve())
@@ -397,8 +415,10 @@ class CudaOrchestratorV2:
                 "## Shapes",
                 shapes_block,
                 "",
-                f"## Baseline reference",
-                f"`{self.spec.baseline.source}`",
+                f"## Baseline (what you are scored against)",
+                f"`{self.spec.baseline.source}` — measure it in the same harness as your kernel; emit the number as KERNEL_RESULT_REFERENCE.",
+                "",
+                self._render_references_block().rstrip(),
                 "",
                 env_section.rstrip(),
                 "",
@@ -419,8 +439,8 @@ class CudaOrchestratorV2:
                 if state.stage == "REPRODUCE":
                     parts.append(
                         "You are resuming. Read the git history, read the current "
-                        "kernel, find the architectural gap with the baseline "
-                        f"source (`{self.spec.baseline.source}`), and close it."
+                        f"kernel, study the references listed above to learn the "
+                        f"architecture, and close the gap to beat `{self.spec.baseline.source}`."
                     )
                 else:
                     parts.append(

@@ -43,7 +43,17 @@ problem:
     BATCH: 1
 
 baseline:
-  source: resources/flashinfer-0.6.7.post3
+  # Scoring target — agent measures trtllm-gen MLA decode live (via flashinfer's
+  # `trtllm_batch_decode_with_kv_cache_mla`) in the same harness as its kernel
+  # and emits the TFLOPS as KERNEL_RESULT_REFERENCE.
+  source: trtllm-gen MLA decode
+
+references:
+  # Read during REPRODUCE to learn the architecture. NOT the scoring baseline.
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/mla.cuh           # reference MLA decode (attention kernel structure)
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha                              # SM100 FMHA with warp specialization + tcgen05
+  - resources/flashmla-main/csrc/sm100/decode                                       # SM100 MLA decode
+  - examples/tcgen05-gemm/                                                          # tcgen05 PTX patterns (TMA, mbarrier, warp spec, cluster MMA)
 
 configs:
   # Q1: current 31.1, trtllm 34.3. Stretch target = match trtllm (target 1.0).

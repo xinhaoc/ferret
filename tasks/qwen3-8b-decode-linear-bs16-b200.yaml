@@ -44,10 +44,18 @@ problem:
     M: 16
 
 baseline:
-  # Two CUTLASS BF16 GEMM candidates — agent is expected to benchmark
-  # BOTH during REPRODUCE and use whichever is faster as the reference.
-  # See hints below for the full instruction.
-  source: resources/cutlass-4.4.2/examples
+  # Scoring target only. Agent must measure cuBLAS in the same harness as
+  # its kernel (cublasGemmEx, same GPU, same L2-flush methodology) and emit
+  # the TFLOPS as KERNEL_RESULT_REFERENCE.
+  source: cuBLAS
+
+references:
+  # Read during REPRODUCE to learn the architecture. NOT the scoring baseline.
+  - examples/tcgen05-gemm/                                                         # hand-written PTX tcgen05 BF16 GEMM progression
+  - resources/cutlass-4.4.2/examples/71_blackwell_gemm_with_collective_builder     # CUTLASS sm100 BF16 GEMM template
+  - resources/cutlass-4.4.2/examples/74_blackwell_gemm_streamk                     # stream-K scheduler for shapes with few tiles
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/gemm/tgv_gemm.cuh          # sm100 BF16 GEMM using CUTLASS primitives
+  - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh  # persistent scheduler + TMA store epilogue
 
 configs:
   - name: QKV

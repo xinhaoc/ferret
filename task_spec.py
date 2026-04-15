@@ -47,10 +47,13 @@ class ConfigEntry:
 
 @dataclass
 class BaselineSpec:
-    """Where the reference comes from. Numbers are measured at runtime, not statically."""
-    source: str                     # path to reference impl (must exist) — code-reading hint for agent
-    # command + pre_measured removed — agent measures baseline live in its own
-    # benchmark, no separate orchestrator-run step needed.
+    """The scoring baseline — what the agent's TFLOPS is measured against.
+
+    This is NOT a code-reading hint. It names the fast, fixed comparison
+    point (e.g. "cuBLAS", "trtllm-gen") that KERNEL_RESULT_REFERENCE must be
+    measured against. Architectural reading material goes in TaskSpec.references.
+    """
+    source: str                     # name/path of the scoring reference (e.g. "cuBLAS")
 
 
 @dataclass
@@ -79,6 +82,7 @@ class TaskSpec:
     shapes: dict[str, Any]          # machine-checkable shape facts
     baseline: BaselineSpec
     configs: list[ConfigEntry]
+    references: list[str] = field(default_factory=list)  # REPRODUCE reading list — architectural templates (e.g. examples/tcgen05-gemm/). Separate from baseline: these are what to read, not what to beat.
     scoring: str = "min_ratio"      # min_ratio | weighted_avg | focus
     focus_config: str = ""          # only used when scoring == "focus"
     stage_gate: StageGate = field(default_factory=StageGate)
@@ -239,6 +243,11 @@ def load_task_spec(path: str | Path) -> TaskSpec:
     if not all(isinstance(s, str) for s in hints):
         raise ValueError("task spec.hints must be a list of strings")
 
+    # references — REPRODUCE reading list, separate from baseline
+    references = list(data.get("references", []) or [])
+    if not all(isinstance(s, str) for s in references):
+        raise ValueError("task spec.references must be a list of strings")
+
     return TaskSpec(
         name=str(data["name"]),
         gpu=str(data["gpu"]),
@@ -248,6 +257,7 @@ def load_task_spec(path: str | Path) -> TaskSpec:
         shapes=dict(problem["shapes"]),
         baseline=baseline,
         configs=configs,
+        references=references,
         scoring=scoring,
         focus_config=focus_config,
         stage_gate=stage_gate,

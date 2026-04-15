@@ -47,17 +47,24 @@ problem:
     BATCH: 1
 
 # ----- [REQUIRED] Baseline --------------------------------------------------
-# How to measure the reference number(s) the agent compares against.
-#
-# Two modes:
-#   (a) `command:` — agent runs this once at startup and parses the output.
-#       The command must print numbers in the same key=value form the kernel
-#       uses (see `result_format` below).
-#
-# `source:` is the path to the reference implementation the agent can read
-# while reproducing. It MUST exist or the agent stops with an error.
+# The scoring target — what your kernel's TFLOPS is measured against. The
+# agent runs baseline + its own kernel in the same harness on the same GPU
+# and emits KERNEL_RESULT_REFERENCE alongside KERNEL_RESULT. `source:` is
+# a name/path identifying the baseline (e.g. "cuBLAS", "trtllm-gen"), NOT
+# architectural reading material — that goes in `references:` below.
 baseline:
-  source: resources/flashinfer-0.6.7.post3
+  source: cuBLAS
+
+# ----- [OPTIONAL] References ------------------------------------------------
+# Architectural templates the agent reads during REPRODUCE to learn how to
+# build the kernel. These are NOT the scoring baseline; they never appear in
+# KERNEL_RESULT_REFERENCE. Include any mix of vendored libraries (resources/)
+# and hand-written examples (examples/). Keep the list tight — every entry
+# the agent reads costs context.
+references:
+  - examples/tcgen05-gemm/
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/mla.cuh
 
 # ----- [REQUIRED] Configurations --------------------------------------------
 # Each config is one (shape, baseline) pair. The agent's job is to make the

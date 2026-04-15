@@ -38,7 +38,16 @@ problem:
     M: 1
 
 baseline:
-  source: resources/tensorrt-llm-1.2.0/cpp/tensorrt_llm/kernels/trtllmGenKernels/gemm
+  # Scoring target — agent measures trtllm-gen live (or its closest available
+  # BF16 M=1 GEMV) in the same harness as its kernel and emits the TFLOPS as
+  # KERNEL_RESULT_REFERENCE.
+  source: trtllm-gen
+
+references:
+  # Read during REPRODUCE to learn the architecture. NOT the scoring baseline.
+  - resources/tensorrt-llm-1.2.0/cpp/tensorrt_llm/kernels/trtllmGenKernels/gemm     # trtllm-gen M=1 GEMV patterns
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/gemm/tgv_gemm.cuh           # sm100 BF16 GEMM variants
+  - examples/tcgen05-gemm/                                                          # hand-written PTX progression (mostly M>=64 but useful for TMA/barrier patterns)
 
 configs:
   - name: QKV

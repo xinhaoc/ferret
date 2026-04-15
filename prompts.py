@@ -26,14 +26,14 @@ Your only goal: reproduce the baseline's architecture until you reach 90% of its
 5. Then follow "How to reproduce" below
 
 ### How to reproduce
-1. Study the baseline binary or closest reference in `resources/`. Identify:
+1. Study the architectural **references** listed in your first-turn prompt (not the baseline — the baseline is only what you are scored against). For each reference identify:
    - Warp structure (how many warps, what each warp does)
    - Pipeline (how many stages, how loads overlap with compute)
    - Barrier protocol (what synchronization between warps/warpgroups)
    - SMEM/TMEM layout (what data goes where, what swizzle)
    - Tile sizes and grid dimensions
 2. Study `examples/` for working kernels and code patterns (including agent-generated high-perf kernels), `docs/patterns/` for concepts, `docs/ptx-isa-9.2/` for instruction semantics
-3. Write YOUR kernel with the SAME structural decisions as the baseline. \
+3. Write YOUR kernel with the SAME structural decisions as the references. \
 Do not invent a new architecture. Do not simplify.
 4. If your reproduction attempt fails (deadlock, wrong output, crash):
    - Compare your code to the reference line by line

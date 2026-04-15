@@ -70,6 +70,53 @@ When your kernel reaches ≥90% of baseline TFLOPS → move to Stage 2.
 
 You've reached 90% of baseline. Now use profiling to find and eliminate every inefficiency.
 
+### Kernel ownership (OPTIMIZE stage)
+
+kernel.cu must contain your own `__global__` function(s). Wrapping a
+library's pre-built full kernel is forbidden:
+- `cutlass::gemm::device::GemmUniversalAdapter<...>::run()`
+- `cutlass::gemm::kernel::GemmUniversal<...>::operator()`
+- ThunderKittens top-level kernel entry points
+- Any library `.run()` / `.launch()` that launches a kernel body you
+  did not write
+
+Library primitives ARE allowed as DEVELOPMENT SCAFFOLDING while
+iterating on algorithm:
+- `cute::Layout`, `cute::Tensor`, `cute::copy` (TMA), `cute::SM100_MMA_*`
+- `kittens::` tile ops, SMEM tile allocators, MMA wrappers
+- `cutlass::arch::` (mma, barrier, memory)
+
+These primitives compile to the same PTX you'd write by hand — they
+are not abstractions, just C++ spellings of inline asm. Use them
+freely early in OPTIMIZE to move fast.
+
+By the time you CONVERGE (kernel stops improving for several
+iterations), kernel.cu should contain no library template includes:
+- No `#include <cute/...>`
+- No `#include <cutlass/...>`
+- No `#include <kittens/...>` or similar
+
+Only CUDA standard includes (cuda_runtime.h, cuda_bf16.h,
+cooperative_groups.h) + raw inline PTX: `asm volatile("tcgen05.mma...")`.
+
+Why: the final kernel must be self-contained and portable — readable
+by reviewers, auditable instruction-by-instruction, droppable into any
+CUDA project without template dependencies. The primitives you used
+as scaffolding compile to single PTX instructions each; replace them
+in place once the schedule is frozen.
+
+Workflow:
+1. Early OPTIMIZE: primitives for fast iteration on tile/layout choices
+2. Converge on a winning schedule (stable for 3-5 iterations)
+3. Replace each primitive with its raw PTX equivalent, one at a time.
+   Verify correctness + no regression between each replacement.
+4. Final: grep kernel.cu → no cute/kittens/cutlass template includes.
+
+If your REPRODUCE kernel wrapped a library, your first OPTIMIZE
+iteration must rewrite kernel.cu as a hand-written `__global__` using
+primitives or raw PTX. Port the tile config discovered via REPRODUCE
+as starting schedule — don't start from scratch.
+
 ### Tools: let data guide you
 - **ncu**: run_ncu() for full profiling. Look at bandwidth, compute utilization, stall reasons, occupancy, tensor core activity. Understand WHERE time is spent.
 - **SASS**: read_sass() to see actual instructions. Compare to reference kernels. Find spilling, unnecessary moves, redundant address computation, suboptimal instruction scheduling.

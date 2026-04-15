@@ -176,26 +176,33 @@ def load_flashinfer() -> Backend:
             fn = getattr(mod, fn_name, None)
             if fn is not None:
                 def call(x, w, r, out, N, K, _fn=fn):
-                    # tgv_gemm_sm100(A, B, bias, ...) — bias is REQUIRED positional.
-                    # When no residual, pass a zero-tensor to match our kernel's
-                    # epilogue behavior (kernel adds nothing when residual=nullptr).
+                    # tgv_gemm_sm100 expects B in [K, N] layout (mat1[M,K] @
+                    # mat2[K,N]). Our kernel takes w in [N, K]; transpose once
+                    # per unique w (cached by data_ptr so same w reuses across
+                    # the 200 benchmark iters).
+                    if getattr(call, '_wt_ptr', None) != w.data_ptr():
+                        call._wt_ptr = w.data_ptr()
+                        call._wt_kn = w.t().contiguous()
+                    w_kn = call._wt_kn
+
+                    # bias is REQUIRED positional. When no residual, pass a
+                    # cached zero tensor of shape [N].
                     if r is not None:
-                        bias = r.view(-1)  # flatten [1,N] -> [N] for bias
+                        bias = r.view(-1)
                     else:
-                        # Cache the zero bias per config to avoid per-call alloc
-                        key = (x.device.index, N)
+                        bkey = (x.device.index, N)
                         if not hasattr(call, '_zero_cache'):
                             call._zero_cache = {}
-                        if key not in call._zero_cache:
-                            call._zero_cache[key] = torch.zeros(
+                        if bkey not in call._zero_cache:
+                            call._zero_cache[bkey] = torch.zeros(
                                 N, dtype=torch.bfloat16, device=x.device,
                             )
-                        bias = call._zero_cache[key]
+                        bias = call._zero_cache[bkey]
+
                     try:
-                        y = _fn(x, w, bias)
+                        y = _fn(x, w_kn, bias)
                     except TypeError:
-                        # Some versions accept a 4th dtype arg or kwargs. Try kwargs.
-                        y = _fn(x, w, bias=bias)
+                        y = _fn(x, w_kn, bias=bias)
                     out.copy_(y.view(1, N) if y.dim() == 1 else y)
                     return out
                 return Backend("flashinfer_tgv", True, call_fn=call,

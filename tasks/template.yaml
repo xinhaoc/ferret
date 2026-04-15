@@ -53,15 +53,11 @@ problem:
 #   (a) `command:` — agent runs this once at startup and parses the output.
 #       The command must print numbers in the same key=value form the kernel
 #       uses (see `result_format` below).
-#   (b) `pre_measured: true` — you already know the baseline numbers and have
-#       filled them into each `configs[].baseline_tflops`. Agent skips the run.
 #
 # `source:` is the path to the reference implementation the agent can read
 # while reproducing. It MUST exist or the agent stops with an error.
 baseline:
   source: resources/flashinfer-0.6.7.post3
-  command: python3 baselines/run_trtllm_mtp.py --kv 4096
-  pre_measured: true        # set false if you want the agent to (re)measure
 
 # ----- [REQUIRED] Configurations --------------------------------------------
 # Each config is one (shape, baseline) pair. The agent's job is to make the
@@ -69,26 +65,22 @@ baseline:
 # depending on `scoring`).
 #
 # args: passed to the kernel harness (template params, runtime args, both).
-# baseline_tflops: the number to compare against. Required if pre_measured.
 # target_ratio: 1.0 means "match baseline", 0.95 means "within 5%",
 #               1.20 means "beat baseline by 20%".
 # weight: only used by `scoring: weighted_avg`. Ignored otherwise.
 configs:
   - name: Q1
     args: { Q_LEN: 1 }
-    baseline_tflops: 34.3       # trtllm-gen on B200
     target_ratio: 0.95
     weight: 1.0
 
   - name: Q2
     args: { Q_LEN: 2 }
-    baseline_tflops: 62.6
     target_ratio: 0.95
     weight: 1.0
 
   - name: Q4
     args: { Q_LEN: 4 }
-    baseline_tflops: 79.8
     target_ratio: 1.00          # already winning, just don't regress
     weight: 0.5
 

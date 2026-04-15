@@ -35,17 +35,19 @@ class ConfigEntry:
     """One (shape, baseline) pair the kernel must satisfy."""
     name: str                       # e.g. "Q1"
     args: dict[str, Any]            # e.g. {"Q_LEN": 1}
-    baseline_tflops: float          # the number to compare against
-    target_ratio: float = 0.95      # 1.0 = match, 0.95 = within 5%, 1.20 = beat by 20%
+    target_ratio: float = 0.95      # 1.0 = match reference, 0.95 = within 5%, 1.10 = beat by 10%
     weight: float = 1.0             # only used by scoring=weighted_avg
+    # baseline_tflops removed — baselines are now measured at runtime by the
+    # agent's benchmark and emitted as KERNEL_RESULT_REFERENCE alongside
+    # KERNEL_RESULT. See compute_score / orchestrator render.
 
 
 @dataclass
 class BaselineSpec:
-    """Where the reference comes from + how to (re)measure it."""
-    source: str                     # path to reference impl (must exist)
-    command: str = ""               # optional: command to run to measure baseline
-    pre_measured: bool = True       # if True, baselines come from configs[].baseline_tflops
+    """Where the reference comes from. Numbers are measured at runtime, not statically."""
+    source: str                     # path to reference impl (must exist) — code-reading hint for agent
+    # command + pre_measured removed — agent measures baseline live in its own
+    # benchmark, no separate orchestrator-run step needed.
 
 
 @dataclass
@@ -135,8 +137,6 @@ def load_task_spec(path: str | Path) -> TaskSpec:
         raise ValueError("task spec.baseline missing required field: source")
     baseline = BaselineSpec(
         source=str(baseline_data["source"]),
-        command=str(baseline_data.get("command", "")),
-        pre_measured=bool(baseline_data.get("pre_measured", True)),
     )
 
     # configs
@@ -158,15 +158,6 @@ def load_task_spec(path: str | Path) -> TaskSpec:
         seen_names.add(name)
         if not isinstance(c["args"], dict):
             raise ValueError(f"config[{i}] ({name}).args must be a mapping")
-        if baseline.pre_measured and "baseline_tflops" not in c:
-            raise ValueError(
-                f"config[{i}] ({name}) missing baseline_tflops "
-                f"(required when baseline.pre_measured is true)"
-            )
-        try:
-            baseline_tflops = float(c.get("baseline_tflops", 0.0))
-        except (TypeError, ValueError) as e:
-            raise ValueError(f"config[{i}] ({name}).baseline_tflops must be a number") from e
         try:
             target_ratio = float(c.get("target_ratio", 0.95))
         except (TypeError, ValueError) as e:
@@ -175,16 +166,14 @@ def load_task_spec(path: str | Path) -> TaskSpec:
             weight = float(c.get("weight", 1.0))
         except (TypeError, ValueError) as e:
             raise ValueError(f"config[{i}] ({name}).weight must be a number") from e
-        if baseline_tflops < 0:
-            raise ValueError(f"config[{i}] ({name}).baseline_tflops must be >= 0")
         if target_ratio <= 0:
             raise ValueError(f"config[{i}] ({name}).target_ratio must be > 0")
         if weight < 0:
             raise ValueError(f"config[{i}] ({name}).weight must be >= 0")
+        # baseline_tflops silently ignored if present in old yaml — measured at runtime now
         configs.append(ConfigEntry(
             name=name,
             args=c["args"],
-            baseline_tflops=baseline_tflops,
             target_ratio=target_ratio,
             weight=weight,
         ))
@@ -272,7 +261,8 @@ def load_task_spec(path: str | Path) -> TaskSpec:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-_KERNEL_RESULT_RE = re.compile(r"KERNEL_RESULT\s+(\{[^\n]*\})")
+_KERNEL_RESULT_RE = re.compile(r"KERNEL_RESULT(?!_REFERENCE)\s+(\{[^\n]*\})")
+_KERNEL_RESULT_REFERENCE_RE = re.compile(r"KERNEL_RESULT_REFERENCE\s+(\{[^\n]*\})")
 _QLEN_RE = re.compile(r"Q_LEN=(\d+):\s*([\d.]+)\s*TFLOPS")
 _QSHORT_RE = re.compile(r"Q(\d+)=([\d.]+)")
 
@@ -325,6 +315,34 @@ def parse_kernel_output(stdout: str) -> dict[str, float]:
     return results
 
 
+def parse_reference_output(stdout: str) -> dict[str, float]:
+    """Parse REFERENCE baseline TFLOPS — KERNEL_RESULT_REFERENCE JSON line.
+
+    The agent's benchmark must emit BOTH lines so ferret can score:
+        KERNEL_RESULT {"<config>": <kernel-tflops>, ...}
+        KERNEL_RESULT_REFERENCE {"<config>": <reference-tflops>, ...}
+
+    Both should be measured on the same GPU with the same harness — fair
+    comparison. The reference is whatever the agent picked as the bar
+    (cuBLAS, trtllm-gen, etc.). No fallback: if KERNEL_RESULT_REFERENCE is
+    missing, returns {} and scoring will report ratio 0 (treated like missing
+    measurement).
+    """
+    if not stdout:
+        return {}
+    m = _KERNEL_RESULT_REFERENCE_RE.search(stdout)
+    if not m:
+        return {}
+    try:
+        data = json.loads(m.group(1))
+        if isinstance(data, dict):
+            return {str(k): float(v) for k, v in data.items()
+                    if isinstance(v, (int, float))}
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return {}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Scoring — pure functions, easy to unit-test
 # ─────────────────────────────────────────────────────────────────────────────
@@ -332,27 +350,33 @@ def parse_kernel_output(stdout: str) -> dict[str, float]:
 
 def compute_score(
     results: dict[str, float],
+    reference: dict[str, float],
     spec: TaskSpec,
 ) -> tuple[float, dict[str, float]]:
     """Compute aggregate score + per-config ratios.
 
+    Args:
+        results:    own-kernel TFLOPS per config (parse_kernel_output)
+        reference:  baseline reference TFLOPS per config (parse_reference_output)
+        spec:       task spec
+
     Returns:
-      (aggregate_score, per_config_ratios)
+        (aggregate_score, per_config_ratios)
+        ratio[cfg] = results[cfg] / reference[cfg]
+        Missing reference (ref==0) → ratio 0 (can't score without reference).
 
     aggregate_score is the single number that drives stage gating and "is this
     kernel better than the previous one". per_config_ratios is for display in
     iteration prompts so the agent sees which config is the bottleneck.
-
-    A config that's missing from `results` gets ratio 0.0 (worst case) — that
-    way a kernel that doesn't even run a config can't accidentally win.
     """
     ratios: dict[str, float] = {}
     for cfg in spec.configs:
-        if cfg.baseline_tflops <= 0:
+        ref = reference.get(cfg.name, 0.0)
+        if ref <= 0:
             ratios[cfg.name] = 0.0
             continue
         tflops = results.get(cfg.name, 0.0)
-        ratios[cfg.name] = tflops / cfg.baseline_tflops
+        ratios[cfg.name] = tflops / ref
 
     if not ratios:
         return 0.0, ratios
@@ -398,8 +422,9 @@ def should_advance_stage(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _format_state(spec: TaskSpec, results: dict[str, float]) -> str:
-    score, ratios = compute_score(results, spec)
+def _format_state(spec: TaskSpec, results: dict[str, float],
+                  reference: dict[str, float]) -> str:
+    score, ratios = compute_score(results, reference, spec)
     lines = [
         f"  scoring     : {spec.scoring}",
         f"  score       : {score:.3f}",
@@ -408,10 +433,11 @@ def _format_state(spec: TaskSpec, results: dict[str, float]) -> str:
     ]
     for cfg in spec.configs:
         tflops = results.get(cfg.name, 0.0)
+        ref = reference.get(cfg.name, 0.0)
         ratio = ratios.get(cfg.name, 0.0)
         marker = " ✓" if ratio >= cfg.target_ratio else ""
         lines.append(
-            f"    {cfg.name}: {tflops:6.1f} / {cfg.baseline_tflops:6.1f} "
+            f"    {cfg.name}: {tflops:6.1f} / {ref:6.1f} "
             f"= {ratio*100:5.1f}% (target {cfg.target_ratio*100:.0f}%){marker}"
         )
     return "\n".join(lines)
@@ -431,42 +457,39 @@ def _main() -> int:
     print(f"Loaded: {spec.name}")
     print(f"  gpu/arch    : {spec.gpu} / {spec.arch} / {spec.precision}")
     print(f"  configs     : {[c.name for c in spec.configs]}")
-    print(f"  baselines   : {[c.baseline_tflops for c in spec.configs]}")
+    print(f"  target_ratios: {[c.target_ratio for c in spec.configs]}")
     print(f"  constraints : {len(spec.constraints)}")
     print(f"  hints       : {len(spec.hints)}")
     print(f"  stage_gate  : ratio={spec.stage_gate.ratio} strict={spec.stage_gate.strict}")
     print()
 
-    print("Dry-run scoring:")
+    print("Dry-run scoring (reference values are illustrative — measured at runtime):")
     print()
-    print("  Case A — every config at exactly its baseline (ratio=1.0):")
-    fake = {c.name: c.baseline_tflops for c in spec.configs}
-    print(_format_state(spec, fake))
-    print()
-
-    print("  Case B — every config at 90% of baseline:")
-    fake = {c.name: c.baseline_tflops * 0.9 for c in spec.configs}
-    print(_format_state(spec, fake))
+    fake_ref = {c.name: 100.0 for c in spec.configs}  # arbitrary reference
+    print("  Case A — kernel == reference (ratio=1.0):")
+    fake_kernel = {c.name: 100.0 for c in spec.configs}
+    print(_format_state(spec, fake_kernel, fake_ref))
     print()
 
-    print("  Case C — first config at 70%, rest at 110% (tests min_ratio vs avg):")
-    fake = {}
-    for i, c in enumerate(spec.configs):
-        fake[c.name] = c.baseline_tflops * (0.70 if i == 0 else 1.10)
-    print(_format_state(spec, fake))
+    print("  Case B — kernel at 90% of reference:")
+    fake_kernel = {c.name: 90.0 for c in spec.configs}
+    print(_format_state(spec, fake_kernel, fake_ref))
     print()
 
-    print("Parser test (KERNEL_RESULT JSON):")
-    sample = 'noise\nKERNEL_RESULT {"Q1": 31.0, "Q2": 54.7, "Q4": 87.7}\nmore noise'
-    print(f"  -> {parse_kernel_output(sample)}")
+    print("  Case C — first config 70%, rest 110% (tests min_ratio):")
+    fake_kernel = {c.name: (70.0 if i == 0 else 110.0)
+                   for i, c in enumerate(spec.configs)}
+    print(_format_state(spec, fake_kernel, fake_ref))
+    print()
 
-    print("Parser test (v004 printf format):")
-    sample = "Q_LEN=1: 31.0 TFLOPS, 18.4 us\nQ_LEN=2: 54.7 TFLOPS, 20.9 us"
-    print(f"  -> {parse_kernel_output(sample)}")
-
-    print("Parser test (commit message format):")
-    sample = "TFLOPS: Q1=31.0, Q2=54.7, Q4=87.7"
-    print(f"  -> {parse_kernel_output(sample)}")
+    print("Parser tests:")
+    sample = 'noise\nKERNEL_RESULT {"Q1": 31.0, "Q2": 54.7}\nmore noise'
+    print(f"  KERNEL_RESULT JSON          -> {parse_kernel_output(sample)}")
+    sample_ref = 'KERNEL_RESULT_REFERENCE {"Q1": 25.0, "Q2": 50.0}'
+    print(f"  KERNEL_RESULT_REFERENCE     -> {parse_reference_output(sample_ref)}")
+    sample_both = sample + "\n" + sample_ref
+    print(f"  Both lines (kernel parser)  -> {parse_kernel_output(sample_both)}")
+    print(f"  Both lines (ref parser)     -> {parse_reference_output(sample_both)}")
 
     return 0
 

@@ -500,28 +500,51 @@ class CudaOrchestratorV2:
         target_ratio and ← WORST marker for the score bottleneck.
         """
         # Fresh workspace (no tagged kernel yet) — don't render a table of zeros.
-        # Show the baseline targets instead so the agent knows what to aim for.
+        # Fresh workspace OR no reference measured yet — show targets only
         if not state.has_any_kernel:
             lines = [
                 f"## Iteration {iteration} — {state.stage} stage (no kernel yet)",
                 "",
-                "No tagged improvement in workspace/.git. Targets to reach:",
+                "No tagged improvement in workspace/.git. Per-config target ratios:",
             ]
             for cfg in self.spec.configs:
                 lines.append(
-                    f"  {cfg.name}: baseline {cfg.baseline_tflops:.1f} TFLOPS "
-                    f"(target {cfg.target_ratio*100:.0f}%)"
+                    f"  {cfg.name}: target ratio {cfg.target_ratio*100:.0f}% (vs reference)"
                 )
+            lines.append("")
+            lines.append(
+                "Reference will be measured by your benchmark and emitted as "
+                "KERNEL_RESULT_REFERENCE alongside KERNEL_RESULT."
+            )
+            return "\n".join(lines)
+
+        if not state.has_reference:
+            lines = [
+                f"## Iteration {iteration} — {state.stage} stage "
+                f"(reference not yet measured — score unavailable)",
+                "",
+                "Your kernel measurements (from latest tag's KERNEL_RESULT):",
+            ]
+            for cfg in self.spec.configs:
+                tflops = state.results.get(cfg.name, 0.0)
+                lines.append(f"  {cfg.name}: {tflops:.2f} TFLOPS")
+            lines.append("")
+            lines.append(
+                "ferret cannot compute ratios until your benchmark also emits "
+                "KERNEL_RESULT_REFERENCE {\"<config>\": <reference TFLOPS>, ...} "
+                "and you commit that into the tag's body. Add this to your benchmark NOW."
+            )
             return "\n".join(lines)
 
         lines = [
             f"## Iteration {iteration} — {state.stage} stage "
             f"(score: {state.score:.3f} via {self.spec.scoring})",
             "",
-            "Per-config status:",
+            "Per-config status (kernel / reference = ratio):",
         ]
         for cfg in self.spec.configs:
             tflops = state.results.get(cfg.name, 0.0)
+            ref = state.reference.get(cfg.name, 0.0)
             ratio = state.ratios.get(cfg.name, 0.0)
             if ratio >= cfg.target_ratio:
                 marker = " ✓"
@@ -530,7 +553,7 @@ class CudaOrchestratorV2:
             else:
                 marker = ""
             lines.append(
-                f"  {cfg.name}: {tflops:6.1f} / {cfg.baseline_tflops:6.1f} "
+                f"  {cfg.name}: {tflops:6.1f} / {ref:6.1f} "
                 f"= {ratio*100:5.1f}% (target {cfg.target_ratio*100:.0f}%){marker}"
             )
         if state.worst_config and state.ratios.get(state.worst_config, 0.0) < 1.0:

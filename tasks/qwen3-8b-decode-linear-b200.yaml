@@ -1,12 +1,9 @@
 # ferret task spec — Qwen3-8B decode-phase linear projections on B200
 #
 # Status (2026-04-13):
-#   baseline_tflops values below are ESTIMATES from HBM physics (~6 TB/s
 #   effective bandwidth on B200 → ~4–5.5 TFLOPS per config depending on
 #   weight size). They will be WRONG by 5–20%. The first-iteration hint
 #   tells the agent to run `baselines/run_decode_linear_baseline.py`
-#   as its first action and use the measured numbers for its own
-#   judgment. After the first run, update this file with measured values.
 #
 # Goal: beat trtllm-gen by 10% across all 5 shapes (target_ratio=1.10).
 
@@ -42,37 +39,30 @@ problem:
 
 baseline:
   source: resources/tensorrt-llm-1.2.0/cpp/tensorrt_llm/kernels/trtllmGenKernels/gemm
-  command: "python3 baselines/run_decode_linear_baseline.py --backend trtllm_gen"
-  pre_measured: true    # estimates below; agent re-measures live in iter 0
 
 configs:
   - name: QKV
     args: { M: 1, N: 6144, K: 4096, residual: false }
-    baseline_tflops: 4.5   # ESTIMATE — 48MB weight, HBM-bound
     target_ratio: 1.10
     weight: 1.0
 
   - name: O
     args: { M: 1, N: 4096, K: 4096, residual: true }
-    baseline_tflops: 4.0   # ESTIMATE — 32MB weight
     target_ratio: 1.10
     weight: 1.0
 
   - name: GateUp
     args: { M: 1, N: 24576, K: 4096, residual: false }
-    baseline_tflops: 5.0   # ESTIMATE — 192MB weight
     target_ratio: 1.10
     weight: 1.0
 
   - name: Down
     args: { M: 1, N: 4096, K: 12288, residual: true }
-    baseline_tflops: 5.0   # ESTIMATE — 96MB weight, longer K
     target_ratio: 1.10
     weight: 1.0
 
   - name: LMHead
     args: { M: 1, N: 153600, K: 4096, residual: false }
-    baseline_tflops: 5.5   # ESTIMATE — 1.2GB weight, fully HBM-saturated
     target_ratio: 1.10
     weight: 1.0
 
@@ -90,10 +80,10 @@ constraints:
   - "Residual fusion is in-kernel epilogue only — do not launch a separate add kernel for O/Down."
 
 hints:
-  - "FIRST ACTION: run `baselines/run_decode_linear_baseline.py` to establish the real trtllm-gen numbers. The baseline_tflops values in this spec are rough physics estimates and may be off by 5-20%. Record the measured numbers in progress.md and judge your kernel against those, not the spec estimates."
-  - "The baseline script's trtllm_gen backend is a stub — it raises NotImplementedError. Your job during REPRODUCE is to either (a) implement it by calling into resources/flashinfer-0.6.7.post3/include/flashinfer/gemm/tgv_gemm.cuh (the sm100 BF16 decode-linear GEMM using CUTLASS primitives), or (b) fall back to --backend cublas (torch.matmul, reasonable proxy). For (a) the canonical CUTLASS pattern is in resources/cutlass-4.4.2/examples/93_blackwell_low_latency_gqa/tgv_gqa.cuh."
+  - "Your benchmark must measure BOTH your kernel AND a reference baseline on the same GPU with the same harness. Reference of choice for this task: trtllm-gen if you can wire it (see resources/flashinfer-0.6.7.post3/include/flashinfer/gemm/tgv_gemm.cuh for the sm100 BF16 decode-linear path) — otherwise cuBLAS via torch.matmul as a practical proxy. Pick one and stay consistent across iterations. Emit BOTH KERNEL_RESULT and KERNEL_RESULT_REFERENCE JSON lines, commit BOTH into your tag commit body, otherwise ferret cannot score you."
+  - "Reference reading: cutlass example 93 (resources/cutlass-4.4.2/examples/93_blackwell_low_latency_gqa/tgv_gqa.cuh) is the canonical Blackwell low-batch GEMM pattern; tgv_gemm.cuh in flashinfer is the sm100 BF16 implementation."
   - "M=1 makes this memory-bound. Vectorized BF16 weight loads (cp.async.bulk / TMA) and K-dim tiling matter more than MMA throughput. Consider CTA-cooperative weight loading for LMHead's N=153600 — a single CTA streaming 1.2GB is ~150us at best."
-  - "For split-K strategies, the output is small (N elements), so a separate reduction kernel is cheap. Don't overthink it."
+  - "For split-K strategies, the output is small (N elements), so a separate reduction kernel is cheap. Don't overthink it. Down (K=12288, small N) is the case where split-K matters most — short N starves parallelism, long K lengthens per-warp work."
   - "Free to use multiple __global__ functions in kernel.cu with host dispatch. Small-N (O, QKV) may want warp-wide GEMV; large-N (LMHead, GateUp) may want CTA/cluster-level GEMV with multicast."
 
 budget:

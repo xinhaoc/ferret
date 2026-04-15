@@ -189,6 +189,16 @@ eval $(./pick_gpu.sh)
   Without flush, weights ≤ 100MB stay hot — your "perf" reflects L2 hits, not HBM.
   This silently lies on shapes < 100MB and is the #1 measurement bug.
 - Pick a quiet GPU first: `eval $(./pick_gpu.sh)`. Other users' jobs distort timing.
+- **You MUST measure both your kernel AND the reference baseline (cuBLAS,
+  trtllm-gen, whatever the spec.baseline.source points at) in the SAME harness
+  on the SAME GPU.** Pick one reference and stay consistent across iterations.
+  Emit two JSON lines so ferret can score:
+      KERNEL_RESULT {"<config_name>": <kernel-tflops>, ...}
+      KERNEL_RESULT_REFERENCE {"<config_name>": <reference-tflops>, ...}
+  Both lines go to stdout from your benchmark AND into your git commit body
+  (orchestrator parses them from the latest tag's commit message). Without
+  KERNEL_RESULT_REFERENCE in the commit body, ferret cannot compute the
+  ratio you're being scored on.
 
 ## Forbidden patterns
 - "complex to implement" / "multi-iteration project" / "next run should..." — implement it NOW

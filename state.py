@@ -28,8 +28,30 @@ from .task_spec import (
     TaskSpec,
     compute_score,
     parse_kernel_output,
+    parse_reference_output,
     should_advance_stage,
 )
+
+
+def _read_latest_tag_body(workspace_path: str | Path) -> str:
+    """Return the latest tag's full commit message body, or '' if no tags."""
+    ws = str(Path(workspace_path).resolve())
+    try:
+        tag = subprocess.check_output(
+            ["git", "-C", ws, "describe", "--tags", "--abbrev=0"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+    if not tag:
+        return ""
+    try:
+        return subprocess.check_output(
+            ["git", "-C", ws, "log", "-1", "--format=%B", tag],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        return ""
 
 
 def get_best_results(workspace_path: str | Path) -> dict[str, float]:
@@ -37,45 +59,22 @@ def get_best_results(workspace_path: str | Path) -> dict[str, float]:
 
     Convention from the agent's git workflow: every tag is by definition an
     improvement (failed and no-gain attempts get a commit body but no tag), so
-    the most recent reachable tag is the current best. This matches what the
-    agent's own revert command (`git checkout $(git describe --tags --abbrev=0)`)
-    already loads.
+    the most recent reachable tag is the current best.
 
-    Args:
-        workspace_path: directory containing the agent's kernel.cu and .git
-
-    Returns:
-        Dict like {"Q1": 31.0, "Q2": 54.7, "Q4": 87.7}, or {} if there are no
-        tags, or the tag exists but its commit body has no parseable result line.
-
-    The parser (task_spec.parse_kernel_output) handles three formats in this
-    priority order: KERNEL_RESULT JSON line, v004 printf "Q_LEN=N: X TFLOPS",
-    and commit-body "Q<N>=<float>". The first format that matches wins.
+    Returns own-kernel measurements, parsed via parse_kernel_output (handles
+    KERNEL_RESULT JSON, v004 printf, and TFLOPS:Q<N>= commit format).
     """
-    ws = str(Path(workspace_path).resolve())
+    return parse_kernel_output(_read_latest_tag_body(workspace_path))
 
-    try:
-        tag = subprocess.check_output(
-            ["git", "-C", ws, "describe", "--tags", "--abbrev=0"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return {}
 
-    if not tag:
-        return {}
+def get_best_reference(workspace_path: str | Path) -> dict[str, float]:
+    """Return per-config REFERENCE TFLOPS from the latest tagged kernel version.
 
-    try:
-        body = subprocess.check_output(
-            ["git", "-C", ws, "log", "-1", "--format=%B", tag],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except subprocess.CalledProcessError:
-        return {}
-
-    return parse_kernel_output(body)
+    The agent's benchmark must emit BOTH KERNEL_RESULT and KERNEL_RESULT_REFERENCE
+    lines and commit them into the tag's commit body so we can score live.
+    Returns {} if no reference line in the latest tag.
+    """
+    return parse_reference_output(_read_latest_tag_body(workspace_path))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -94,10 +93,12 @@ class RunState:
     """
     stage: str                                       # "REPRODUCE" or "OPTIMIZE"
     score: float                                     # aggregate per spec.scoring
-    results: dict[str, float] = field(default_factory=dict)  # {"Q1": 31.1, ...}
-    ratios: dict[str, float] = field(default_factory=dict)   # {"Q1": 0.907, ...}
+    results: dict[str, float] = field(default_factory=dict)  # own-kernel TFLOPS per config
+    reference: dict[str, float] = field(default_factory=dict)  # baseline TFLOPS per config
+    ratios: dict[str, float] = field(default_factory=dict)   # results / reference per config
     worst_config: str = ""                           # config name with lowest ratio
     has_any_kernel: bool = False                     # False on a fresh workspace
+    has_reference: bool = False                      # False if agent hasn't measured baseline yet
 
 
 def compute_state(workspace_path: str | Path, spec: TaskSpec) -> RunState:
@@ -113,15 +114,18 @@ def compute_state(workspace_path: str | Path, spec: TaskSpec) -> RunState:
     This is the signal to _first_turn that the agent is starting from scratch.
     """
     results = get_best_results(workspace_path)
+    reference = get_best_reference(workspace_path)
 
     if not results:
         return RunState(
             stage="REPRODUCE",
             score=0.0,
             has_any_kernel=False,
+            has_reference=bool(reference),
+            reference=reference,
         )
 
-    score, ratios = compute_score(results, spec)
+    score, ratios = compute_score(results, reference, spec)
     advance = should_advance_stage(score, ratios, spec)
     worst = min(ratios, key=ratios.get) if ratios else ""
 
@@ -129,8 +133,10 @@ def compute_state(workspace_path: str | Path, spec: TaskSpec) -> RunState:
         stage="OPTIMIZE" if advance else "REPRODUCE",
         score=score,
         results=results,
+        reference=reference,
         ratios=ratios,
         worst_config=worst,
+        has_reference=bool(reference),
         has_any_kernel=True,
     )
 
@@ -158,12 +164,19 @@ def _main() -> int:
 
     # Always show the raw results first
     results = get_best_results(ws)
+    reference = get_best_reference(ws)
     if not results:
         print(f"no tagged improvements in {ws}")
         return 0
-    print(f"latest tag's per-config TFLOPS:")
+    print(f"latest tag's KERNEL_RESULT:")
     for k, v in results.items():
         print(f"  {k}: {v}")
+    if reference:
+        print(f"latest tag's KERNEL_RESULT_REFERENCE:")
+        for k, v in reference.items():
+            print(f"  {k}: {v}")
+    else:
+        print(f"latest tag's KERNEL_RESULT_REFERENCE: (not present — agent must measure)")
 
     # If a task.yaml was provided, also show the full RunState
     if len(sys.argv) >= 3:
@@ -182,15 +195,17 @@ def _main() -> int:
         print(f"  score           : {state.score:.3f} (via {spec.scoring})")
         print(f"  worst_config    : {state.worst_config or '(none)'}")
         print(f"  has_any_kernel  : {state.has_any_kernel}")
-        print(f"  per-config ratios (vs spec baselines):")
+        print(f"  has_reference   : {state.has_reference}")
+        print(f"  per-config ratios (kernel / reference):")
         for cfg in spec.configs:
             tflops = state.results.get(cfg.name, 0.0)
+            ref = state.reference.get(cfg.name, 0.0)
             ratio = state.ratios.get(cfg.name, 0.0)
             marker = " ✓" if ratio >= cfg.target_ratio else (
                 "  ← WORST" if cfg.name == state.worst_config else ""
             )
             print(
-                f"    {cfg.name}: {tflops:6.1f} / {cfg.baseline_tflops:6.1f} "
+                f"    {cfg.name}: {tflops:6.1f} / {ref:6.1f} "
                 f"= {ratio*100:5.1f}% (target {cfg.target_ratio*100:.0f}%){marker}"
             )
     return 0

@@ -42,27 +42,20 @@ problem:
     KV_LEN: 4096
     BATCH: 1
 
-# Baselines are pre-measured from a prior trtllm-gen benchmark run. Not
-# re-measuring per ferret run — set pre_measured: false if you want the
-# agent to re-measure each startup.
 baseline:
   source: resources/flashinfer-0.6.7.post3
-  command: ""            # empty = don't run; trust pre_measured numbers below
-  pre_measured: true
 
 configs:
   # Q1: current 31.1, trtllm 34.3. Stretch target = match trtllm (target 1.0).
   # min_ratio aggregate scoring means this config can block stage advance.
   - name: Q1
     args: { Q_LEN: 1 }
-    baseline_tflops: 34.3
     target_ratio: 1.00
     weight: 1.0
 
   # Q2: current 54.7, trtllm 62.6. Same story as Q1.
   - name: Q2
     args: { Q_LEN: 2 }
-    baseline_tflops: 62.6
     target_ratio: 1.00
     weight: 1.0
 
@@ -71,7 +64,6 @@ configs:
   # Q4 is the easiest config.
   - name: Q4
     args: { Q_LEN: 4 }
-    baseline_tflops: 79.8
     target_ratio: 1.00
     weight: 0.5
 

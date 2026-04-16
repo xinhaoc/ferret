@@ -95,15 +95,16 @@ async def main():
     except ValueError as e:
         parser.error(f"invalid task spec: {e}")
 
-    # Validate the baseline source path referenced by the spec exists, relative
-    # to the agent root (where resources/ lives). Agent will read this during
-    # the run, so catch the typo now.
-    baseline_path = AGENT_ROOT / spec.baseline.source
-    if not baseline_path.exists():
-        parser.error(
-            f"baseline source not found: {baseline_path} "
-            f"(referenced from {task_yaml_path})"
-        )
+    # Validate reference paths exist. `baseline.source` is a name (e.g. "cuBLAS",
+    # "trtllm-gen") — the scoring target, not a readable path. `references` is
+    # the REPRODUCE reading list and each entry MUST resolve to a file/dir.
+    for ref in spec.references:
+        ref_path = AGENT_ROOT / ref
+        if not ref_path.exists():
+            parser.error(
+                f"reference path not found: {ref_path} "
+                f"(from references[] in {task_yaml_path})"
+            )
 
     # Workspace dir
     ws_path = Path(args.workspace)

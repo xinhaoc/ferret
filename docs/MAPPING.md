@@ -47,7 +47,7 @@ Current pins:
 - `triton-3.6.0` — `python/tutorials/06-fused-attention.py`
 
 ### GEMM / Matrix Multiply
-- `examples/tcgen05-gemm/` — hand-written PTX tcgen05 BF16 GEMM reference kernels (`00_sm80_baseline.cu` → `07_tuned_final.cu`): TMA, mbarrier pipeline, warp specialization, 2-SM cluster MMA, persistent scheduler. `common.h` has the inline PTX MMA/TMA wrappers. Start here for self-contained tcgen05 kernels — no CUTLASS includes.
+- `examples/tcgen05-gemm/` — hand-written PTX tcgen05 BF16 GEMM reference kernels (`00_sm80_baseline.cu` → `07_cg2_persistent_large_m.cu`): TMA, mbarrier pipeline, warp specialization, 2-SM cluster MMA, persistent scheduler. `common.h` has the inline PTX MMA/TMA wrappers. Start here for self-contained tcgen05 kernels — no CUTLASS includes. For SMALL-M GEMM (e.g. M=16 decode), start from `05b_cg2_swapab_small_m.cu` — 05/06/07 use an M-split cg2 pattern that fails at M < BLOCK_M.
 - `cutlass-4.4.2` — `include/cutlass/gemm/kernel/` (40+ variants), CuTe GEMM tutorials, collective mainloops
 - `deepgemm-2.1.1.post3` — `deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh`, `sm90_fp8_gemm_*.cuh`, `sm100_bf16_gemm.cuh`, `sm100_fp8_gemm_*.cuh`
 - `tensorrt-llm-1.2.0` — `cpp/tensorrt_llm/thop/fp8PerTensorScalingTrtllmGenGemm.cpp`, `fp8BlockScalingGemm.cpp`, `fp4Gemm.cpp`, `weightOnlyQuantGemm.cpp`

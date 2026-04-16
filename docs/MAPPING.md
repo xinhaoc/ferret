@@ -128,7 +128,8 @@ Hardware dynamic tile distribution via `clusterlaunchcontrol.try_cancel` PTX (Bl
 
 ### Cluster-cooperative MMA (cta_group::2)
 Two SMs cooperatively execute a single MMA via DSMEM, effectively doubling M per instruction (Blackwell SM100+).
-- `examples/tcgen05-gemm/05_two_sm_cluster_mma.cu` — minimal hand-written 2-SM cluster tcgen05 GEMM (no CUTLASS).
+- `examples/tcgen05-gemm/05_two_sm_cluster_mma.cu` — minimal hand-written 2-SM cluster tcgen05 GEMM (no CUTLASS). Standard M-split pattern — for GEMMs where M is large enough to dispatch >=2 M-blocks per cluster.
+- `examples/tcgen05-gemm/05b_cg2_swapab_small_m.cu` — **variant for small-M GEMM** (e.g. M=16 decode). Uses swapab to put the large N dimension into MMA_M and pad small M into MMA_N. Verified correct on B200. Non-persistent / un-pipelined — use as correctness starting point, then add persistent + warp-specialized pipeline to match cg1 perf.
 - `deepgemm-2.1.1.post3` — `deep_gemm/include/deep_gemm/common/sm100_utils.cuh` (struct `SM100_MMA_F16BF16_2x1SM_SS` has the `tcgen05.mma.cta_group::2.kind::f16` inline PTX; also `MXF8F6F4_2x1SM_SS` variant)
 - `deepgemm-2.1.1.post3` — `deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh` (full kernel using the 2x1SM MMA)
 - `cutlass-4.4.2` — `include/cute/atom/mma_traits_sm100.hpp`, `include/cute/arch/mma_sm100_umma.hpp` (CuTe abstractions)

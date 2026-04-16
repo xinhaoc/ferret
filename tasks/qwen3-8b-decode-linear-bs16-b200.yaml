@@ -56,43 +56,48 @@ references:
   - resources/cutlass-4.4.2/examples/74_blackwell_gemm_streamk                     # stream-K scheduler for shapes with few tiles
   - resources/flashinfer-0.6.7.post3/include/flashinfer/gemm/tgv_gemm.cuh          # sm100 BF16 GEMM using CUTLASS primitives
   - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh  # persistent scheduler + TMA store epilogue
+  - examples/tcgen05-gemm/05b_cg2_swapab_small_m.cu                                        # cg2 for small-M via swapab (verified correct on B200, needs tuning)
 
+# Targets calibrated against cuBLAS on B200 for M=16 BF16 (2026-04-15 bench):
+#   QKV   kernel 42.65 vs cuBLAS 43.46 → 98%
+#   O     kernel 31.54 vs cuBLAS 28.34 → 111% (residual-fusion wins)
+#   GateUp kernel 62.91 vs cuBLAS 64.90 → 97%
+#   Down   kernel 45.84 vs cuBLAS 50.03 → 92%
+#   LMHead kernel 95.07 vs cuBLAS 90.69 → 105%
+# Original 1.30 target was set against a weak CUTLASS reference; vs cuBLAS
+# at M=16 it is physically unrealistic. 1.10 is aggressive but achievable
+# on shapes where residual fusion or cg2 swapab can give a real edge.
 configs:
   - name: QKV
     args: { M: 16, N: 6144, K: 4096, residual: false }
-    target_ratio: 1.30
+    target_ratio: 1.10
     weight: 1.0
 
   - name: O
     args: { M: 16, N: 4096, K: 4096, residual: true }
-    target_ratio: 1.30
+    target_ratio: 1.10
     weight: 1.0
 
   - name: GateUp
     args: { M: 16, N: 24576, K: 4096, residual: false }
-    target_ratio: 1.30
+    target_ratio: 1.10
     weight: 1.0
 
   - name: Down
     args: { M: 16, N: 4096, K: 12288, residual: true }
-    target_ratio: 1.30
+    target_ratio: 1.10
     weight: 1.0
 
   - name: LMHead
     args: { M: 16, N: 153600, K: 4096, residual: false }
-    target_ratio: 1.30
+    target_ratio: 1.10
     weight: 1.0
 
-# min_ratio: every config must clear 1.30x — one straggler fails the
+# min_ratio: every config must clear its target — one straggler fails the
 # whole task. Weighted_avg would let a big win on LMHead mask a loss
 # on O, which would be dishonest.
 scoring: min_ratio
 
-# REPRODUCE must actually happen this time. 0.9 means the kernel has to
-# reach 90% of CUTLASS (measured, not estimated) before OPTIMIZE
-# engages. A dumb CUDA-core FMA GEMM at M=16 will get maybe 20-30% of
-# tcgen05 CUTLASS — so the agent stays in REPRODUCE until it ports
-# tensor cores. That's the point.
 stage_gate:
   ratio: 0.9
   strict: false

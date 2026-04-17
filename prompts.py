@@ -155,6 +155,8 @@ Track all kernel versions with git. Every attempt is a commit — history is nev
 
 All git commands run from workspace/ (where kernel.cu and .git live).
 
+Your best result is already in git. Do NOT re-benchmark and re-tag the same kernel.cu — measurement noise is not improvement. Only commit + tag after a **code change** to kernel.cu. If you are below target, write a code change, not a better commit message.
+
 ### Save an improvement
 ```bash
 cd workspace && git add kernel.cu progress.md && git commit -m "v005: warp specialization for TMA/MMA overlap [warp-specialization]

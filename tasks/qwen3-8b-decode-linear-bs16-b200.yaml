@@ -57,6 +57,7 @@ references:
   - resources/flashinfer-0.6.7.post3/include/flashinfer/gemm/tgv_gemm.cuh          # sm100 BF16 GEMM using CUTLASS primitives
   - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh  # persistent scheduler + TMA store epilogue
   - examples/tcgen05-gemm/05b_cg2_swapab_small_m.cu                                        # cg2 for small-M via swapab (verified correct on B200, needs tuning)
+  - examples/qwen3-8b-decode-linear-bs16/v019_swapab_cg2_l2hints.cu                        # current best cg2 kernel (1.07 min_ratio vs cuBLAS) — port to cg1
 
 # Targets calibrated against cuBLAS on B200 for M=16 BF16 (2026-04-15 bench):
 #   QKV   kernel 42.65 vs cuBLAS 43.46 → 98%
@@ -105,7 +106,7 @@ stage_gate:
 constraints:
   - "Single CUDA stream only — kernel runs inside a framework managing its own streams. No cudaStreamCreate, no cudaEventRecord overlap."
   - "No CUDA graphs."
-  - "cta_group::2 (2-CTA cluster MMA) IS ALLOWED and likely required to beat CUTLASS at LMHead's large N."
+  - "cta_group::1 only — deployment framework does not support cluster launch (cta_group::2)."
   - "Output bit-compatible with the CUTLASS baseline: max relative error < 5e-3 across all 5 configs."
   - "Residual fusion is in-kernel epilogue only — no separate add kernel for O/Down."
 

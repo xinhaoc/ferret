@@ -1,0 +1,86 @@
+# ferret task spec — MLA decode with TP=8 (16 local heads per rank)
+
+name: mla-mtp-decode-tp8-kv4096
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    DeepSeek V3 MLA multi-token prediction decode kernel — TP=8.
+    Per-rank attention for 16 local Q heads against a replicated KV cache.
+
+    Layout (per rank):
+      Q : [B, Q_LEN, 16, D_K]     (16 local heads, D_K = 576)
+      KV: [B, KV_LEN, D_K]        (replicated)
+      O : [B, Q_LEN, 16, D_V]     (D_V = 512)
+
+    MMA M mapping:
+      - Q_LEN=1: 16 rows → M=64, pad 48 rows (75% waste)
+      - Q_LEN=2: 32 rows → M=64, pad 32 rows (50% waste)
+      - Q_LEN=4: 64 rows → M=64, exact fit
+
+    Causal masking: each query q attends to KV positions ≤ (kv_len - Q_LEN + q).
+
+  shapes:
+    NUM_HEADS: 16
+    D_K: 576
+    D_V: 512
+    KV_LEN: 4096
+    BATCH: 1
+
+baseline:
+  source: trtllm-gen MLA decode (single-GPU, scaled to 16 heads)
+
+references:
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/mla.cuh
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
+  - resources/flashmla-main/csrc/sm100/decode
+  - examples/tcgen05-gemm/
+  - examples/mla-mtp-decode-q1to8-kv4096/
+
+configs:
+  - name: Q1
+    args: { Q_LEN: 1 }
+    target_ratio: 0.90
+    weight: 1.0
+
+  - name: Q2
+    args: { Q_LEN: 2 }
+    target_ratio: 0.95
+    weight: 1.0
+
+  - name: Q3
+    args: { Q_LEN: 3 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: Q4
+    args: { Q_LEN: 4 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.80
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only — deployment framework does not support cluster launch."
+  - "No reshape kernels — Q loaded directly from [Q_LEN, 16, D_K] via TMA."
+  - "Output bit-compatible with reference: max relative error < 5e-3."
+  - "NUM_HEADS=16 (TP=8)."
+
+hints:
+  - "Start from examples/mla-mtp-decode-q1to8-kv4096/ (single-GPU best)."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [Q1, Q2, Q3, Q4]

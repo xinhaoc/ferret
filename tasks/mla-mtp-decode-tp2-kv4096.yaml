@@ -1,0 +1,93 @@
+# ferret task spec — MLA decode with TP=2 (64 local heads per rank)
+#
+# DeepSeek V3 MLA decode kernel ported to Tensor Parallelism.
+# Each rank owns local_num_heads = 128 / 2 = 64 Q heads.
+# KV cache is replicated (not sharded) — the MLA trick.
+# tcgen05 MMA M=64 fits exactly (no padding waste at TP=2).
+
+name: mla-mtp-decode-tp2-kv4096
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    DeepSeek V3 MLA multi-token prediction decode kernel — TP=2.
+    Per-rank attention for 64 local Q heads against a replicated KV cache.
+
+    Layout (per rank):
+      Q : [B, Q_LEN, 64, D_K]     (64 local heads, D_K = 576)
+      KV: [B, KV_LEN, D_K]        (replicated, shared across heads)
+      O : [B, Q_LEN, 64, D_V]     (D_V = 512)
+
+    With 64 heads:
+      - Q_LEN=1: 64 valid MMA rows → M=64 (exact fit, 0% waste)
+      - Q_LEN=2: 128 valid MMA rows → M=128 (exact fit)
+      - Q_LEN=4: 256 valid MMA rows → needs 2× M=128 blocks or M=64 with 4 groups
+
+    Causal masking: each query q attends to KV positions ≤ (kv_len - Q_LEN + q).
+
+    Output must match single-GPU PyTorch MLA reference within max rel error < 5e-3.
+
+  shapes:
+    NUM_HEADS: 64             # local heads per rank (128 / TP=2)
+    D_K: 576
+    D_V: 512
+    KV_LEN: 4096
+    BATCH: 1
+
+baseline:
+  source: trtllm-gen MLA decode (single-GPU, scaled to 64 heads)
+
+references:
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/mla.cuh
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
+  - resources/flashmla-main/csrc/sm100/decode
+  - examples/tcgen05-gemm/
+  - examples/mla-mtp-decode-q1to8-kv4096/
+
+configs:
+  - name: Q1
+    args: { Q_LEN: 1 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: Q2
+    args: { Q_LEN: 2 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: Q3
+    args: { Q_LEN: 3 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: Q4
+    args: { Q_LEN: 4 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only — no cudaStreamCreate, no multi-stream overlap."
+  - "No CUDA graphs."
+  - "cta_group::1 only — deployment framework does not support cluster launch."
+  - "No reshape kernels — Q loaded directly from [Q_LEN, 64, D_K] via TMA."
+  - "Output bit-compatible with reference: max relative error < 5e-3."
+  - "NUM_HEADS=64 (TP=2)."
+
+hints:
+  - "Start from examples/mla-mtp-decode-q1to8-kv4096/ (single-GPU best)."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [Q1, Q2, Q3, Q4]

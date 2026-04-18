@@ -37,7 +37,7 @@ problem:
     BATCH: 1
 
 baseline:
-  source: trtllm-gen MLA decode (single-GPU, scaled to 32 heads)
+  source: "flashinfer FA2 MLA decode — run: python3 baselines/mla-mtp-decode/baseline.py --num-heads 32"
 
 references:
   - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/mla.cuh

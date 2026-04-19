@@ -40,6 +40,7 @@ baseline:
   source: "trtllm-gen MLA decode — run: python3 baselines/mla-mtp-decode/baseline.py --num-heads 64"
 
 references:
+  - examples/mla-mtp-decode-q1to8-kv4096/swapab_mla_regpv.cu        # verified swap-AB MLA: QK MMA + cross-thread softmax + register PV. PASS on B200.
   - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/mla.cuh
   - resources/cutlass-4.4.2/examples/77_blackwell_fmha
   - resources/flashmla-main/csrc/sm100/decode

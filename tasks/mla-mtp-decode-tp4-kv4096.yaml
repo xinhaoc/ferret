@@ -40,11 +40,13 @@ baseline:
   source: "trtllm-gen MLA decode — run: python3 baselines/mla-mtp-decode/baseline.py --num-heads 32"
 
 references:
+  - examples/mla-mtp-decode-q1to8-kv4096/v037_tp2_swapab_unrolled_reduce.cu   # best TP=2 kernel (swap-AB, beats trtllm-gen). Adapt NUM_HEADS 64→32.
+  - examples/mla-mtp-decode-q1to8-kv4096/v001_tp8_swapab.cu                   # TP=8 kernel (16 heads, also beats trtllm-gen)
+  - examples/mla-mtp-decode-q1to8-kv4096/swapab_mla_regpv.cu                  # verified swap-AB MLA correctness proof
   - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/mla.cuh
   - resources/cutlass-4.4.2/examples/77_blackwell_fmha
   - resources/flashmla-main/csrc/sm100/decode
   - examples/tcgen05-gemm/
-  - examples/mla-mtp-decode-q1to8-kv4096/
 
 configs:
   - name: Q1

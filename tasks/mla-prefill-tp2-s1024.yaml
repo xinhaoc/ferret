@@ -1,0 +1,78 @@
+# ferret task spec — MLA prefill with TP=2 (64 local heads per rank)
+
+name: mla-prefill-tp2-s1024
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    DeepSeek V3 MLA prefill kernel — TP=2.
+    Per-rank causal self-attention for 64 local Q heads.
+
+    Layout (per rank):
+      Q_nope: [B, S, 64, D_CKV]    (D_CKV = 512)
+      Q_pe:   [B, S, 64, D_KPE]    (D_KPE = 64)
+      KV:     [B, S, D_CKV + D_KPE] (replicated, shared across heads)
+      O:      [B, S, 64, D_V]       (D_V = 512)
+
+    Causal masking: position q attends to kv positions ≤ q.
+
+  shapes:
+    NUM_HEADS: 64
+    D_CKV: 512
+    D_KPE: 64
+    D_V: 512
+    BATCH: 1
+
+baseline:
+  source: "trtllm-gen MLA prefill — run: python3 baselines/mla-prefill/baseline.py --num-heads 64"
+
+references:
+  - examples/mla-prefill-b1-s1024/v016_mma_sync_fused.cu
+  - examples/mla-mtp-decode-q1to8-kv4096/v037_tp2_swapab_unrolled_reduce.cu
+  - examples/mla-mtp-decode-q1to8-kv4096/swapab_mla_regpv.cu
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/mla.cuh
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
+  - resources/flashmla-main/csrc/sm100/decode
+  - examples/tcgen05-gemm/
+
+configs:
+  - name: S512
+    args: { SEQ_LEN: 512 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: S1024
+    args: { SEQ_LEN: 1024 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: S2048
+    args: { SEQ_LEN: 2048 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only — deployment framework does not support cluster launch."
+  - "Output bit-compatible with reference: max relative error < 5e-3."
+  - "NUM_HEADS=64 (TP=2)."
+
+hints:
+  - "Start from examples/mla-prefill-b1-s1024/v016_mma_sync_fused.cu (single-GPU best, mma.sync). Upgrade to tcgen05 for B200 perf."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [S512, S1024, S2048]

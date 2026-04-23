@@ -52,10 +52,9 @@ for S in args.seq_len:
     torch.cuda.synchronize()
     ms = st.elapsed_time(en) / N
     us = ms * 1000
-    # FLOPS uses absorbed dims (576+512) for fair comparison with agent's kernel
-    # even though FA2 computes with smaller dims. This way agent's KERNEL_RESULT
-    # and KERNEL_RESULT_REFERENCE use the same FLOPS formula.
+    # Must match kernel's formula: 2.0 * B * H * S * S * (D_CKV + D_KPE + D_V)
+    # = 2 * B * H * S * S * (512 + 64 + 512) = 2 * B * H * S * S * 1088
     ABS_QK, ABS_V = 576, 512
-    flops = B * H * S * S * (ABS_QK + ABS_V)
+    flops = 2 * B * H * S * S * (ABS_QK + ABS_V)
     tflops = flops / (ms / 1000) / 1e12
     print(f"S{S}: {tflops:.2f} TFLOPS (absorbed-equivalent), {us:.1f} us latency")

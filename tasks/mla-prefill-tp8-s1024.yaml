@@ -79,10 +79,10 @@ constraints:
   - "No CUDA graphs."
   - "cta_group::1 only — deployment framework does not support cluster launch."
   - "Output bit-compatible with reference: max relative error < 5e-3."
-  - "NUM_HEADS=64 (TP=8)."
+  - "NUM_HEADS=16 (TP=8)."
 
 hints:
-  - "Start from examples/mla-prefill-b1-s1024/v016_mma_sync_fused.cu (single-GPU best, mma.sync). Upgrade to tcgen05 for B200 perf."
+  - "Current absorbed kernel beats FA2 at S≤1024 but loses at S=2048 (0.84x). FA2 uses unabsorbed form (D_QK=192, D_V=128) — 3x less compute per head. For large S where compute dominates, consider writing an unabsorbed kernel or hybrid dispatch (absorbed for short S, unabsorbed for long S). See resources/flashinfer-0.6.7.post3/include/flashinfer/attention/prefill.cuh for the FA2 implementation."
 
 budget:
   max_iterations: 60

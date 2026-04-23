@@ -32,6 +32,8 @@ references:
   - examples/mla-prefill-b1-s1024/v016_mma_sync_fused.cu
   - examples/mla-mtp-decode-q1to8-kv4096/v037_tp2_swapab_unrolled_reduce.cu
   - examples/mla-mtp-decode-q1to8-kv4096/swapab_mla_regpv.cu
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/prefill.cuh          # FA2 prefill kernel (unabsorbed path)
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/hopper/prefill_sm90.cuh  # Hopper FA2/FA3 prefill
   - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/mla.cuh
   - resources/cutlass-4.4.2/examples/77_blackwell_fmha
   - resources/flashmla-main/csrc/sm100/decode

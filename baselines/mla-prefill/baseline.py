@@ -83,7 +83,7 @@ for S in args.seq_len:
     en.record()
     torch.cuda.synchronize()
     ms = st.elapsed_time(en) / N
-    # 2x for multiply-accumulate: QK (2*B*H*S*S*D_QK) + PV (2*B*H*S*S*D_V)
-    flops = 2 * B * H * S * S * (HEAD_DIM_QK + HEAD_DIM_V)
+    # QK (B*H*S*S*D_QK) + PV (B*H*S*S*D_V) — same 1x convention as decode baseline
+    flops = B * H * S * S * (HEAD_DIM_QK + HEAD_DIM_V)
     tflops = flops / (ms / 1000) / 1e12
     print(f"S{S}: {tflops:.2f} TFLOPS, {ms * 1000:.1f} us")

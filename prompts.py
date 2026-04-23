@@ -248,6 +248,11 @@ eval $(./pick_gpu.sh)
   (orchestrator parses them from the latest tag's commit message). Without
   KERNEL_RESULT_REFERENCE in the commit body, ferret cannot compute the
   ratio you're being scored on.
+- **KERNEL_RESULT_REFERENCE must come from running `baselines/` script
+  every time you tag**, not from hardcoded numbers in kernel.cu. If you
+  change the TFLOPS formula in your kernel, the reference must use the
+  SAME formula. Run the baseline script and use its output directly.
+  Do NOT copy reference numbers from old commits.
 
 ## Forbidden patterns
 - "complex to implement" / "multi-iteration project" / "next run should..." — implement it NOW

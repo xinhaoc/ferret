@@ -1,0 +1,86 @@
+# ferret task spec — MLA prefill TP=8, long sequences (S≥1024)
+# Goal: beat FA2 unabsorbed at long sequence lengths where absorbed form loses.
+
+name: mla-prefill-tp8-longseq
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    DeepSeek V3 MLA prefill kernel — TP=8, long sequences.
+    Beat FA2 unabsorbed (the production prefill path) at S=1024, 2048, 4096.
+
+    The absorbed form (D_QK=576, D_V=512) loses to FA2 unabsorbed
+    (D_QK=192, D_V=128) at S≥2048 because it does 3x more compute
+    per head. At S=2048: absorbed kernel 0.85x of FA2 latency.
+
+    The agent should write an unabsorbed MLA prefill kernel:
+      Q_nope: [B, S, 16, 128]   (qk_nope_head_dim)
+      Q_pe:   [B, S, 16, 64]    (qk_rope_head_dim)
+      K:      [B, S, 1, 192]    (nope + rope, 1 KV head, replicated)
+      V:      [B, S, 1, 128]    (kv_lora_rank compressed, replicated)
+      O:      [B, S, 16, 128]
+
+    Or use any approach that beats FA2 on latency — absorbed, unabsorbed,
+    hybrid, or something else.
+
+    Causal masking: position q attends to kv positions ≤ q.
+
+  shapes:
+    NUM_HEADS: 16
+    D_QK_NOPE: 128
+    D_QK_ROPE: 64
+    D_V: 128
+    BATCH: 1
+
+baseline:
+  source: "FA2 unabsorbed MLA prefill — run: python3 baselines/mla-prefill/baseline.py --num-heads 16 --seq-len 1024 2048 4096"
+
+references:
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/prefill.cuh
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/hopper/prefill_sm90.cuh
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
+  - examples/mla-prefill-b1-s1024/v024_tp8_absorbed_mmasync.cu
+  - examples/mla-prefill-b1-s1024/v016_mma_sync_fused.cu
+  - examples/tcgen05-gemm/
+
+configs:
+  - name: S1024
+    args: { SEQ_LEN: 1024 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: S2048
+    args: { SEQ_LEN: 2048 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: S4096
+    args: { SEQ_LEN: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only — deployment framework does not support cluster launch."
+  - "Output bit-compatible with reference: max relative error < 5e-3."
+  - "NUM_HEADS=16 (TP=8)."
+
+hints:
+  - "FA2 uses unabsorbed dims (D_QK=192, D_V=128) — 3x less compute than absorbed (576, 512). At S≥2048 compute dominates and absorbed can't win. Write an unabsorbed kernel."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [S1024, S2048, S4096]

@@ -9,6 +9,18 @@ problem:
   description: |
     DeepSeek V3 MLA prefill kernel — TP=8.
     Per-rank causal self-attention for 16 local Q heads.
+    Goal: beat FA2 unabsorbed prefill (the production path used by
+    vLLM/SGLang) on LATENCY across all sequence lengths.
+
+    Production path (FA2 unabsorbed): decompresses latent KV via kv_b_proj
+    GEMM, then runs standard MHA with D_QK=192, D_V=128.
+    Current best absorbed kernel: beats FA2 at S≤1024, loses at S=2048
+    (247μs vs 100.6μs — absorbed does 3x more compute per head).
+
+    The agent may use absorbed form (D_QK=576, D_V=512, skips kv_b_proj)
+    OR unabsorbed form (D_QK=192, D_V=128, needs decompression) OR a
+    hybrid per sequence length. The scoring target is FA2 unabsorbed
+    latency — whatever approach beats it wins.
 
     Layout (per rank):
       Q_nope: [B, S, 16, D_CKV]    (D_CKV = 512)
@@ -26,7 +38,7 @@ problem:
     BATCH: 1
 
 baseline:
-  source: "trtllm-gen MLA prefill — run: python3 baselines/mla-prefill/baseline.py --num-heads 16"
+  source: "FA2 unabsorbed MLA prefill (production path) — run: python3 baselines/mla-prefill/baseline.py --num-heads 16 (use FA2 unabsorbed latency as the target to beat)"
 
 references:
   - examples/mla-prefill-b1-s1024/v016_mma_sync_fused.cu

@@ -34,7 +34,7 @@ problem:
     BATCH: 1
 
 baseline:
-  source: "FA2 unabsorbed chunked prefill — run: python3 baselines/mla-prefill/baseline_chunked.py --num-heads 16"
+  source: "CUTLASS SM100a single_prefill (stronger than FA2 batch) — run: python3 baselines/mla-prefill/baseline_chunked.py --num-heads 16 (use CUTLASS SM100a numbers as target)"
 
 references:
   - examples/mla-prefill-b1-s1024/v006_tp8_unabsorbed.cu

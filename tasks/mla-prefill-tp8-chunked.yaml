@@ -37,6 +37,7 @@ baseline:
   source: "CUTLASS SM100a single_prefill (stronger than FA2 batch) — run: python3 baselines/mla-prefill/baseline_chunked.py --num-heads 16 (use CUTLASS SM100a numbers as target)"
 
 references:
+  - examples/mla-prefill-b1-s1024/v020_tp8_unabsorbed_chunked.cu
   - examples/mla-prefill-b1-s1024/v006_tp8_unabsorbed.cu
   - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/prefill.cuh
   - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/hopper/prefill_sm90.cuh

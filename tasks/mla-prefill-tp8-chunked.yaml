@@ -44,13 +44,23 @@ references:
   - examples/tcgen05-gemm/
 
 configs:
-  - name: C512_KV2048
-    args: { CHUNK: 512, KV_LEN: 2048 }
+  - name: C256_KV2048
+    args: { CHUNK: 256, KV_LEN: 2048 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: C256_KV4096
+    args: { CHUNK: 256, KV_LEN: 4096 }
     target_ratio: 1.00
     weight: 1.0
 
   - name: C512_KV4096
     args: { CHUNK: 512, KV_LEN: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: C512_KV8192
+    args: { CHUNK: 512, KV_LEN: 8192 }
     target_ratio: 1.00
     weight: 1.0
 
@@ -61,6 +71,11 @@ configs:
 
   - name: C1024_KV8192
     args: { CHUNK: 1024, KV_LEN: 8192 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: C2048_KV8192
+    args: { CHUNK: 2048, KV_LEN: 8192 }
     target_ratio: 1.00
     weight: 1.0
 
@@ -86,4 +101,4 @@ budget:
 
 output:
   result_format: kernel_result_json
-  result_keys: [C512_KV2048, C512_KV4096, C1024_KV4096, C1024_KV8192]
+  result_keys: [C256_KV2048, C256_KV4096, C512_KV4096, C512_KV8192, C1024_KV4096, C1024_KV8192, C2048_KV8192]

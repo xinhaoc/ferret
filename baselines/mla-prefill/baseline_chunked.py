@@ -22,10 +22,13 @@ device, dtype = "cuda", torch.bfloat16
 sm_scale = 1.0 / (UNABS_QK ** 0.5)
 
 configs = [
-    {"name": "C512_KV2048",  "chunk": 512,  "kv_len": 2048},
+    {"name": "C256_KV2048",  "chunk": 256,  "kv_len": 2048},
+    {"name": "C256_KV4096",  "chunk": 256,  "kv_len": 4096},
     {"name": "C512_KV4096",  "chunk": 512,  "kv_len": 4096},
+    {"name": "C512_KV8192",  "chunk": 512,  "kv_len": 8192},
     {"name": "C1024_KV4096", "chunk": 1024, "kv_len": 4096},
     {"name": "C1024_KV8192", "chunk": 1024, "kv_len": 8192},
+    {"name": "C2048_KV8192", "chunk": 2048, "kv_len": 8192},
 ]
 
 print(f"=== FA2 Chunked Prefill Baseline ===")

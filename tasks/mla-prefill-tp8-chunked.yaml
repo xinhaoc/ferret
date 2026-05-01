@@ -1,0 +1,89 @@
+# ferret task spec — MLA chunked prefill TP=8 (16 heads)
+# Q covers a chunk of the sequence, KV covers the full context.
+# Goal: beat FA2 unabsorbed on chunked prefill latency.
+
+name: mla-prefill-tp8-chunked
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    DeepSeek V3 MLA chunked prefill kernel — TP=8.
+    Q covers positions [q_start, q_start + chunk_size).
+    KV covers the full context [0, kv_len).
+    Causal: position q attends to kv positions ≤ q.
+
+    This is the production prefill path: long sequences are processed
+    in chunks interleaved with decode requests. Q_LEN ≠ KV_LEN.
+
+    Unabsorbed form (what vLLM/SGLang deploy):
+      Q: [B, chunk, H, 192]   (nope 128 + rope 64)
+      K: [B, kv_len, 1, 192]  (replicated, shared across heads)
+      V: [B, kv_len, 1, 128]  (replicated)
+      O: [B, chunk, H, 128]
+
+    The kernel needs separate q_len and kv_len parameters, plus q_start
+    for correct causal masking.
+
+  shapes:
+    NUM_HEADS: 16
+    D_QK_NOPE: 128
+    D_QK_ROPE: 64
+    D_V: 128
+    BATCH: 1
+
+baseline:
+  source: "FA2 unabsorbed chunked prefill — run: python3 baselines/mla-prefill/baseline_chunked.py --num-heads 16"
+
+references:
+  - examples/mla-prefill-b1-s1024/v006_tp8_unabsorbed.cu
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/prefill.cuh
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/hopper/prefill_sm90.cuh
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
+  - examples/tcgen05-gemm/
+
+configs:
+  - name: C512_KV2048
+    args: { CHUNK: 512, KV_LEN: 2048 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: C512_KV4096
+    args: { CHUNK: 512, KV_LEN: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: C1024_KV4096
+    args: { CHUNK: 1024, KV_LEN: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: C1024_KV8192
+    args: { CHUNK: 1024, KV_LEN: 8192 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only — deployment framework does not support cluster launch."
+  - "Output bit-compatible with reference: max relative error < 5e-3."
+  - "NUM_HEADS=16 (TP=8)."
+
+hints:
+  - "Start from examples/mla-prefill-b1-s1024/v006_tp8_unabsorbed.cu (beats FA2 at all S for full prefill). Add q_start and separate q_len/kv_len parameters. Causal mask becomes: kvend = min(kv_len, q_start + qs + BM)."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [C512_KV2048, C512_KV4096, C1024_KV4096, C1024_KV8192]

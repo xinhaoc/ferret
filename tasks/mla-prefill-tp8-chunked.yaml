@@ -37,10 +37,8 @@ baseline:
   source: "CUTLASS SM100a single_prefill (stronger than FA2 batch) — run: python3 baselines/mla-prefill/baseline_chunked.py --num-heads 16 (use CUTLASS SM100a numbers as target)"
 
 references:
-  - resources/cutlass-4.4.2/examples/77_blackwell_fmha                              # CUTLASS SM100a FMHA — the baseline implementation. Study this to reproduce.
-  - examples/mla-prefill-b1-s1024/v009_tp8_chunked_mmasync.cu                       # current best mma.sync kernel (ties CUTLASS at chunk>=1024, behind at 256/512)
-  - examples/mla-prefill-b1-s1024/v020_tp8_unabsorbed_chunked.cu
-  - examples/tcgen05-gemm/                                                          # tcgen05 PTX patterns (TMA, mbarrier, warp spec)
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha                              # CUTLASS SM100a FMHA — the baseline. Reproduce this architecture.
+  - examples/tcgen05-gemm/                                                          # tcgen05 PTX patterns (TMA, mbarrier, warp spec, MMA)
   - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/prefill.cuh
 
 configs:
@@ -93,7 +91,7 @@ constraints:
   - "NUM_HEADS=16 (TP=8)."
 
 hints:
-  - "Start from examples/mla-prefill-b1-s1024/v006_tp8_unabsorbed.cu (beats FA2 at all S for full prefill). Add q_start and separate q_len/kv_len parameters. Causal mask becomes: kvend = min(kv_len, q_start + qs + BM)."
+  - "Use tcgen05 from the start — do NOT use mma.sync. The baseline is CUTLASS SM100a which uses tcgen05. Study resources/cutlass-4.4.2/examples/77_blackwell_fmha and examples/tcgen05-gemm/ for the tcgen05 attention architecture. An mma.sync kernel already exists and cannot beat CUTLASS on small chunks."
 
 budget:
   max_iterations: 60

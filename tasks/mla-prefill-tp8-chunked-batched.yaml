@@ -1,0 +1,84 @@
+# ferret task spec — MLA chunked prefill TP=8, batched (BS=1-16)
+# Goal: beat FA2 batch (vLLM/SGLang production) across batch sizes.
+# Starting from proven mma.sync kernel that already beats FA2 at BS=1.
+
+name: mla-prefill-tp8-chunked-batched
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    DeepSeek V3 MLA chunked prefill kernel — TP=8, batch sizes 1-16.
+    Unabsorbed form (D_QK=192, D_V=128).
+    Q covers [q_start, q_start + chunk), KV covers [0, kv_len).
+    Causal: position q attends to kv positions ≤ q.
+
+    The kernel already supports batch via blockIdx.z. Test across
+    BS=1, 4, 8, 16 with chunk=512 and kv_len=4096.
+
+    Layout (per rank):
+      Q: [B, chunk, H, 192]
+      K: [B, kv_len, 1, 192] (replicated)
+      V: [B, kv_len, 1, 128] (replicated)
+      O: [B, chunk, H, 128]
+
+  shapes:
+    NUM_HEADS: 16
+    D_QK_NOPE: 128
+    D_QK_ROPE: 64
+    D_V: 128
+
+baseline:
+  source: "FA2 batch (vLLM/SGLang production) — run: python3 baselines/mla-prefill/baseline_chunked_batched.py --num-heads 16"
+
+references:
+  - examples/mla-prefill-b1-s1024/v019_tp8_unabsorbed_chunked.cu
+  - examples/mla-prefill-b1-s1024/v009_tp8_chunked_mmasync.cu
+  - examples/tcgen05-gemm/
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/prefill.cuh
+
+configs:
+  - name: BS1_C512_KV4096
+    args: { BATCH: 1, CHUNK: 512, KV_LEN: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: BS4_C512_KV4096
+    args: { BATCH: 4, CHUNK: 512, KV_LEN: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: BS8_C512_KV4096
+    args: { BATCH: 8, CHUNK: 512, KV_LEN: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: BS16_C512_KV4096
+    args: { BATCH: 16, CHUNK: 512, KV_LEN: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only — deployment framework does not support cluster launch."
+  - "Output bit-compatible with reference: max relative error < 5e-3."
+  - "NUM_HEADS=16 (TP=8)."
+
+hints:
+  - "Start from examples/mla-prefill-b1-s1024/v019_tp8_unabsorbed_chunked.cu — already beats FA2 at BS=1. Kernel supports batch via blockIdx.z. Test with B>1."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [BS1_C512_KV4096, BS4_C512_KV4096, BS8_C512_KV4096, BS16_C512_KV4096]

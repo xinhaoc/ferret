@@ -37,12 +37,11 @@ baseline:
   source: "CUTLASS SM100a single_prefill (stronger than FA2 batch) — run: python3 baselines/mla-prefill/baseline_chunked.py --num-heads 16 (use CUTLASS SM100a numbers as target)"
 
 references:
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha                              # CUTLASS SM100a FMHA — the baseline implementation. Study this to reproduce.
+  - examples/mla-prefill-b1-s1024/v009_tp8_chunked_mmasync.cu                       # current best mma.sync kernel (ties CUTLASS at chunk>=1024, behind at 256/512)
   - examples/mla-prefill-b1-s1024/v020_tp8_unabsorbed_chunked.cu
-  - examples/mla-prefill-b1-s1024/v006_tp8_unabsorbed.cu
+  - examples/tcgen05-gemm/                                                          # tcgen05 PTX patterns (TMA, mbarrier, warp spec)
   - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/prefill.cuh
-  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/hopper/prefill_sm90.cuh
-  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
-  - examples/tcgen05-gemm/
 
 configs:
   - name: C256_KV2048

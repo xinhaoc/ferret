@@ -1,14 +1,13 @@
-"""CUTLASS SM100a MHA Prefill Baseline (B200)
-Standard multi-head attention, causal, BF16.
-Uses flashinfer single_prefill_with_kv_cache → CUTLASS SM100a tcgen05 kernel.
+"""FlashAttention-4 MHA Prefill Baseline (B200)
+Standard MHA, causal, BF16. Uses FA4's SM100 CuTe DSL kernel on Blackwell.
 
 Usage:
     python3 baselines/mha-prefill/baseline.py
-    python3 baselines/mha-prefill/baseline.py --num-heads 32 --num-kv-heads 8 --head-dim 128
+    python3 baselines/mha-prefill/baseline.py --num-heads 32 --head-dim 128 --seq-len 1024 2048 4096
 """
 import argparse
 import torch
-from flashinfer.prefill import single_prefill_with_kv_cache
+from flash_attn.flash_attn_interface import flash_attn_func
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--num-heads", type=int, default=32)
@@ -23,19 +22,18 @@ H_Q = args.num_heads
 H_KV = args.num_kv_heads
 D = args.head_dim
 device, dtype = "cuda", torch.bfloat16
-sm_scale = 1.0 / (D ** 0.5)
 
-print(f"=== CUTLASS SM100a MHA Prefill Baseline ===")
-print(f"H_Q={H_Q}, H_KV={H_KV}, D={D}, B={B}")
+print(f"=== FlashAttention-4 MHA Prefill Baseline ===")
+print(f"B={B}, H_Q={H_Q}, H_KV={H_KV}, D={D}")
 print()
 
 for S in args.seq_len:
-    q = torch.randn(S, H_Q, D, device=device, dtype=dtype)
-    k = torch.randn(S, H_KV, D, device=device, dtype=dtype)
-    v = torch.randn(S, H_KV, D, device=device, dtype=dtype)
+    q = torch.randn(B, S, H_Q, D, device=device, dtype=dtype)
+    k = torch.randn(B, S, H_KV, D, device=device, dtype=dtype)
+    v = torch.randn(B, S, H_KV, D, device=device, dtype=dtype)
 
     for _ in range(10):
-        single_prefill_with_kv_cache(q, k, v, causal=True, sm_scale=sm_scale, kv_layout="NHD")
+        flash_attn_func(q, k, v, causal=True)
     torch.cuda.synchronize()
 
     N = 50
@@ -43,11 +41,11 @@ for S in args.seq_len:
     en = torch.cuda.Event(enable_timing=True)
     st.record()
     for _ in range(N):
-        single_prefill_with_kv_cache(q, k, v, causal=True, sm_scale=sm_scale, kv_layout="NHD")
+        flash_attn_func(q, k, v, causal=True)
     en.record()
     torch.cuda.synchronize()
     ms = st.elapsed_time(en) / N
     us = ms * 1000
-    flops = 2 * B * H_Q * S * S * D * 2  # QK + PV
+    flops = 4 * B * H_Q * S * S * D  # 2x for QK + 2x for PV
     tflops = flops / (ms / 1000) / 1e12
     print(f"S{S}: {tflops:.2f} TFLOPS, {us:.1f} us")

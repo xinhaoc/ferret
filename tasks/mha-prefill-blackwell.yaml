@@ -33,7 +33,7 @@ problem:
     BATCH: 1
 
 baseline:
-  source: "CUTLASS SM100a — run: python3 baselines/mha-prefill/baseline.py"
+  source: "FlashAttention-4 (SM100 CuTe DSL, SOTA) — run: python3 baselines/mha-prefill/baseline.py"
 
 references:
   - resources/flash-attention-fa4-v4.0.0.beta8/flash_attn/cute/flash_fwd_sm100.py    # FA4 CuTe DSL SM100 kernel

@@ -1,0 +1,83 @@
+# ferret task spec — Standard MHA prefill on Blackwell (tcgen05)
+# Goal: write a tcgen05-native attention kernel that beats CUTLASS SM100a.
+# FA4's Blackwell kernel (CuTe DSL) is based on CUTLASS 77_blackwell_fmha.
+
+name: mha-prefill-blackwell
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    Standard multi-head attention prefill on Blackwell (B200).
+    Write a tcgen05-native kernel that beats CUTLASS SM100a / FA4.
+
+    Layout:
+      Q: [S, H_Q, D]    (H_Q=32, D=128)
+      K: [S, H_KV, D]   (H_KV=32, standard MHA)
+      V: [S, H_KV, D]
+      O: [S, H_Q, D]
+
+    Causal: position q attends to kv positions ≤ q.
+    BF16 input/output, FP32 accumulator.
+
+    The baseline (CUTLASS SM100a) uses tcgen05 with TMA, warp
+    specialization, persistent scheduling, and CLC tile distribution.
+    FA4's Blackwell kernel is based on the same CUTLASS example,
+    implemented in CuTe DSL (Python → PTX).
+
+  shapes:
+    H_Q: 32
+    H_KV: 32
+    D: 128
+    BATCH: 1
+
+baseline:
+  source: "CUTLASS SM100a — run: python3 baselines/mha-prefill/baseline.py"
+
+references:
+  - resources/flash-attention-fa4-v4.0.0.beta8/flash_attn/cute/flash_fwd_sm100.py    # FA4 CuTe DSL SM100 kernel
+  - resources/flash-attention-fa4-v4.0.0.beta8/flash_attn/cute/blackwell_helpers.py
+  - resources/flash-attention-fa4-v4.0.0.beta8/flash_attn/cute/mma_sm100_desc.py
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha                                # CUTLASS SM100a FMHA (C++ templates)
+  - examples/tcgen05-gemm/                                                             # tcgen05 PTX patterns
+
+configs:
+  - name: S1024
+    args: { SEQ_LEN: 1024 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: S2048
+    args: { SEQ_LEN: 2048 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: S4096
+    args: { SEQ_LEN: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only — deployment framework does not support cluster launch."
+  - "Output bit-compatible with reference: max relative error < 5e-3."
+  - "Use tcgen05 (SM100 tensor cores). Do NOT use mma.sync (SM80) — the baseline uses tcgen05 and mma.sync cannot match it."
+
+hints:
+  - "Study resources/flash-attention-fa4-v4.0.0.beta8/flash_attn/cute/flash_fwd_sm100.py — FA4's Blackwell kernel in CuTe DSL. The Python maps 1:1 to PTX: tcgen05.mma, TMA loads, mbarrier. Also study resources/cutlass-4.4.2/examples/77_blackwell_fmha for the C++ version."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [S1024, S2048, S4096]

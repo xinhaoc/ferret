@@ -1,0 +1,90 @@
+# ferret task spec — Standard MHA prefill on Blackwell, 8-warp architecture
+# Goal: beat CUTLASS SM100a FMHA by using 8 warps with parallel softmax.
+
+name: mha-prefill-blackwell-8warp
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    Standard multi-head attention prefill on Blackwell (B200).
+    Write a tcgen05-native kernel with 8 warps (256 threads).
+
+    Layout:
+      Q: [S, H_Q, D]    (H_Q=32, D=128)
+      K: [S, H_KV, D]   (H_KV=32, standard MHA)
+      V: [S, H_KV, D]
+      O: [S, H_Q, D]
+
+    Causal: position q attends to kv positions ≤ q.
+    BF16 input/output, FP32 accumulator.
+
+    Warp roles (8 warps, 256 threads):
+      Warps 0-3: softmax (read S^T from TMEM, compute exp2, write P to SMEM)
+      Warp 4: MMA (tcgen05 QK and PV, elected thread only)
+      Warp 5: TMA load (Q, K, V from global to SMEM)
+      Warp 6: correction (O rescaling between KV tiles)
+      Warp 7: epilogue (write O to global)
+
+    Key optimization: split_P_arrive — softmax warps write first 3/4
+    of P to SMEM and signal MMA to start PV early while last 1/4 is
+    still computing. This overlaps softmax with PV MMA.
+
+  shapes:
+    H_Q: 32
+    H_KV: 32
+    D: 128
+    BATCH: 1
+
+baseline:
+  source: "FlashAttention-4 SM100 CuTe DSL — run: python3 baselines/mha-prefill/baseline.py"
+
+references:
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha/kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+  - resources/flash-attention-fa4-v4.0.0.beta8/flash_attn/cute/flash_fwd_sm100.py
+  - resources/flash-attention-fa4-v4.0.0.beta8/flash_attn/cute/softmax.py
+  - examples/tcgen05-gemm/
+
+configs:
+  - name: S1024
+    args: { SEQ_LEN: 1024 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: S2048
+    args: { SEQ_LEN: 2048 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: S4096
+    args: { SEQ_LEN: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only — deployment framework does not support cluster launch."
+  - "Output bit-compatible with reference: max relative error < 5e-3."
+  - "Use tcgen05 (SM100 tensor cores). Do NOT use mma.sync."
+  - "CORRECTNESS FIRST. Run: python3 baselines/mha-prefill/check_correctness.py to verify. Cosine > 0.99 before ANY performance optimization. Do NOT tag v### until correctness passes."
+  - "Use 8 warps (256 threads). Do NOT use 4 warps — 4-warp kernels cannot match CUTLASS/FA4 at S>=2048 because softmax is serialized."
+
+hints:
+  - "Read resources/cutlass-4.4.2/examples/77_blackwell_fmha/kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp lines 63-70 for warp role assignments. CUTLASS uses 16 warps; adapt to 8 by merging: 4 softmax warps (parallel softmax across P columns), 1 MMA, 1 TMA, 1 correction, 1 epilogue. Key: softmax warps read S^T from TMEM in parallel, each handles 1/4 of N columns. split_P_arrive: signal MMA to start PV after 3/4 of P is written."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [S1024, S2048, S4096]

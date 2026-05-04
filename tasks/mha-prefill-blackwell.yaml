@@ -73,7 +73,7 @@ constraints:
   - "CORRECTNESS FIRST. Run: python3 baselines/mha-prefill/check_correctness.py — it generates CPU fp32 reference at S=64 and saves to /tmp/mha_check_{q,k,v,o_ref}.bin. Load these in your kernel, compute output, save to /tmp/mha_check_o_kernel.bin, rerun the script to compare. Must reach cosine > 0.99 before ANY performance optimization. For s=0 (first query, causal), output must equal V[0]. If not, QK/PV MMA or TMEM layout is broken."
 
 hints:
-  - "Study resources/flash-attention-fa4-v4.0.0.beta8/flash_attn/cute/flash_fwd_sm100.py — FA4's Blackwell kernel in CuTe DSL. The Python maps 1:1 to PTX: tcgen05.mma, TMA loads, mbarrier. Also study resources/cutlass-4.4.2/examples/77_blackwell_fmha for the C++ version."
+  - "FA4 SM100 uses 16 warps (512 threads): 8 softmax warps (parallel softmax), 4 correction warps (O rescale), 1 MMA warp, 1 TMA warp, 1 epilogue warp. Key optimization: split_P_arrive — softmax warps write 3/4 of P to SMEM and signal MMA to start PV early while last 1/4 still computes. This overlaps softmax with PV MMA. Read flash_fwd_sm100.py lines 216-232 for warp roles, softmax_loop (line 1758) for the parallel softmax. Your kernel uses 4 warps — increase to 16 and parallelize softmax."
 
 budget:
   max_iterations: 60

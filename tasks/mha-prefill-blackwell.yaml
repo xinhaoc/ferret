@@ -70,7 +70,7 @@ constraints:
   - "cta_group::1 only — deployment framework does not support cluster launch."
   - "Output bit-compatible with reference: max relative error < 5e-3."
   - "Use tcgen05 (SM100 tensor cores). Do NOT use mma.sync (SM80) — the baseline uses tcgen05 and mma.sync cannot match it."
-  - "CORRECTNESS FIRST. Before ANY performance optimization, verify output against a CPU fp32 reference at S=64. For s=0 (first query, causal), the output must exactly equal V[0] (only attends to itself). If s=0 output ≠ V[0], the kernel is structurally broken — fix before proceeding. Do NOT tag v### until correctness passes."
+  - "CORRECTNESS FIRST. Run: python3 baselines/mha-prefill/check_correctness.py — it generates CPU fp32 reference at S=64 and saves to /tmp/mha_check_{q,k,v,o_ref}.bin. Load these in your kernel, compute output, save to /tmp/mha_check_o_kernel.bin, rerun the script to compare. Must reach cosine > 0.99 before ANY performance optimization. For s=0 (first query, causal), output must equal V[0]. If not, QK/PV MMA or TMEM layout is broken."
 
 hints:
   - "Study resources/flash-attention-fa4-v4.0.0.beta8/flash_attn/cute/flash_fwd_sm100.py — FA4's Blackwell kernel in CuTe DSL. The Python maps 1:1 to PTX: tcgen05.mma, TMA loads, mbarrier. Also study resources/cutlass-4.4.2/examples/77_blackwell_fmha for the C++ version."

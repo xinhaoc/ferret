@@ -1,13 +1,21 @@
-"""FlashAttention-4 MHA Prefill Baseline (B200)
-Standard MHA, causal, BF16. Uses FA4's SM100 CuTe DSL kernel on Blackwell.
+"""FlashAttention-4 SM100 CuTe DSL Baseline (B200)
+Standard MHA, causal, BF16. Uses FA4's native Blackwell kernel.
+
+IMPORTANT: must use flash_attn.cute.interface (SM100 CuTe DSL),
+NOT flash_attn.flash_attn_interface (SM80/SM90 C++ fallback).
+Also requires CUTLASS_HOME pointing to CUTLASS installation.
 
 Usage:
     python3 baselines/mha-prefill/baseline.py
-    python3 baselines/mha-prefill/baseline.py --num-heads 32 --head-dim 128 --seq-len 1024 2048 4096
 """
 import argparse
+import os
 import torch
-from flash_attn.flash_attn_interface import flash_attn_func
+
+# Must set before importing FA4 cute
+os.environ["CUTLASS_HOME"] = os.path.join(os.path.dirname(__file__), "../../resources/cutlass-4.4.2")
+
+from flash_attn.cute.interface import flash_attn_func
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--num-heads", type=int, default=32)
@@ -23,7 +31,7 @@ H_KV = args.num_kv_heads
 D = args.head_dim
 device, dtype = "cuda", torch.bfloat16
 
-print(f"=== FlashAttention-4 MHA Prefill Baseline ===")
+print(f"=== FlashAttention-4 SM100 CuTe DSL Baseline ===")
 print(f"B={B}, H_Q={H_Q}, H_KV={H_KV}, D={D}")
 print()
 
@@ -32,11 +40,12 @@ for S in args.seq_len:
     k = torch.randn(B, S, H_KV, D, device=device, dtype=dtype)
     v = torch.randn(B, S, H_KV, D, device=device, dtype=dtype)
 
-    for _ in range(10):
+    # JIT warmup (first call compiles)
+    for _ in range(20):
         flash_attn_func(q, k, v, causal=True)
     torch.cuda.synchronize()
 
-    N = 50
+    N = 100
     st = torch.cuda.Event(enable_timing=True)
     en = torch.cuda.Event(enable_timing=True)
     st.record()
@@ -46,6 +55,6 @@ for S in args.seq_len:
     torch.cuda.synchronize()
     ms = st.elapsed_time(en) / N
     us = ms * 1000
-    flops = 4 * B * H_Q * S * S * D  # 2x for QK + 2x for PV
+    flops = 4 * B * H_Q * S * S * D
     tflops = flops / (ms / 1000) / 1e12
     print(f"S{S}: {tflops:.2f} TFLOPS, {us:.1f} us")

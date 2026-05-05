@@ -1,0 +1,96 @@
+# ferret task spec — MLA prefill TP=8 UNABSORBED form (correct DeepSeek V3 dims)
+# Q: [S, H, 192], K: [S, H, 192] (per-head), V: [S, H, 128] (per-head)
+# This is what vLLM uses for prefill — decompress via kv_b_proj first.
+
+name: mla-prefill-tp8-unabsorbed-correct
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    DeepSeek V3 MLA chunked prefill — TP=8, TRUE UNABSORBED form.
+    After kv_b_proj decompression, K and V are PER-HEAD (not shared).
+
+    Layout (per rank):
+      Q_nope: [B, chunk, 16, 128]   (qk_nope_head_dim)
+      Q_rope: [B, chunk, 16, 64]    (qk_rope_head_dim)
+      K_nope: [B, kv_len, 16, 128]  (per-head, from kv_b_proj)
+      K_rope: [B, kv_len, 1, 64]    (shared, from KV cache directly)
+      V:      [B, kv_len, 16, 128]  (per-head, from kv_b_proj)
+      O:      [B, chunk, 16, 128]
+
+    This is standard MHA attention (16 Q heads, 16 KV heads) after
+    decompression. Not MQA — every head has its own K and V.
+
+    QK = Q_nope @ K_nope^T + Q_rope @ K_rope^T (two separate dot products)
+    O = softmax(QK * scale) @ V
+
+    Causal: position q attends to kv positions ≤ q.
+    Chunked: Q covers [q_start, q_start+chunk), KV covers [0, kv_len).
+
+    Note: kv_b_proj decompression GEMM is done OUTSIDE this kernel.
+    This kernel only does the attention computation.
+
+  shapes:
+    NUM_HEADS: 16
+    NUM_KV_HEADS: 16
+    D_QK_NOPE: 128
+    D_QK_ROPE: 64
+    D_V: 128
+    BATCH: 1
+
+baseline:
+  source: "FA2 batch unabsorbed — run: python3 baselines/mla-prefill/baseline_chunked.py --num-heads 16"
+
+references:
+  - examples/mla-prefill-b1-s1024/v019_tp8_unabsorbed_chunked.cu
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/prefill.cuh
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
+  - examples/tcgen05-gemm/
+
+configs:
+  - name: C512_KV2048
+    args: { CHUNK: 512, KV_LEN: 2048 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: C512_KV4096
+    args: { CHUNK: 512, KV_LEN: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: C1024_KV4096
+    args: { CHUNK: 1024, KV_LEN: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: C1024_KV8192
+    args: { CHUNK: 1024, KV_LEN: 8192 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only."
+  - "Output bit-compatible with reference: max relative error < 5e-3."
+  - "NUM_HEADS=16, NUM_KV_HEADS=16 (per-head KV, NOT 1 shared head)."
+  - "CORRECTNESS FIRST. Verify cosine > 0.99 vs CPU reference before optimizing."
+
+hints:
+  - "Previous kernel (v019) used 1 shared KV head with dims 128/64/128 — that was wrong (absorbed structure with unabsorbed dims). This task uses true unabsorbed: 16 KV heads, each with K[192] and V[128]. Standard MHA attention after kv_b_proj decompression."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [C512_KV2048, C512_KV4096, C1024_KV4096, C1024_KV8192]

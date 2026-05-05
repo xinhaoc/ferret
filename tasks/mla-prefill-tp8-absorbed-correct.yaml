@@ -1,0 +1,85 @@
+# ferret task spec — MLA prefill TP=8 ABSORBED form (correct DeepSeek V3 dims)
+# Q absorbed W_UK: [S, H, 576], K = c_latent+k_pe: [S, 1, 576], V = c_latent: [S, 1, 512]
+
+name: mla-prefill-tp8-absorbed-correct
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    DeepSeek V3 MLA chunked prefill — TP=8, ABSORBED form.
+    Correct dimensions matching MPK cache format.
+
+    In absorbed MLA, Q absorbs W_UK so attention runs directly against
+    the raw latent cache. No kv_b_proj decompression needed.
+
+    Layout (per rank):
+      Q:  [B, chunk, 16, 576]    (kv_lora_rank=512 + qk_rope_dim=64)
+      K:  [B, kv_len, 1, 576]    (c_latent[512] + k_pe[64], 1 shared head)
+      V:  [B, kv_len, 1, 512]    (c_latent, 1 shared head)
+      O:  [B, chunk, 16, 512]    (kv_lora_rank)
+
+    Causal: position q attends to kv positions ≤ q.
+    Chunked: Q covers [q_start, q_start+chunk), KV covers [0, kv_len).
+
+  shapes:
+    NUM_HEADS: 16
+    D_QK: 576
+    D_V: 512
+    BATCH: 1
+
+baseline:
+  source: "FA2 batch (production path) — run: python3 baselines/mla-mtp-decode/baseline.py --num-heads 16"
+
+references:
+  - examples/mla-prefill-b1-s1024/v024_tp8_absorbed_mmasync.cu
+  - examples/mla-prefill-b1-s1024/v019_tp8_unabsorbed_chunked.cu
+  - examples/tcgen05-gemm/
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
+
+configs:
+  - name: C512_KV2048
+    args: { CHUNK: 512, KV_LEN: 2048 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: C512_KV4096
+    args: { CHUNK: 512, KV_LEN: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: C1024_KV4096
+    args: { CHUNK: 1024, KV_LEN: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: C1024_KV8192
+    args: { CHUNK: 1024, KV_LEN: 8192 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only."
+  - "Output bit-compatible with reference: max relative error < 5e-3."
+  - "NUM_HEADS=16 (TP=8). D_QK=576, D_V=512. 1 shared KV head."
+  - "CORRECTNESS FIRST. Verify cosine > 0.99 vs CPU reference before optimizing."
+
+hints:
+  - "Start from examples/mla-prefill-b1-s1024/v024_tp8_absorbed_mmasync.cu (mma.sync absorbed kernel, correct but slow at large S). Fix dims to D_QK=576, D_V=512. Previous kernel used wrong dims (128/64/128)."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [C512_KV2048, C512_KV4096, C1024_KV4096, C1024_KV8192]

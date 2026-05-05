@@ -41,7 +41,7 @@ problem:
     BATCH: 1
 
 baseline:
-  source: "FA2 batch unabsorbed — run: python3 baselines/mla-prefill/baseline_chunked.py --num-heads 16"
+  source: "FA2 batch unabsorbed per-head — run: python3 baselines/mla-prefill/baseline_unabsorbed_perhead.py --num-heads 16"
 
 references:
   - examples/mla-prefill-b1-s1024/v019_tp8_unabsorbed_chunked.cu

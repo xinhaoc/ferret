@@ -1,0 +1,105 @@
+# ferret task spec — GQA multi-token decode at mirage's per-rank shape (TP=8 Qwen-style)
+# Target: beat or match FA2 (FlashInfer's fa2 backend on B200, ~12-15 us).
+#
+# This is the shape mirage's persistent_kernel/tasks/blackwell/attention_sm100.cuh
+# is templated for. Mirage's current kernel uses Ampere mma + cp_async (16-29 us);
+# Blackwell-native options (cutlass sm100a, TRTLLM-gen) are SLOWER at this shape
+# due to setup overhead. The bar to beat is fa2 (~12-15 us).
+
+name: attention-gqa-decode-mirage-shape
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    Multi-token GQA decode attention at TP=8 per-rank shape:
+      Q: [mt, qo_heads=4, head_dim=128]    (mt new tokens, GQA group=4)
+      K: [kv_len, kv_heads=1, head_dim=128] (1 shared KV head)
+      V: [kv_len, kv_heads=1, head_dim=128]
+      O: [mt, qo_heads=4, head_dim=128]
+
+    Causal mask: q token i (0-indexed within the mt new tokens) attends to
+    KV positions [0, kv_len - mt + i + 1).
+
+    Total work is small: 4 q rows × 1..8 mt × 12..512 kv. At this size, fixed
+    per-launch overhead dominates. Tcgen05's deeper pipeline does NOT pay off
+    unless setup is minimized.
+
+    Ragged KV layout (contiguous tensors, NOT paged) — paging can be added later.
+
+  shapes:
+    NUM_QO_HEADS: 4
+    NUM_KV_HEADS: 1
+    HEAD_DIM: 128
+    BATCH: 1
+
+baseline:
+  source: "FlashInfer fa2 — run: python3 baselines/attention-decode/baseline_fa2.py"
+
+references:
+  - examples/mla-mtp-decode-q1to8-kv4096/v007_tp4_swapab.cu
+  - examples/mla-mtp-decode-q1to8-kv4096/v012_tcgen05_tmem_accum.cu
+  - examples/tcgen05-gemm/
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
+  - resources/flashinfer-0.6.7.post3/include/flashinfer/attention/decode.cuh
+
+configs:
+  - name: mt1_kv128
+    args: { MT: 1, KV_LEN: 128 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: mt1_kv512
+    args: { MT: 1, KV_LEN: 512 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: mt4_kv128
+    args: { MT: 4, KV_LEN: 128 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: mt4_kv512
+    args: { MT: 4, KV_LEN: 512 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: mt8_kv128
+    args: { MT: 8, KV_LEN: 128 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: mt8_kv512
+    args: { MT: 8, KV_LEN: 512 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "BF16 input + output, FP32 softmax accumulator."
+  - "Causal mask (q token i sees kv [0, kv_len - mt + i + 1))."
+  - "Output must match a CPU/Torch reference within max relative error < 5e-3."
+  - "CORRECTNESS FIRST. Verify cosine > 0.99 vs reference before optimizing."
+
+hints:
+  - "The bar is FA2 at 12-15 us. At this tiny shape (4 q × 1..8 mt × 12..512 kv), kernel-launch and pipeline-setup overhead dominate. The Blackwell-native paths (cutlass sm100a 15-21 us, TRTLLM-gen 18-20 us) all LOSE to fa2 here for that reason. So minimize fixed cost: small grid, tight register footprint, simple mainloop."
+  - "Single warpgroup (4 warps, 128 threads) is likely the right starting point — same as mirage's current kernel and FA2. 8 warps with warp-specialization can help if you add a producer/consumer split for KV loading, but only if the extra parallelism actually amortizes across 12+ kv_len."
+  - "tcgen05 with cta_group::1 + TMEM accumulator + TMA loads gets you Blackwell throughput, but you must keep setup overhead small. Compare to v012_tcgen05_tmem_accum.cu (similar small-Q decode pattern)."
+  - "Q is small (4-32 rows). Use swap-AB pattern: put KV in MMA-M (large dim), Q in MMA-N. See examples/mla-mtp-decode-q1to8-kv4096/v007_tp4_swapab.cu — same pattern, MLA shape but transferable to GQA. Cross-thread softmax via TMEM column-reduction."
+  - "Mirage's current attention_sm100.cuh: include/mirage/persistent_kernel/tasks/blackwell/attention_sm100.cuh. It uses Ampere mma — 16-29 us at our shapes. We need to beat its 16-29 us (easy) AND beat fa2's 12-15 us (the actual goal)."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [mt1_kv128, mt1_kv512, mt4_kv128, mt4_kv512, mt8_kv128, mt8_kv512]

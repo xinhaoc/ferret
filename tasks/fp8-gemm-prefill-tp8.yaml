@@ -127,15 +127,18 @@ stage_gate:
 constraints:
   - "Single CUDA stream only."
   - "No CUDA graphs."
+  - "cta_group::1 only. 2-CTA clusters are not supported on this build — do not attempt cta_group::2."
   - "FP8 e4m3 input, BF16 output, FP32 accumulator."
   - "Block-scaled: activation scale per 1x128 tile, weight scale per 128x128 block."
   - "Output must match cuBLAS within max relative error < 1e-2."
   - "CORRECTNESS FIRST. Verify output before optimizing."
 
 hints:
-  - "Prefill regime — M is large (512..8192). Use bigger BLOCK_M (128 or 256), more pipeline stages, and 2-CTA cluster (cta_group::2) where it pays off. The decode-tuned v006 used BLOCK_M=64 + persistent kernel; that schedule is wrong here."
+  - "Prefill regime — M is large (512..8192). Use bigger BLOCK_M (128 or 256), more pipeline stages. The decode-tuned v006 used BLOCK_M=64 + persistent kernel; that schedule is wrong here. NOTE: cta_group::2 is NOT available — stay on cta_group::1, the wins must come from elsewhere."
   - "kv_b_proj at large M is the most important workload — in unabsorbed MLA chunked prefill, kv_b_proj's M equals the FULL KV cache length, not the q chunk. So an 8K-context request runs kv_b_proj at M=8192 every step. The previous kernel was 3-4x slower than cuBLAS in this regime. Prioritize getting M=4096/8192 right."
-  - "DeepGEMM source at resources/deepgemm-2.1.1.post3/. Key files: deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh (1D activation × 2D weight scale) and sm100_fp8_gemm_1d1d.cuh. Block-scale dequantization is fused into the MMA pipeline via tcgen05."
+  - "PRIMARY UNTRIED OPTIMIZATION: hardware-fused block-scale dequant via 'tcgen05.mma.kind::mxf8f6f4.block_scale'. This eliminates the per-K-iteration epilogue entirely — dequant accumulates across all K blocks inside the MMA pipeline, epilogue runs once per output tile. DeepGEMM uses this. Without it, the per-K epilogue stays the bottleneck regardless of pipeline tuning."
+  - "DeepGEMM source at resources/deepgemm-2.1.1.post3/. Key files: deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh (1D activation × 2D weight scale) and sm100_fp8_gemm_1d1d.cuh. Read these — they show the fused block-scale MMA pattern that fixes the per-K epilogue."
+  - "CUTLASS narrow precision example at resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm has a complete sm100a fused block-scale GEMM."
   - "examples/fp8-gemm/v006_dense_tp8_tcgen05.cu is the small-M kernel — useful as a reference for tcgen05 kind::f8f6f4 setup, but its tile shape and persistent scheduling are NOT what you want here."
 
 budget:

@@ -15,12 +15,18 @@ problem:
     C[M, N] = dequant(A[M, K]) @ dequant(B[N, K])^T
     where A is FP8 with scale_a[M, K/128], B is FP8 with scale_b[N/128, K/128].
 
-    TP=8 per-rank shapes (head-sharded; M is the prefill chunk length):
-      q_b_proj:  M × [1536, 3072]  (16 heads)
-      kv_b_proj: M × [512, 4096]   (16 heads)
-      o_proj:    M × [2048, 7168]   (row parallel)
+    TP=8 per-rank shapes (head-sharded):
+      q_b_proj:  M × [1536, 3072]  (16 heads)   — M = q chunk length
+      kv_b_proj: M × [512, 4096]   (16 heads)   — M = kv_len (full KV cache, decompresses)
+      o_proj:    M × [2048, 7168]  (row parallel) — M = q chunk length
 
-    M is large here (512, 1024, 2048, 4096) — compute-bound.
+    Note: in unabsorbed MLA chunked prefill, kv_b_proj's M = kv_len (full KV
+    history), NOT the q chunk length. So at 8K context, kv_b_proj runs at M=8K
+    even when q chunk is 512. This makes kv_b_proj the biggest workload at
+    long context — and where the small-M-tuned kernel loses worst (3-4× behind
+    cuBLAS at M=4096-8192).
+
+    M is large here (512..8192) — compute-bound.
     Tile/pipeline schedule should target throughput, not latency.
 
   shapes:
@@ -72,8 +78,43 @@ configs:
     target_ratio: 1.00
     weight: 1.0
 
+  - name: kv_b_proj_M2048
+    args: { M: 2048, K: 512, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
   - name: o_proj_M2048
     args: { M: 2048, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: q_b_proj_M4096
+    args: { M: 4096, K: 1536, N: 3072 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: kv_b_proj_M4096
+    args: { M: 4096, K: 512, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: o_proj_M4096
+    args: { M: 4096, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: q_b_proj_M8192
+    args: { M: 8192, K: 1536, N: 3072 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: kv_b_proj_M8192
+    args: { M: 8192, K: 512, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: o_proj_M8192
+    args: { M: 8192, K: 2048, N: 7168 }
     target_ratio: 1.00
     weight: 1.0
 
@@ -92,7 +133,8 @@ constraints:
   - "CORRECTNESS FIRST. Verify output before optimizing."
 
 hints:
-  - "Prefill regime — M is large (512+). Use bigger BLOCK_M (128 or 256), more pipeline stages, and 2-CTA cluster (cta_group::2) where it pays off. The decode-tuned v006 used BLOCK_M=64 + persistent kernel; that schedule is wrong here."
+  - "Prefill regime — M is large (512..8192). Use bigger BLOCK_M (128 or 256), more pipeline stages, and 2-CTA cluster (cta_group::2) where it pays off. The decode-tuned v006 used BLOCK_M=64 + persistent kernel; that schedule is wrong here."
+  - "kv_b_proj at large M is the most important workload — in unabsorbed MLA chunked prefill, kv_b_proj's M equals the FULL KV cache length, not the q chunk. So an 8K-context request runs kv_b_proj at M=8192 every step. The previous kernel was 3-4x slower than cuBLAS in this regime. Prioritize getting M=4096/8192 right."
   - "DeepGEMM source at resources/deepgemm-2.1.1.post3/. Key files: deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh (1D activation × 2D weight scale) and sm100_fp8_gemm_1d1d.cuh. Block-scale dequantization is fused into the MMA pipeline via tcgen05."
   - "examples/fp8-gemm/v006_dense_tp8_tcgen05.cu is the small-M kernel — useful as a reference for tcgen05 kind::f8f6f4 setup, but its tile shape and persistent scheduling are NOT what you want here."
 
@@ -102,4 +144,4 @@ budget:
 
 output:
   result_format: kernel_result_json
-  result_keys: [q_b_proj_M512, kv_b_proj_M512, o_proj_M512, q_b_proj_M1024, kv_b_proj_M1024, o_proj_M1024, q_b_proj_M2048, o_proj_M2048]
+  result_keys: [q_b_proj_M512, kv_b_proj_M512, o_proj_M512, q_b_proj_M1024, kv_b_proj_M1024, o_proj_M1024, q_b_proj_M2048, kv_b_proj_M2048, o_proj_M2048, q_b_proj_M4096, kv_b_proj_M4096, o_proj_M4096, q_b_proj_M8192, kv_b_proj_M8192, o_proj_M8192]

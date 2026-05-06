@@ -1,0 +1,105 @@
+# ferret task spec — Dense FP8 GEMM for DeepSeek V3 attention projections at PREFILL (TP=8)
+# Large-M / compute-bound regime. Beat cuBLAS FP8 (torch._scaled_mm).
+
+name: fp8-gemm-prefill-tp8
+gpu: B200
+arch: sm_100a
+precision: FP8
+
+problem:
+  description: |
+    Dense FP8 block-scaled GEMM for DeepSeek V3 attention projections at TP=8,
+    PREFILL regime (large M). FP8 e4m3 input, BF16 output, FP32 accumulator.
+    Block scales: activation per 1x128, weight per 128x128.
+
+    C[M, N] = dequant(A[M, K]) @ dequant(B[N, K])^T
+    where A is FP8 with scale_a[M, K/128], B is FP8 with scale_b[N/128, K/128].
+
+    TP=8 per-rank shapes (head-sharded; M is the prefill chunk length):
+      q_b_proj:  M × [1536, 3072]  (16 heads)
+      kv_b_proj: M × [512, 4096]   (16 heads)
+      o_proj:    M × [2048, 7168]   (row parallel)
+
+    M is large here (512, 1024, 2048, 4096) — compute-bound.
+    Tile/pipeline schedule should target throughput, not latency.
+
+  shapes:
+    BATCH: 1
+
+baseline:
+  source: "cuBLAS FP8 (torch._scaled_mm) — run: python3 baselines/fp8-gemm/baseline_prefill.py"
+
+references:
+  - examples/fp8-gemm/v006_dense_tp8_tcgen05.cu
+  - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh
+  - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d1d.cuh
+  - resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm
+  - examples/tcgen05-gemm/
+
+configs:
+  - name: q_b_proj_M512
+    args: { M: 512, K: 1536, N: 3072 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: kv_b_proj_M512
+    args: { M: 512, K: 512, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: o_proj_M512
+    args: { M: 512, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: q_b_proj_M1024
+    args: { M: 1024, K: 1536, N: 3072 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: kv_b_proj_M1024
+    args: { M: 1024, K: 512, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: o_proj_M1024
+    args: { M: 1024, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: q_b_proj_M2048
+    args: { M: 2048, K: 1536, N: 3072 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: o_proj_M2048
+    args: { M: 2048, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "FP8 e4m3 input, BF16 output, FP32 accumulator."
+  - "Block-scaled: activation scale per 1x128 tile, weight scale per 128x128 block."
+  - "Output must match cuBLAS within max relative error < 1e-2."
+  - "CORRECTNESS FIRST. Verify output before optimizing."
+
+hints:
+  - "Prefill regime — M is large (512+). Use bigger BLOCK_M (128 or 256), more pipeline stages, and 2-CTA cluster (cta_group::2) where it pays off. The decode-tuned v006 used BLOCK_M=64 + persistent kernel; that schedule is wrong here."
+  - "DeepGEMM source at resources/deepgemm-2.1.1.post3/. Key files: deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh (1D activation × 2D weight scale) and sm100_fp8_gemm_1d1d.cuh. Block-scale dequantization is fused into the MMA pipeline via tcgen05."
+  - "examples/fp8-gemm/v006_dense_tp8_tcgen05.cu is the small-M kernel — useful as a reference for tcgen05 kind::f8f6f4 setup, but its tile shape and persistent scheduling are NOT what you want here."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [q_b_proj_M512, kv_b_proj_M512, o_proj_M512, q_b_proj_M1024, kv_b_proj_M1024, o_proj_M1024, q_b_proj_M2048, o_proj_M2048]

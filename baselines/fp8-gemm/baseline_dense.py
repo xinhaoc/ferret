@@ -51,7 +51,7 @@ for cfg in configs:
 
     # Warmup
     for _ in range(10):
-        deep_gemm.gemm_fp8_fp8_bf16_nt(A, scale_a, B, scale_b, out)
+        deep_gemm.fp8_gemm_nt(A, scale_a, B, scale_b, out)
     torch.cuda.synchronize()
 
     # Benchmark
@@ -60,7 +60,7 @@ for cfg in configs:
     en = torch.cuda.Event(enable_timing=True)
     st.record()
     for _ in range(NI):
-        deep_gemm.gemm_fp8_fp8_bf16_nt(A, scale_a, B, scale_b, out)
+        deep_gemm.fp8_gemm_nt(A, scale_a, B, scale_b, out)
     en.record()
     torch.cuda.synchronize()
     ms = st.elapsed_time(en) / NI

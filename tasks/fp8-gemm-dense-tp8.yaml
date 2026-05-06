@@ -1,0 +1,105 @@
+# ferret task spec — Dense FP8 GEMM for DeepSeek V3 attention projections (TP=8)
+# Block-scaled FP8 e4m3: activation 1x128, weight 128x128.
+# Beat DeepGEMM (what SGLang uses on Blackwell).
+
+name: fp8-gemm-dense-tp8
+gpu: B200
+arch: sm_100a
+precision: FP8
+
+problem:
+  description: |
+    Dense FP8 block-scaled GEMM for DeepSeek V3 attention projections at TP=8.
+    FP8 e4m3 input, BF16 output, FP32 accumulator.
+    Block scales: activation per 1x128, weight per 128x128.
+
+    C[M, N] = dequant(A[M, K]) @ dequant(B[N, K])^T
+    where A is FP8 with scale_a[M, K/128], B is FP8 with scale_b[N/128, K/128].
+
+    TP=8 per-rank shapes:
+      q_a_proj:  M × [7168, 1536]  (replicated)
+      q_b_proj:  M × [1536, 3072]  (16 heads)
+      kv_a_proj: M × [7168, 576]   (replicated)
+      kv_b_proj: M × [512, 4096]   (16 heads)
+      o_proj:    M × [2048, 7168]   (row parallel)
+
+    M varies: 1 (single decode), 16 (batch decode), 512 (prefill chunk).
+
+  shapes:
+    BATCH: 1
+
+baseline:
+  source: "DeepGEMM — run: python3 baselines/fp8-gemm/baseline_dense.py"
+
+references:
+  - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh
+  - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d1d.cuh
+  - resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm
+  - examples/tcgen05-gemm/
+
+configs:
+  - name: q_b_proj_M1
+    args: { M: 1, K: 1536, N: 3072 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: kv_b_proj_M1
+    args: { M: 1, K: 512, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: o_proj_M1
+    args: { M: 1, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: q_b_proj_M16
+    args: { M: 16, K: 1536, N: 3072 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: kv_b_proj_M16
+    args: { M: 16, K: 512, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: o_proj_M16
+    args: { M: 16, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: q_b_proj_M512
+    args: { M: 512, K: 1536, N: 3072 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: o_proj_M512
+    args: { M: 512, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only."
+  - "FP8 e4m3 input, BF16 output, FP32 accumulator."
+  - "Block-scaled: activation scale per 1x128 tile, weight scale per 128x128 block."
+  - "Output must match DeepGEMM within max relative error < 1e-2."
+  - "CORRECTNESS FIRST. Verify output matches DeepGEMM before optimizing."
+
+hints:
+  - "DeepGEMM source at resources/deepgemm-2.1.1.post3/. Key files: deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh (1D activation scale × 2D weight scale) and sm100_fp8_gemm_1d1d.cuh. Uses tcgen05 with block-scale dequantization fused into the MMA pipeline."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [q_b_proj_M1, kv_b_proj_M1, o_proj_M1, q_b_proj_M16, kv_b_proj_M16, o_proj_M16, q_b_proj_M512, o_proj_M512]

@@ -33,7 +33,7 @@ problem:
     BATCH: 1
 
 baseline:
-  source: "cuBLAS FP8 (torch._scaled_mm) — run: python3 baselines/fp8-gemm/baseline_prefill.py"
+  source: "DeepGEMM (deep_gemm.fp8_gemm_nt) — run: python3 baselines/fp8-gemm/baseline_prefill.py"
 
 references:
   - examples/fp8-gemm/v006_dense_tp8_tcgen05.cu
@@ -130,16 +130,16 @@ constraints:
   - "cta_group::1 only. 2-CTA clusters are not supported on this build — do not attempt cta_group::2."
   - "FP8 e4m3 input, BF16 output, FP32 accumulator."
   - "Block-scaled: activation scale per 1x128 tile, weight scale per 128x128 block."
-  - "Output must match cuBLAS within max relative error < 1e-2."
+  - "Output must match DeepGEMM within max relative error < 1e-2."
   - "CORRECTNESS FIRST. Verify output before optimizing."
 
 hints:
-  - "Prefill regime — M is large (512..8192). Use bigger BLOCK_M (128 or 256), more pipeline stages. The decode-tuned v006 used BLOCK_M=64 + persistent kernel; that schedule is wrong here. NOTE: cta_group::2 is NOT available — stay on cta_group::1, the wins must come from elsewhere."
-  - "kv_b_proj at large M is the most important workload — in unabsorbed MLA chunked prefill, kv_b_proj's M equals the FULL KV cache length, not the q chunk. So an 8K-context request runs kv_b_proj at M=8192 every step. The previous kernel was 3-4x slower than cuBLAS in this regime. Prioritize getting M=4096/8192 right."
-  - "PRIMARY UNTRIED OPTIMIZATION: hardware-fused block-scale dequant via 'tcgen05.mma.kind::mxf8f6f4.block_scale'. This eliminates the per-K-iteration epilogue entirely — dequant accumulates across all K blocks inside the MMA pipeline, epilogue runs once per output tile. DeepGEMM uses this. Without it, the per-K epilogue stays the bottleneck regardless of pipeline tuning."
-  - "DeepGEMM source at resources/deepgemm-2.1.1.post3/. Key files: deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh (1D activation × 2D weight scale) and sm100_fp8_gemm_1d1d.cuh. Read these — they show the fused block-scale MMA pattern that fixes the per-K epilogue."
-  - "CUTLASS narrow precision example at resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm has a complete sm100a fused block-scale GEMM."
-  - "examples/fp8-gemm/v006_dense_tp8_tcgen05.cu is the small-M kernel — useful as a reference for tcgen05 kind::f8f6f4 setup, but its tile shape and persistent scheduling are NOT what you want here."
+  - "BASELINE IS DEEPGEMM (not cuBLAS). DeepGEMM is what vLLM and SGLang ship for DeepSeek V3 FP8 attention projections on Blackwell. cuBLAS is closed-source and was unrealistic to match at small M; DeepGEMM is open and you can read every line. Prior runs against cuBLAS plateaued at min_ratio 0.55 (small-M is hard for any open-source kernel)."
+  - "REFERENCE TO READ: resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh and sm100_fp8_gemm_1d1d.cuh. These ARE your perf bar — port their architecture (tcgen05 with block-scale dequant fused into the MMA pipeline) and you match the baseline."
+  - "Prefill regime — M is large (512..8192). Use bigger BLOCK_M (128 or 256), more pipeline stages. cta_group::2 is NOT available on this build — stay on cta_group::1. examples/fp8-gemm/v015_dense_tp8_tcgen05_prefill.cu is the prior best (TMA SFA + dual TMEM load pipelining) — it BEATS DeepGEMM at small M (M=512-2048 q_b/kv_b) but trails at large M because it uses per-K-iteration epilogue dequant; DeepGEMM uses fused block-scale MMA that runs epilogue once per tile."
+  - "PRIMARY UNTRIED OPTIMIZATION: hardware-fused block-scale dequant via 'tcgen05.mma.kind::mxf8f6f4.block_scale' — that's how DeepGEMM matches itself. Note the block_scale variant requires UE8M0-format scale matrices in TMEM (not float32). DeepGEMM source shows the conversion + layout; replicate it."
+  - "kv_b_proj at large M is the most important workload — in unabsorbed MLA chunked prefill, kv_b_proj's M equals the FULL KV cache length, not the q chunk. An 8K-context request runs kv_b_proj at M=8192 every step. Prioritize M=4096/8192."
+  - "CUTLASS narrow precision example at resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm has another complete sm100a fused block-scale GEMM (slightly different layout from DeepGEMM)."
 
 budget:
   max_iterations: 60

@@ -1,10 +1,17 @@
-"""cuBLAS FP8 GEMM Prefill Baseline (B200) via torch._scaled_mm
-DeepSeek V3 attention projections at TP=8, prefill regime (large M).
+"""DeepGEMM FP8 GEMM Prefill Baseline (B200) — what vLLM and SGLang ship.
+
+DeepGEMM is the open-source FP8 block-scaled GEMM that vLLM/SGLang use by
+default for DeepSeek V3 attention projections on Blackwell. Selected via
+`should_use_deepgemm_for_fp8_linear` (vllm) / `flashinfer.deep_gemm` (sglang).
+At M >= 4096 it matches or beats cuBLAS on these shapes.
+
+Block-scaled FP8: activation scale per 1×128, weight scale per 128×128.
 
 Usage:
     python3 baselines/fp8-gemm/baseline_prefill.py
 """
-import torch
+import torch  # MUST be first to load libc10
+import deep_gemm
 
 device = "cuda"
 
@@ -26,16 +33,17 @@ configs = [
     ("o_proj_M8192",    8192, 2048, 7168),
 ]
 
-print("=== cuBLAS FP8 GEMM Prefill Baseline (TP=8) ===\n")
+print("=== DeepGEMM FP8 GEMM Prefill Baseline (TP=8) ===\n")
 
 for name, M, K, N in configs:
-    A = torch.randn(M, K, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-    B = torch.randn(N, K, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-    scale_a = torch.ones(M, 1, device=device, dtype=torch.float32)
-    scale_b = torch.ones(1, N, device=device, dtype=torch.float32)
+    A_bf = torch.randn(M, K, device=device, dtype=torch.bfloat16)
+    B_bf = torch.randn(N, K, device=device, dtype=torch.bfloat16)
+    A_fp8, scale_a = deep_gemm.per_token_cast_to_fp8(A_bf, use_ue8m0=False)
+    B_fp8, scale_b = deep_gemm.per_block_cast_to_fp8(B_bf, use_ue8m0=False)
+    out = torch.empty(M, N, device=device, dtype=torch.bfloat16)
 
     for _ in range(10):
-        torch._scaled_mm(A, B.t(), scale_a=scale_a, scale_b=scale_b, out_dtype=torch.bfloat16)
+        deep_gemm.fp8_gemm_nt((A_fp8, scale_a), (B_fp8, scale_b), out)
     torch.cuda.synchronize()
 
     NI = 100
@@ -43,7 +51,7 @@ for name, M, K, N in configs:
     en = torch.cuda.Event(enable_timing=True)
     st.record()
     for _ in range(NI):
-        torch._scaled_mm(A, B.t(), scale_a=scale_a, scale_b=scale_b, out_dtype=torch.bfloat16)
+        deep_gemm.fp8_gemm_nt((A_fp8, scale_a), (B_fp8, scale_b), out)
     en.record()
     torch.cuda.synchronize()
     ms = st.elapsed_time(en) / NI

@@ -77,16 +77,11 @@ constraints:
   - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include host reference comparison and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). Prior runs reported fake 3-4x wins from kernels that produced NaN — do NOT remove this guard."
 
 hints:
-  - "BASELINE IS DEEPGEMM. Read examples/fp8-gemm/v002_dense_tp8_validated_065.cu — it's a verified-correct kernel that already wins at small M but gets 0.65-0.93 of DeepGEMM at the 5 configs in this task. Extend it; don't rewrite from scratch."
-  - "DO NOT attempt 'tcgen05.mma.kind::mxf8f6f4.block_scale' (block-scaled MMA). 6 prior attempts across 2 runs all deadlocked or produced NaN — the UE8M0 scale matrix layout + UTCCP plumbing is too complex to get right without working test infrastructure. See examples/fp8-gemm/v007_BROKEN_block_scale_nan.cu for what NOT to do."
-  - "HIGH-VALUE OPTIMIZATIONS to try (proven elsewhere, didn't make it into v002):"
-  - "  (a) TMA store epilogue: stage output in SMEM, TMA-store to global. v015 had this but was reverted; bring it back on top of v002."
-  - "  (b) Larger BN (192 or 256) for o_proj (N=7168). Current BN=128 means many tiles per row; bigger BN reduces overhead per output element."
-  - "  (c) Dual TMEM load pipelining: overlap two TMEM reads in the per-K epilogue (v015 had this)."
-  - "  (d) More pipeline stages (NS=6 or 7) with separate SFA/SFB stages from A/B."
-  - "  (e) MMA descriptor pre-computation across lanes (DeepGEMM __shfl pattern)."
-  - "Per-K epilogue dequant is the architectural ceiling — DeepGEMM avoids it via fused block_scale MMA. Without that path, getting to 0.85 is hard but 0.75-0.80 should be achievable through (a)+(b)+(c)+(d)."
-  - "DeepGEMM 1d2d source at resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh — read for layout/scheduling ideas, not for the block_scale MMA itself."
+  - "BASELINE IS DEEPGEMM. Read examples/fp8-gemm/v002_dense_tp8_validated_065.cu — it's a verified-correct kernel that already wins at small M but gets 0.65-0.93 of DeepGEMM at the 5 configs in this task. Extend it OR rewrite using DeepGEMM's architecture, your call."
+  - "PRIMARY PATH TO MATCH DEEPGEMM: hardware-fused block-scale dequant via 'tcgen05.mma.kind::mxf8f6f4.block_scale'. This eliminates the per-K-iteration epilogue entirely — dequant accumulates inside the MMA pipeline, epilogue runs once per output tile. DeepGEMM's perf at large M comes from this. Without it, the per-K epilogue ceiling is ~0.65-0.70 of DeepGEMM (verified by v002). The MANDATORY validation check (max_rel_err < 1e-2 or emit INVALID) will catch broken block_scale attempts — feel free to attempt it, validation makes it safe."
+  - "Block-scale MMA requires UE8M0-format scale matrices in TMEM (not float32). DeepGEMM's resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d1d.cuh shows the SF tensor layout, UTCCP load pattern, and MMA descriptor format. CUTLASS example 72 (resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm) is a simpler complete reference for the same instruction. Read both — common failure modes are: (i) UE8M0 conversion bug producing NaN, (ii) UTCCP scale layout in TMEM mismatched with what the MMA reads, (iii) missing arrival/wait barrier between scale-load and MMA-issue."
+  - "ALTERNATIVE if block_scale fails: per-K-epilogue optimizations on top of v002 — TMA store epilogue, larger BN (192/256) for o_proj (N=7168), dual TMEM load pipelining, more pipeline stages. Combined upside ~0.75-0.80, not enough to fully match DeepGEMM at large M but a real improvement."
+  - "examples/fp8-gemm/v007_BROKEN_block_scale_nan.cu shows a previous failed block_scale attempt — kernel produced all-NaN output. Read it as a cautionary example, but the validation check would now catch this immediately."
 
 budget:
   max_iterations: 60

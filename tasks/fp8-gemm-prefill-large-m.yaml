@@ -1,0 +1,97 @@
+# ferret task spec — Dense FP8 GEMM at LARGE M only (M=2048..8192)
+# Focus: the 5 shapes where v002 trails DeepGEMM. Small-M shapes already won.
+
+name: fp8-gemm-prefill-large-m
+gpu: B200
+arch: sm_100a
+precision: FP8
+
+problem:
+  description: |
+    Large-M FP8 block-scaled GEMM for DeepSeek V3 attention projections, TP=8.
+    Restricted to the 5 configs where the prior best kernel (v002) trails DeepGEMM:
+      o_proj_M2048   (0.76), o_proj_M4096  (0.65), o_proj_M8192  (0.65)
+      q_b_proj_M8192 (0.65), kv_b_proj_M8192 (0.93)
+    Small-M shapes already beat DeepGEMM by 1.5-3.8x — those are excluded here.
+
+    All shapes have large M (>=2048) and large N (>=3072). The bottleneck is
+    sustained MMA throughput + epilogue dequant. Tile shape, pipeline depth,
+    and epilogue overhead drive perf.
+
+    Block-scaled FP8 e4m3, BF16 output, FP32 accumulator.
+    Block scales: activation 1x128, weight 128x128.
+
+  shapes:
+    BATCH: 1
+
+baseline:
+  source: "DeepGEMM (deep_gemm.fp8_gemm_nt) — run: python3 baselines/fp8-gemm/baseline_prefill_large_m.py"
+
+references:
+  - examples/fp8-gemm/v002_dense_tp8_validated_065.cu
+  - examples/fp8-gemm/v015_dense_tp8_tcgen05_prefill.cu
+  - examples/fp8-gemm/v007_BROKEN_block_scale_nan.cu
+  - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh
+  - resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm
+  - examples/tcgen05-gemm/
+
+configs:
+  - name: o_proj_M2048
+    args: { M: 2048, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: q_b_proj_M8192
+    args: { M: 8192, K: 1536, N: 3072 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: kv_b_proj_M8192
+    args: { M: 8192, K: 512, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: o_proj_M4096
+    args: { M: 4096, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: o_proj_M8192
+    args: { M: 8192, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only. 2-CTA clusters are NOT supported on this build."
+  - "FP8 e4m3 input, BF16 output, FP32 accumulator."
+  - "Block-scaled: activation scale per 1x128 tile, weight scale per 128x128 block."
+  - "Output must match a CPU/host reference within max relative error < 1e-2."
+  - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include host reference comparison and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). Prior runs reported fake 3-4x wins from kernels that produced NaN — do NOT remove this guard."
+
+hints:
+  - "BASELINE IS DEEPGEMM. Read examples/fp8-gemm/v002_dense_tp8_validated_065.cu — it's a verified-correct kernel that already wins at small M but gets 0.65-0.93 of DeepGEMM at the 5 configs in this task. Extend it; don't rewrite from scratch."
+  - "DO NOT attempt 'tcgen05.mma.kind::mxf8f6f4.block_scale' (block-scaled MMA). 6 prior attempts across 2 runs all deadlocked or produced NaN — the UE8M0 scale matrix layout + UTCCP plumbing is too complex to get right without working test infrastructure. See examples/fp8-gemm/v007_BROKEN_block_scale_nan.cu for what NOT to do."
+  - "HIGH-VALUE OPTIMIZATIONS to try (proven elsewhere, didn't make it into v002):"
+  - "  (a) TMA store epilogue: stage output in SMEM, TMA-store to global. v015 had this but was reverted; bring it back on top of v002."
+  - "  (b) Larger BN (192 or 256) for o_proj (N=7168). Current BN=128 means many tiles per row; bigger BN reduces overhead per output element."
+  - "  (c) Dual TMEM load pipelining: overlap two TMEM reads in the per-K epilogue (v015 had this)."
+  - "  (d) More pipeline stages (NS=6 or 7) with separate SFA/SFB stages from A/B."
+  - "  (e) MMA descriptor pre-computation across lanes (DeepGEMM __shfl pattern)."
+  - "Per-K epilogue dequant is the architectural ceiling — DeepGEMM avoids it via fused block_scale MMA. Without that path, getting to 0.85 is hard but 0.75-0.80 should be achievable through (a)+(b)+(c)+(d)."
+  - "DeepGEMM 1d2d source at resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh — read for layout/scheduling ideas, not for the block_scale MMA itself."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [o_proj_M2048, q_b_proj_M8192, kv_b_proj_M8192, o_proj_M4096, o_proj_M8192]

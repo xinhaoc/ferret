@@ -1,0 +1,134 @@
+# ferret task spec — Grouped FP8 block-scaled GEMM for DeepSeek V3 MoE prefill
+# Per-expert per-rank shapes for DSv3 with EP=8 (32 experts/rank)
+# This is what vLLM ships for DSv3 MoE (deep_gemm_moe.py)
+
+name: fp8-group-gemm-dsv3-prefill
+gpu: B200
+arch: sm_100a
+precision: FP8
+
+problem:
+  description: |
+    Grouped FP8 block-scaled GEMM for DeepSeek V3 MoE, prefill regime.
+    Two grouped GEMMs per MoE layer per token:
+      gate_up: A[M_total, K=7168] @ W_gu[E, N=4096, K=7168]^T → O[M_total, 4096]
+      down:    A[M_total, K=2048] @ W_d [E, N=7168, K=2048]^T → O[M_total, 7168]
+    where E = num_experts/rank = 32 (DSv3 EP=8: 256 experts / 8 ranks).
+
+    Layout: CONTIGUOUS — rows of A pre-permuted so each expert's tokens are
+    packed consecutive in memory. `m_indices[M_total]` gives the expert id
+    for each row; the kernel uses it to select the correct W slice. This is
+    DeepGEMM's `m_grouped_fp8_gemm_nt_contiguous` API exactly.
+
+    For each output tile (block_m, block_n) the kernel:
+      1. Reads m_indices[block_m_start] to find expert e
+      2. Loads W[e, block_n*BN:(block_n+1)*BN, :] tile
+      3. Loads W_scales[e, block_n*BN/128:(block_n+1)*BN/128, :]
+      4. Runs the same tcgen05.mma.kind::mxf8f6f4.block_scale main loop
+         as the dense kernel
+      5. Stores O[block_m, block_n]
+
+    Block-scaled FP8 e4m3: activation 1x128 tile, weight 128x128 block.
+    BF16 output, FP32 accumulator. UE8M0 scales in TMEM (block_scale variant).
+
+    M-per-expert distribution: tokens routed to each expert via topk=8.
+    For prefill chunk T tokens per rank, avg M-per-expert = T/32. Configs
+    span M_per_expert ∈ {64, 128, 256, 512} (T ∈ {2048, 4096, 8192, 16384}).
+
+  shapes:
+    NUM_EXPERTS_PER_RANK: 32
+    HIDDEN: 7168
+    EXPERT_INTERMEDIATE: 2048
+
+baseline:
+  source: "DeepGEMM (deep_gemm.m_grouped_fp8_gemm_nt_contiguous) — run: python3 baselines/fp8-group-gemm/baseline_dsv3_prefill.py"
+
+references:
+  - examples/fp8-gemm/v009_large_m_block_scale_mma_080.cu
+  - examples/fp8-gemm/v002_dense_tp8_validated_065.cu
+  - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh
+  - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d1d.cuh
+  - resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm
+  - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/smxx_layout.cuh
+
+configs:
+  # gate_up: K=7168, N=4096 (gate∥up fused)
+  - name: gate_up_M64
+    args: { M_PER_EXPERT: 64, NUM_GROUPS: 32, K: 7168, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: gate_up_M128
+    args: { M_PER_EXPERT: 128, NUM_GROUPS: 32, K: 7168, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: gate_up_M256
+    args: { M_PER_EXPERT: 256, NUM_GROUPS: 32, K: 7168, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: gate_up_M512
+    args: { M_PER_EXPERT: 512, NUM_GROUPS: 32, K: 7168, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  # down: K=2048, N=7168
+  - name: down_M64
+    args: { M_PER_EXPERT: 64, NUM_GROUPS: 32, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: down_M128
+    args: { M_PER_EXPERT: 128, NUM_GROUPS: 32, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: down_M256
+    args: { M_PER_EXPERT: 256, NUM_GROUPS: 32, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: down_M512
+    args: { M_PER_EXPERT: 512, NUM_GROUPS: 32, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only. 2-CTA clusters are NOT supported on this build."
+  - "FP8 e4m3 input, BF16 output, FP32 accumulator."
+  - "Block-scaled: activation scale per 1x128 tile, weight scale per 128x128 block."
+  - "Contiguous layout (vLLM-style): rows of A pre-permuted by expert; m_indices[M_total] gives expert id per row."
+  - "Output must match a CPU/host reference within max relative error < 1e-2."
+  - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include host reference comparison and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). DO NOT remove this guard."
+
+hints:
+  - "BASELINE IS DEEPGEMM. The same DeepGEMM kernel that handles dense FP8 also handles grouped variants — see kGemmType::GroupedContiguous path in resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh. Read it: same MMA pipeline, just a different scheduler that maps tiles to (expert, m_block, n_block) and offsets W/W_scales by expert."
+  - "ARCHITECTURAL FOUNDATION: examples/fp8-gemm/v009_large_m_block_scale_mma_080.cu has the working block_scale MMA + UE8M0 + TMEM pipeline you need. The dense → grouped change is mostly in the scheduler (which expert to load) and the weight indexing — the inner MMA loop is identical. Reuse v009's MMA core; rewrite the scheduler around it."
+  - "GROUPED CONTIGUOUS API (matches DeepGEMM):"
+  - "  A_fp8 :     [M_total, K]    contiguous, rows pre-permuted by expert"
+  - "  A_scales:   [M_total, K/128]"
+  - "  W_fp8:      [E, N, K]       weight per-expert"
+  - "  W_scales:   [E, N/128, K/128]"
+  - "  Out:        [M_total, N]"
+  - "  m_indices:  [M_total]       expert id (0..E-1) for each row"
+  - "  Each output tile (m_block, n_block) gets expert = m_indices[m_block * BLOCK_M]; all M-rows within a tile MUST belong to the same expert (DeepGEMM aligns each expert's row count to BLOCK_M)."
+  - "DSv3-SPECIFIC: 32 experts per rank (EP=8 split of 256 experts). Two GEMM shapes: gate_up has K=7168 N=4096 (large K, mid N), down has K=2048 N=7168 (mid K, large N). Same kernel handles both."
+  - "M-per-expert RANGE: 64-512 in this task. At M_per_expert=64 and BLOCK_M=128, you may have padding / sub-block utilization issues — handle gracefully (DeepGEMM pads at the harness level, you can require M_per_expert % BLOCK_M == 0 in the kernel and let the harness pad)."
+  - "WHY FROM SCRATCH (not extending v009): grouped scheduling is a fundamental rewrite of the persistent kernel's tile-assignment logic, and the weight tensor goes from 2D to 3D. A clean rewrite is cleaner than splicing both. v009 is a reference, not a starting point."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [gate_up_M64, gate_up_M128, gate_up_M256, gate_up_M512, down_M64, down_M128, down_M256, down_M512]

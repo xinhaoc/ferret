@@ -1,0 +1,134 @@
+# ferret task spec — Grouped FP8 GEMM for DeepSeek V3 MoE DECODE
+# Tiny M_per_expert (1-16). DeepGEMM is hugely wasteful here (pads M to 128).
+# Big optimization opportunity: smaller BLOCK_M, or masked layout, or per-token scheduling.
+
+name: fp8-group-gemm-dsv3-decode
+gpu: B200
+arch: sm_100a
+precision: FP8
+
+problem:
+  description: |
+    Grouped FP8 block-scaled GEMM for DeepSeek V3 MoE, DECODE regime.
+    Two grouped GEMMs per MoE layer per token (gate_up + down):
+      gate_up: K=7168 → N=4096
+      down:    K=2048 → N=7168
+    num_groups (experts/rank) = 32 (DSv3 EP=8: 256 experts / 8 ranks).
+
+    DECODE shapes: M_per_expert ∈ {1, 4, 8, 16}. Real per-expert M is tiny
+    because each expert only sees a few tokens per decode step (batch * topk
+    spread across 256 experts).
+
+    KEY OPPORTUNITY: DeepGEMM wastes 8-128x compute at this regime because
+    it pads every expert's M to BLOCK_M=128. Measured baseline:
+      gate_up_M1:  217 us  (real 8.7 TFLOPS, pad 1107 TFLOPS — 99.2% wasted)
+      gate_up_M16: 219 us  (real 137 TFLOPS, pad 1099 TFLOPS — 87.5% wasted)
+      down_M1:     119 us  (real 7.9 TFLOPS, pad 1007 TFLOPS)
+      down_M16:    118 us  (real 128 TFLOPS, pad 1023 TFLOPS)
+    Same wall time at M=1 as at M=16 — that's pure waste. Beat it.
+
+    Layout: choose what works best for tiny M.
+      (a) CONTIGUOUS with smaller BLOCK_M (8, 16, or 32) — minimal change
+          from prefill grouped GEMM, but BLOCK_M needs to drop.
+      (b) MASKED layout — A is [E, max_m, K] separated per expert, masked_m
+          tells real M per expert. SGLang uses this for decode-with-overlap.
+      (c) PER-TOKEN scheduling — each output row is a tile, kernel reads
+          m_indices to find expert and weight tile. No tiling waste.
+    All three can match output. Pick one and run with it.
+
+    Block-scaled FP8 e4m3, BF16 output, FP32 accumulator.
+    UE8M0 scales for tcgen05.mma.kind::mxf8f6f4.block_scale, OR
+    float32 scales with software per-K dequant — both are fine.
+
+  shapes:
+    NUM_EXPERTS_PER_RANK: 32
+    HIDDEN: 7168
+    EXPERT_INTERMEDIATE: 2048
+
+baseline:
+  source: "DeepGEMM (deep_gemm.m_grouped_fp8_gemm_nt_contiguous, padded layout) — run: python3 baselines/fp8-group-gemm/baseline_dsv3_decode.py"
+
+references:
+  - examples/fp8-gemm/v009_large_m_block_scale_mma_080.cu
+  - examples/fp8-gemm/v002_dense_tp8_validated_065.cu
+  - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh
+  - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d1d.cuh
+  - resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm
+
+configs:
+  # gate_up: K=7168, N=4096
+  - name: gate_up_M1
+    args: { M_PER_EXPERT: 1, NUM_GROUPS: 32, K: 7168, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: gate_up_M4
+    args: { M_PER_EXPERT: 4, NUM_GROUPS: 32, K: 7168, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: gate_up_M8
+    args: { M_PER_EXPERT: 8, NUM_GROUPS: 32, K: 7168, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: gate_up_M16
+    args: { M_PER_EXPERT: 16, NUM_GROUPS: 32, K: 7168, N: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  # down: K=2048, N=7168
+  - name: down_M1
+    args: { M_PER_EXPERT: 1, NUM_GROUPS: 32, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: down_M4
+    args: { M_PER_EXPERT: 4, NUM_GROUPS: 32, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: down_M8
+    args: { M_PER_EXPERT: 8, NUM_GROUPS: 32, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: down_M16
+    args: { M_PER_EXPERT: 16, NUM_GROUPS: 32, K: 2048, N: 7168 }
+    target_ratio: 1.00
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only. 2-CTA clusters NOT supported on this build."
+  - "FP8 e4m3 input, BF16 output, FP32 accumulator."
+  - "Block-scaled: activation scale per 1x128 tile, weight scale per 128x128 block."
+  - "TFLOPS measured over REAL FLOPs (2 * M_real * N * K), NOT padded. The whole point is to skip padding waste."
+  - "Output must match a CPU/host reference within max relative error < 1e-2."
+  - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include host reference comparison and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). DO NOT remove this guard."
+
+hints:
+  - "BASELINE BEHAVIOR: DeepGEMM's contiguous kernel pads each expert's M to BLOCK_M=128 internally. Wall time is dominated by 32 expert tiles × ~7-8us per tile, regardless of how many real rows each expert has. At M_per_expert=1 only 1/128 of the compute is real. Beating this means doing less work, not faster work."
+  - "ARCHITECTURAL OPTIONS for tiny-M:"
+  - "  (a) Contiguous with BLOCK_M=8 or 16 — same kernel structure as v009/dense, just smaller M tile. Each expert runs ceil(M_per_expert / BLOCK_M) MMAs instead of being padded to 128."
+  - "  (b) Masked layout — A is [E, max_m, K] separated per expert; masked_m[E] gives real M per expert. Different memory layout but no per-expert padding waste. See DeepGEMM kGemmType::GroupedMasked path."
+  - "  (c) Per-token / per-row scheduling — at M_per_expert=1 each tile is one output ROW. Skip tcgen05 entirely and use mma.sync m16n8k32 (Ampere-style) since the work per row is tiny. Could match cuBLAS-FP8-style perf at decode."
+  - "REFERENCES YOU OWN: examples/fp8-gemm/v009_large_m_block_scale_mma_080.cu has the working block_scale MMA + UE8M0 + tcgen05 pipeline (option a inheritor). examples/fp8-gemm/v002_dense_tp8_validated_065.cu has per-K-epilogue + Ampere-friendly path (option c hint)."
+  - "DEEPGEMM SOURCE: resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d2d.cuh has GroupedContiguous AND GroupedMasked schedulers — read both. The MMA core is the same; the scheduler differs."
+  - "EXPECTED WIN: 3-30x at M_per_expert ≤ 8 vs DeepGEMM contiguous, because DeepGEMM is padding-bound there. Target min_ratio ≥ 3.0 across all M=1/4 configs (i.e., 3x faster wall time), ≥ 1.5 at M=8/16."
+  - "DSv3 SHAPES: 32 experts/rank, gate_up K=7168 N=4096, down K=2048 N=7168. Same kernel handles both — only K and N change."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [gate_up_M1, gate_up_M4, gate_up_M8, gate_up_M16, down_M1, down_M4, down_M8, down_M16]

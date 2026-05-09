@@ -43,7 +43,7 @@ for name, M, K, N in configs:
     out = torch.empty(M, N, device=device, dtype=torch.bfloat16)
 
     for _ in range(10):
-        deep_gemm.fp8_gemm_nt((A_fp8, scale_a), (B_fp8, scale_b), out)
+        deep_gemm.fp8_gemm_nt((A_fp8, scale_a), (B_fp8, scale_b), out, disable_ue8m0_cast=True)
     torch.cuda.synchronize()
 
     NI = 100
@@ -51,7 +51,7 @@ for name, M, K, N in configs:
     en = torch.cuda.Event(enable_timing=True)
     st.record()
     for _ in range(NI):
-        deep_gemm.fp8_gemm_nt((A_fp8, scale_a), (B_fp8, scale_b), out)
+        deep_gemm.fp8_gemm_nt((A_fp8, scale_a), (B_fp8, scale_b), out, disable_ue8m0_cast=True)
     en.record()
     torch.cuda.synchronize()
     ms = st.elapsed_time(en) / NI

@@ -56,7 +56,7 @@ for name, M_per_e, E, K, N in configs:
 
     for _ in range(10):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            (A_fp8, A_scale), (W_fp8, W_scale), out, m_indices,
+            (A_fp8, A_scale), (W_fp8, W_scale), out, m_indices, disable_ue8m0_cast=True,
         )
     torch.cuda.synchronize()
 
@@ -66,7 +66,7 @@ for name, M_per_e, E, K, N in configs:
     st.record()
     for _ in range(NI):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            (A_fp8, A_scale), (W_fp8, W_scale), out, m_indices,
+            (A_fp8, A_scale), (W_fp8, W_scale), out, m_indices, disable_ue8m0_cast=True,
         )
     en.record()
     torch.cuda.synchronize()

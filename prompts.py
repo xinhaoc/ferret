@@ -157,6 +157,8 @@ All git commands run from workspace/ (where kernel.cu and .git live).
 
 Your best result is already in git. Do NOT re-benchmark and re-tag the same kernel.cu — measurement noise is not improvement. Only commit + tag after a **code change** to kernel.cu. If you are below target, write a code change, not a better commit message.
 
+**TFLOPS values in commit messages MUST come from a `KERNEL_RESULT` line you observed in your `run_command` tool output during this iteration.** If `./kernel` timed out or you have not seen `KERNEL_RESULT` in tool output, do NOT write TFLOPS values in the commit. Reduce iteration count or extend the timeout, re-run, observe, then commit. Fabricating numbers in commit text breaks the orchestrator's score tracking and produces unverifiable claims.
+
 ### Save an improvement
 ```bash
 cd workspace && git add kernel.cu progress.md && git commit -m "v005: warp specialization for TMA/MMA overlap [warp-specialization]

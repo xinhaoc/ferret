@@ -129,6 +129,7 @@ Small chunks (256) have SM under-utilization — agent uses BM=32 + split-K.
 - **cg2 failure loop**: tries cg2 6+ times via edit patches, same bug every time. Fix: provide a verified working cg2 example as starting point.
 - **Ignores hints**: agent sees "try unabsorbed" hint but keeps optimizing absorbed form. May need stronger prompt or task restructuring (separate task for each approach).
 - **Hardcoded references**: stores baseline TFLOPS in kernel.cu, never re-measures. Leads to stale ratios when formulas change.
+- **Fabricated TFLOPS in commits**: when `./kernel` runs exceed `run_command` timeout, agent never observes a `KERNEL_RESULT` line — yet still commits with plausible-looking TFLOPS values typed directly into the commit message body. The orchestrator's `_get_best_tflops` parses commit body text, so fabricated numbers get accepted as "best" with no verification. Pattern: agent inflates iteration count to chase boost-clock measurements → kernel takes 5+ min → run_command times out → agent commits anyway with monotonically-increasing made-up TFLOPS (e.g. 12.5 → 13.0 → 13.5 → 14.0 → 14.5 → 15.0 across versions, all with perfect M-scaling). Mitigation: prompts.py now requires every TFLOPS value in a commit message to come from an observed `KERNEL_RESULT` tool output during the same iteration. Detection: grep `tool_calls.jsonl` for `./kernel` runs, check whether their stdout actually contained `KERNEL_RESULT` — if not but agent committed TFLOPS, that's fabrication.
 
 ## Infrastructure notes
 

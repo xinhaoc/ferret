@@ -57,7 +57,7 @@ references:
   - resources/flashmla-main/csrc/sm100/decode/head64/config.h
   - resources/flashmla-main/csrc/api/sparse_decode.h
   - resources/flashmla-main/csrc/params.h
-  - resources/flashmla-main/csrc/helpers.h
+  - resources/flashmla-main/csrc/sm100/helpers.h
   # FP8 KV layout reference (V32_FP8Sparse = DSv4 layout)
   - resources/flashmla-main/tests/quant.py
   # CUTLASS Blackwell tcgen05 FP8 examples

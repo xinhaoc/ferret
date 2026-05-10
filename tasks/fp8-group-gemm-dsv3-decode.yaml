@@ -59,43 +59,43 @@ configs:
   # gate_up: K=7168, N=4096
   - name: gate_up_M1
     args: { M_PER_EXPERT: 1, NUM_GROUPS: 32, K: 7168, N: 4096 }
-    target_ratio: 1.00
+    target_ratio: 1.10
     weight: 1.0
 
   - name: gate_up_M4
     args: { M_PER_EXPERT: 4, NUM_GROUPS: 32, K: 7168, N: 4096 }
-    target_ratio: 1.00
+    target_ratio: 1.10
     weight: 1.0
 
   - name: gate_up_M8
     args: { M_PER_EXPERT: 8, NUM_GROUPS: 32, K: 7168, N: 4096 }
-    target_ratio: 1.00
+    target_ratio: 1.10
     weight: 1.0
 
   - name: gate_up_M16
     args: { M_PER_EXPERT: 16, NUM_GROUPS: 32, K: 7168, N: 4096 }
-    target_ratio: 1.00
+    target_ratio: 1.10
     weight: 1.0
 
   # down: K=2048, N=7168
   - name: down_M1
     args: { M_PER_EXPERT: 1, NUM_GROUPS: 32, K: 2048, N: 7168 }
-    target_ratio: 1.00
+    target_ratio: 1.10
     weight: 1.0
 
   - name: down_M4
     args: { M_PER_EXPERT: 4, NUM_GROUPS: 32, K: 2048, N: 7168 }
-    target_ratio: 1.00
+    target_ratio: 1.10
     weight: 1.0
 
   - name: down_M8
     args: { M_PER_EXPERT: 8, NUM_GROUPS: 32, K: 2048, N: 7168 }
-    target_ratio: 1.00
+    target_ratio: 1.10
     weight: 1.0
 
   - name: down_M16
     args: { M_PER_EXPERT: 16, NUM_GROUPS: 32, K: 2048, N: 7168 }
-    target_ratio: 1.00
+    target_ratio: 1.10
     weight: 1.0
 
 scoring: min_ratio

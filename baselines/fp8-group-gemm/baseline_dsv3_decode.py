@@ -4,6 +4,13 @@ Calls deep_gemm.m_grouped_fp8_gemm_nt_contiguous with the REAL M_total
 (no fake padding). DG's scheduler launches only ceil(M_total/BM) m-tiles,
 so giving it real M_total is the production-equivalent measurement.
 
+L2 flush between iterations: in real inference, attention + layernorm +
+other ops evict L2 between MoE GEMM calls, so weights are NOT cached.
+The 128 MB flush before each timed iteration mirrors that and gives the
+production-relevant "L2 cold" measurement. Without flush, DG's per-call
+time is artificially low (~3x faster) because the 939 MB weight matrix
+partially stays L2-resident across consecutive calls.
+
 Usage:
     python3 baselines/fp8-group-gemm/baseline_dsv3_decode.py
 """
@@ -12,6 +19,7 @@ import deep_gemm
 
 device = "cuda"
 NUM_GROUPS = 32  # DSv3 EP=8: 32 experts/rank
+FLUSH_BYTES = 128 * 1024 * 1024  # 128 MB > 96 MB B200 L2
 
 configs = [
     ("gate_up_M1",  1,  NUM_GROUPS, 7168, 4096),
@@ -41,6 +49,7 @@ for name, M_per_e, E, K, N in configs:
     # m_indices[i] = expert id for row i. Rows are contiguous per expert.
     m_indices = torch.arange(M_total, device=device, dtype=torch.int32) // M_per_e
     out = torch.empty(M_total, N, device=device, dtype=torch.bfloat16)
+    flush = torch.zeros(FLUSH_BYTES // 4, dtype=torch.int32, device=device)
 
     for _ in range(10):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
@@ -49,16 +58,21 @@ for name, M_per_e, E, K, N in configs:
     torch.cuda.synchronize()
 
     NI = 100
-    st = torch.cuda.Event(enable_timing=True)
-    en = torch.cuda.Event(enable_timing=True)
-    st.record()
+    # Per-iteration timing with L2 flush between iters → "L2 cold" production-relevant
+    iter_times_us = []
     for _ in range(NI):
+        flush.zero_()
+        st = torch.cuda.Event(enable_timing=True)
+        en = torch.cuda.Event(enable_timing=True)
+        st.record()
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             (A_fp8, A_scale), (W_fp8, W_scale), out, m_indices, disable_ue8m0_cast=True,
         )
-    en.record()
-    torch.cuda.synchronize()
-    ms = st.elapsed_time(en) / NI
+        en.record()
+        torch.cuda.synchronize()
+        iter_times_us.append(st.elapsed_time(en) * 1000.0)
+    iter_times_us.sort()
+    ms = iter_times_us[len(iter_times_us) // 2] / 1000.0  # median
     us = ms * 1000
     flops = 2 * M_total * N * K
     tflops = flops / (ms / 1000) / 1e12

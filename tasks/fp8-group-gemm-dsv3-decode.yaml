@@ -100,6 +100,7 @@ constraints:
   - "TFLOPS measured over REAL FLOPs (2 * M_real * N * K), NOT padded."
   - "Output must match a CPU/host reference within max relative error < 1e-2."
   - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include host reference comparison and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). DO NOT remove this guard."
+  - "MANDATORY L2 FLUSH: your kernel benchmark MUST flush a 128 MB buffer (cudaMemset on a 128MB device buffer) immediately before each timed iteration. The DG baseline does this — comparison without matching flush is invalid. In real inference, attention + layernorm + other ops evict L2 between MoE calls; the flush mirrors that. Reported TFLOPS must be median across NI per-iteration measurements (each iteration: flush, record start, kernel launch, record stop, sync), NOT a single batch event-pair around all iterations. Example pattern in DG baseline at baselines/fp8-group-gemm/baseline_dsv3_decode.py."
 
 hints: []
 

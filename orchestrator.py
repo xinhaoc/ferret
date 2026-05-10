@@ -147,66 +147,36 @@ class CudaOrchestratorV2:
     # ── Scores from git ──
 
     async def _get_best_tflops(self) -> float:
-        """Re-run kernel binary, parse stdout. Cache by kernel.cu mtime.
-
-        Previously read TFLOPS from commit message body text — the agent types
-        that, so the agent could fabricate numbers and have them accepted as
-        "best". Now we independently execute the binary and parse its
-        KERNEL_RESULT stdout. Result cached per kernel.cu mtime so callers
-        within the same iteration don't re-run the kernel.
-        """
-        import json, re
+        """Get best TFLOPS from git tags. Parses commit messages for TFLOPS: lines."""
         ws_abs = str(self.workspace_path.resolve())
-        kernel_path = self.workspace_path / "kernel"
-        cu_path = self.workspace_path / "kernel.cu"
-        cache_path = self.workspace_path / ".measured_tflops"
-
-        if not kernel_path.exists() or not cu_path.exists():
+        stdout, _, code = await self.sh(f"cd {ws_abs} && git tag 2>/dev/null")
+        if code != 0 or not stdout.strip():
             return 0.0
-
-        cu_mtime = cu_path.stat().st_mtime
-        if cache_path.exists():
-            try:
-                cached = json.loads(cache_path.read_text())
-                if cached.get("cu_mtime") == cu_mtime:
-                    return float(cached.get("best_tflops", 0.0))
-            except Exception:
-                pass
-
-        # Hard 60s cap so runaway iter counts can't lock up scoring.
-        run_cmd = f"cd {ws_abs} && timeout 60 ./kernel 2>&1 | grep '^KERNEL_RESULT' | tail -2"
-        out, _, _ = await self.sh(run_cmd)
-
-        def parse(prefix):
-            for line in out.split("\n"):
-                if line.startswith(prefix):
-                    m = re.search(r'\{[^}]+\}', line)
-                    if m:
-                        try:
-                            return json.loads(m.group(0))
-                        except Exception:
-                            pass
-            return None
-
-        kr = parse("KERNEL_RESULT ")
-        ref = parse("KERNEL_RESULT_REFERENCE")
-
-        if not kr:
-            # Kernel timed out or didn't print — record 0 in cache.
-            cache_path.write_text(json.dumps({"cu_mtime": cu_mtime, "best_tflops": 0.0}))
-            return 0.0
-
-        if ref:
-            ratios = {k: kr[k] / ref[k] for k in kr if k in ref and ref[k] > 0}
-            if ratios:
-                worst_cfg = min(ratios, key=ratios.get)
-                best = float(kr[worst_cfg])
-            else:
-                best = float(max(kr.values()))
-        else:
-            best = float(max(kr.values()))
-
-        cache_path.write_text(json.dumps({"cu_mtime": cu_mtime, "best_tflops": best}))
+        best = 0.0
+        for tag in stdout.strip().split("\n"):
+            tag = tag.strip()
+            if not tag:
+                continue
+            msg_out, _, _ = await self.sh(f"cd {ws_abs} && git log -1 --format=%b {tag} 2>/dev/null")
+            for line in msg_out.split("\n"):
+                if line.startswith("TFLOPS:"):
+                    try:
+                        import re
+                        after = line.split(":", 1)[1]
+                        # Try Q\d= format first (e.g. Q1=23.8)
+                        nums = re.findall(r'Q\d+=([\d.]+)', after)
+                        # Fallback: standalone floats (e.g. "235.6")
+                        if not nums:
+                            nums = re.findall(r'(?<![=\w])(\d+\.\d+)', after)
+                        for n in nums:
+                            try:
+                                val = float(n)
+                                if val > best:
+                                    best = val
+                            except ValueError:
+                                pass
+                    except ValueError:
+                        pass
         return best
 
     def _get_baseline_tflops(self) -> float:

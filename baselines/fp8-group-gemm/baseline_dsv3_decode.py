@@ -1,11 +1,8 @@
 """DeepGEMM grouped FP8 GEMM baseline — DSv3 MoE DECODE shapes.
 
-DeepGEMM contiguous pads M_per_expert to BLOCK_M=128 internally — at decode
-shapes (M_per_expert=1..16) most compute is wasted on padding. Wall time is
-~constant regardless of real M_per_expert ≤ 128. This is the bar to beat.
-
-TFLOPS reported over REAL FLOPs (2 * M_real * N * K), NOT padded —
-that's the production-relevant throughput.
+Calls deep_gemm.m_grouped_fp8_gemm_nt_contiguous with the REAL M_total
+(no fake padding). DG's scheduler launches only ceil(M_total/BM) m-tiles,
+so giving it real M_total is the production-equivalent measurement.
 
 Usage:
     python3 baselines/fp8-group-gemm/baseline_dsv3_decode.py
@@ -15,7 +12,6 @@ import deep_gemm
 
 device = "cuda"
 NUM_GROUPS = 32  # DSv3 EP=8: 32 experts/rank
-DEEPGEMM_BLOCK_M = 128
 
 configs = [
     ("gate_up_M1",  1,  NUM_GROUPS, 7168, 4096),
@@ -31,12 +27,9 @@ configs = [
 print("=== DeepGEMM Grouped FP8 GEMM Baseline (DSv3 MoE DECODE) ===\n")
 
 for name, M_per_e, E, K, N in configs:
-    M_real_total = M_per_e * E
-    # DeepGEMM pads each expert to BLOCK_M
-    M_per_e_pad = ((M_per_e + DEEPGEMM_BLOCK_M - 1) // DEEPGEMM_BLOCK_M) * DEEPGEMM_BLOCK_M
-    M_pad_total = M_per_e_pad * E
+    M_total = M_per_e * E
 
-    A_bf = torch.randn(M_pad_total, K, device=device, dtype=torch.bfloat16)
+    A_bf = torch.randn(M_total, K, device=device, dtype=torch.bfloat16)
     W_bf = torch.randn(E, N, K, device=device, dtype=torch.bfloat16)
     A_fp8, A_scale = deep_gemm.per_token_cast_to_fp8(A_bf, use_ue8m0=False)
     W_fp8 = torch.empty(E, N, K, device=device, dtype=torch.float8_e4m3fn)
@@ -45,8 +38,9 @@ for name, M_per_e, E, K, N in configs:
         we_fp8, we_scale = deep_gemm.per_block_cast_to_fp8(W_bf[e], use_ue8m0=False)
         W_fp8[e] = we_fp8
         W_scale[e] = we_scale
-    m_indices = torch.arange(E, device=device, dtype=torch.int32).repeat_interleave(M_per_e_pad)
-    out = torch.empty(M_pad_total, N, device=device, dtype=torch.bfloat16)
+    # m_indices[i] = expert id for row i. Rows are contiguous per expert.
+    m_indices = torch.arange(M_total, device=device, dtype=torch.int32) // M_per_e
+    out = torch.empty(M_total, N, device=device, dtype=torch.bfloat16)
 
     for _ in range(10):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
@@ -66,7 +60,7 @@ for name, M_per_e, E, K, N in configs:
     torch.cuda.synchronize()
     ms = st.elapsed_time(en) / NI
     us = ms * 1000
-    flops_real = 2 * M_real_total * N * K  # production-relevant
-    tflops_real = flops_real / (ms / 1000) / 1e12
-    print(f"{name}: {tflops_real:.2f} TFLOPS, {us:.1f} us  "
-          f"(M_real={M_per_e} M_pad={M_per_e_pad} K={K} N={N} E={E})")
+    flops = 2 * M_total * N * K
+    tflops = flops / (ms / 1000) / 1e12
+    print(f"{name}: {tflops:.2f} TFLOPS, {us:.1f} us  "
+          f"(M_total={M_total} K={K} N={N} E={E})")

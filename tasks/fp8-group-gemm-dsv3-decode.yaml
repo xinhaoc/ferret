@@ -1,6 +1,4 @@
 # ferret task spec — Grouped FP8 GEMM for DeepSeek V3 MoE DECODE
-# Tiny M_per_expert (1-16). DeepGEMM is hugely wasteful here (pads M to 128).
-# Big optimization opportunity: smaller BLOCK_M, or masked layout, or per-token scheduling.
 
 name: fp8-group-gemm-dsv3-decode
 gpu: B200
@@ -13,32 +11,21 @@ problem:
     Two grouped GEMMs per MoE layer per token (gate_up + down):
       gate_up: K=7168 → N=4096
       down:    K=2048 → N=7168
-    num_groups (experts/rank) = 32 (DSv3 EP=8: 256 experts / 8 ranks).
+    num_experts/rank = 32 (DSv3 EP=8: 256 experts / 8 ranks).
 
-    DECODE shapes: M_per_expert ∈ {1, 4, 8, 16}. Real per-expert M is tiny
-    because each expert only sees a few tokens per decode step (batch * topk
-    spread across 256 experts).
+    Decode regime: M_per_expert ∈ {1, 4, 8, 16}. Real per-expert M is small.
 
-    KEY OPPORTUNITY: DeepGEMM wastes 8-128x compute at this regime because
-    it pads every expert's M to BLOCK_M=128. Measured baseline:
-      gate_up_M1:  217 us  (real 8.7 TFLOPS, pad 1107 TFLOPS — 99.2% wasted)
-      gate_up_M16: 219 us  (real 137 TFLOPS, pad 1099 TFLOPS — 87.5% wasted)
-      down_M1:     119 us  (real 7.9 TFLOPS, pad 1007 TFLOPS)
-      down_M16:    118 us  (real 128 TFLOPS, pad 1023 TFLOPS)
-    Same wall time at M=1 as at M=16 — that's pure waste. Beat it.
+    Contiguous layout (DG-compatible):
+      A:         [M_total, K]            FP8, rows ordered by expert (contiguous)
+      A_scale:   [M_total, K/128]        FP32 (1×128 block scale per row)
+      W:         [E, N, K]               FP8 weight per-expert
+      W_scale:   [E, N/128, K/128]       FP32 (128×128 block scale)
+      m_indices: [M_total]               int32, expert id per row
+      Out:       [M_total, N]            BF16
 
-    Layout: choose what works best for tiny M.
-      (a) CONTIGUOUS with smaller BLOCK_M (8, 16, or 32) — minimal change
-          from prefill grouped GEMM, but BLOCK_M needs to drop.
-      (b) MASKED layout — A is [E, max_m, K] separated per expert, masked_m
-          tells real M per expert. SGLang uses this for decode-with-overlap.
-      (c) PER-TOKEN scheduling — each output row is a tile, kernel reads
-          m_indices to find expert and weight tile. No tiling waste.
-    All three can match output. Pick one and run with it.
-
-    Block-scaled FP8 e4m3, BF16 output, FP32 accumulator.
-    UE8M0 scales for tcgen05.mma.kind::mxf8f6f4.block_scale, OR
-    float32 scales with software per-K dequant — both are fine.
+    Block-scaled FP8 e4m3, BF16 output, FP32 accumulator. UE8M0 scales for
+    tcgen05.mma.kind::mxf8f6f4.block_scale, OR float32 scales with software
+    per-K dequant — both correct, perf may differ.
 
   shapes:
     NUM_EXPERTS_PER_RANK: 32
@@ -59,43 +46,43 @@ configs:
   # gate_up: K=7168, N=4096
   - name: gate_up_M1
     args: { M_PER_EXPERT: 1, NUM_GROUPS: 32, K: 7168, N: 4096 }
-    target_ratio: 1.10
+    target_ratio: 1.00
     weight: 1.0
 
   - name: gate_up_M4
     args: { M_PER_EXPERT: 4, NUM_GROUPS: 32, K: 7168, N: 4096 }
-    target_ratio: 1.10
+    target_ratio: 1.00
     weight: 1.0
 
   - name: gate_up_M8
     args: { M_PER_EXPERT: 8, NUM_GROUPS: 32, K: 7168, N: 4096 }
-    target_ratio: 1.10
+    target_ratio: 1.00
     weight: 1.0
 
   - name: gate_up_M16
     args: { M_PER_EXPERT: 16, NUM_GROUPS: 32, K: 7168, N: 4096 }
-    target_ratio: 1.10
+    target_ratio: 1.00
     weight: 1.0
 
   # down: K=2048, N=7168
   - name: down_M1
     args: { M_PER_EXPERT: 1, NUM_GROUPS: 32, K: 2048, N: 7168 }
-    target_ratio: 1.10
+    target_ratio: 1.00
     weight: 1.0
 
   - name: down_M4
     args: { M_PER_EXPERT: 4, NUM_GROUPS: 32, K: 2048, N: 7168 }
-    target_ratio: 1.10
+    target_ratio: 1.00
     weight: 1.0
 
   - name: down_M8
     args: { M_PER_EXPERT: 8, NUM_GROUPS: 32, K: 2048, N: 7168 }
-    target_ratio: 1.10
+    target_ratio: 1.00
     weight: 1.0
 
   - name: down_M16
     args: { M_PER_EXPERT: 16, NUM_GROUPS: 32, K: 2048, N: 7168 }
-    target_ratio: 1.10
+    target_ratio: 1.00
     weight: 1.0
 
 scoring: min_ratio

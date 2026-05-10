@@ -147,31 +147,28 @@ class CudaOrchestratorV2:
     # ── Scores from git ──
 
     async def _get_best_tflops(self) -> float:
-        """Re-run kernel binary, parse stdout. Cache by kernel binary mtime.
+        """Re-run kernel binary, parse stdout. Cache by kernel.cu mtime.
 
         Previously read TFLOPS from commit message body text — the agent types
         that, so the agent could fabricate numbers and have them accepted as
         "best". Now we independently execute the binary and parse its
-        KERNEL_RESULT stdout.
-
-        Cache key is the kernel binary's mtime (not kernel.cu's). The binary
-        is what we actually run, so its identity is what should drive cache
-        invalidation — recompile updates binary mtime, edit-without-recompile
-        leaves the cache valid (the new source isn't being executed yet).
+        KERNEL_RESULT stdout. Result cached per kernel.cu mtime so callers
+        within the same iteration don't re-run the kernel.
         """
         import json, re
         ws_abs = str(self.workspace_path.resolve())
         kernel_path = self.workspace_path / "kernel"
+        cu_path = self.workspace_path / "kernel.cu"
         cache_path = self.workspace_path / ".measured_tflops"
 
-        if not kernel_path.exists():
+        if not kernel_path.exists() or not cu_path.exists():
             return 0.0
 
-        bin_mtime = kernel_path.stat().st_mtime
+        cu_mtime = cu_path.stat().st_mtime
         if cache_path.exists():
             try:
                 cached = json.loads(cache_path.read_text())
-                if cached.get("bin_mtime") == bin_mtime:
+                if cached.get("cu_mtime") == cu_mtime:
                     return float(cached.get("best_tflops", 0.0))
             except Exception:
                 pass
@@ -196,7 +193,7 @@ class CudaOrchestratorV2:
 
         if not kr:
             # Kernel timed out or didn't print — record 0 in cache.
-            cache_path.write_text(json.dumps({"bin_mtime": bin_mtime, "best_tflops": 0.0}))
+            cache_path.write_text(json.dumps({"cu_mtime": cu_mtime, "best_tflops": 0.0}))
             return 0.0
 
         if ref:
@@ -209,7 +206,7 @@ class CudaOrchestratorV2:
         else:
             best = float(max(kr.values()))
 
-        cache_path.write_text(json.dumps({"bin_mtime": bin_mtime, "best_tflops": best}))
+        cache_path.write_text(json.dumps({"cu_mtime": cu_mtime, "best_tflops": best}))
         return best
 
     def _get_baseline_tflops(self) -> float:

@@ -1,0 +1,122 @@
+# ferret task spec — Sparse FP8 MLA Decode for DeepSeek V3.2 / V4 (V32 layout)
+
+name: fp8-mla-decode-dsv4
+gpu: B200
+arch: sm_100a
+precision: FP8
+
+problem:
+  description: |
+    Sparse FP8 Multi-head Latent Attention DECODE for DeepSeek V3.2 / V4 (V32),
+    matching the kernel vLLM dispatches at runtime via
+    flash_mla.flash_mla_with_kvcache(..., is_fp8_kvcache=True, indices=...).
+
+    The reference kernel for this shape is FlashMLA at
+        csrc/sm100/decode/head64/kernel.cuh
+    instantiated with ModelType::V32. See sparse_decode.h:Decode_Sm100_Head64_Impl
+    (h_q=64) and Decode_Sm100_Head64x2_Impl (h_q=128, calls head64 twice).
+
+    Shapes per config (s_q=2 for V3.2 MTP, h_kv=1, d_qk=576, d_v=512):
+      Q:           [b, s_q, h_q, d_qk]     bf16
+      K cache:     [num_blocks, page_block_size, 1, 656 bytes]   FP8 packed (V32)
+                       per token: 512 fp8_e4m3 NoPE
+                                + 16 bytes (4 fp32 scales, each per 128-elem NoPE chunk)
+                                + 128 bytes (64 bf16 RoPE, unquantized)
+      indices:     [b, s_q, topk]          int32 (global token id in paged KV)
+      Out:         [b, s_q, h_q, d_v]      bf16
+      LSE:         [b, s_q, h_q]           fp32
+      sm_scale:    d_qk ** -0.55           (FlashMLA test convention)
+
+    Sparse: each query attends to exactly `topk` tokens selected by `indices`.
+    Production: topk = 2048, s_kv = 32768.
+
+    FP8 KV layout details (from FlashMLA flash_mla/flash_mla_interface.py docstring
+    and tests/quant.py:quantize_k_cache):
+      - First 512 bytes: 512 fp8_e4m3 NoPE values
+      - Next 16 bytes:   4 float32 scales (one per 128-element NoPE chunk)
+      - Last 128 bytes:  64 bf16 RoPE values
+      - num_heads_k must be 1 (MLA collapses KV heads via latent projection)
+
+  shapes:
+    HEAD_DIM_QK: 576
+    HEAD_DIM_V:  512
+    D_NOPE:      512
+    D_ROPE:      64
+    NUM_SCALES_PER_TOKEN: 4
+    QUANT_TILE_SIZE: 128
+    NUM_KV_HEADS: 1
+    PAGE_BLOCK_SIZE: 64
+
+baseline:
+  source: "FlashMLA flash_mla.flash_mla_with_kvcache(is_fp8_kvcache=True, indices=...) — run: python3 baselines/fp8-mla-decode-dsv4/baseline_dsv4_decode.py"
+  reference_commit: "FlashMLA 7166110 (prepare for open source release, 2026-03-30). Source in resources/flashmla-main/ (identical kernel files). Built copy at /home/xinhaoc/mirage-cuda-agent/resources/flashmla-main/ used by baseline script."
+
+references:
+  # FlashMLA reference kernel — the one DSv4 actually dispatches to
+  - resources/flashmla-main/csrc/sm100/decode/head64/kernel.cuh
+  - resources/flashmla-main/csrc/sm100/decode/head64/config.h
+  - resources/flashmla-main/csrc/api/sparse_decode.h
+  - resources/flashmla-main/csrc/params.h
+  - resources/flashmla-main/csrc/helpers.h
+  # FP8 KV layout reference (V32_FP8Sparse = DSv4 layout)
+  - resources/flashmla-main/tests/quant.py
+  # CUTLASS Blackwell tcgen05 FP8 examples
+  - resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm
+  # Prior verified FP8 tcgen05 + block_scale work (1.05-1.21x beat DG on DSv3 decode shapes)
+  - examples/fp8-group-gemm/v007_dsv3_decode_verified_105.cu
+
+configs:
+  - name: b2_h64
+    args: { B: 2, H_Q: 64, S_Q: 2, S_KV: 32768, TOPK: 2048, D_QK: 576, D_V: 512 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: b64_h64
+    args: { B: 64, H_Q: 64, S_Q: 2, S_KV: 32768, TOPK: 2048, D_QK: 576, D_V: 512 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: b128_h64
+    args: { B: 128, H_Q: 64, S_Q: 2, S_KV: 32768, TOPK: 2048, D_QK: 576, D_V: 512 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: b2_h128
+    args: { B: 2, H_Q: 128, S_Q: 2, S_KV: 32768, TOPK: 2048, D_QK: 576, D_V: 512 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: b64_h128
+    args: { B: 64, H_Q: 128, S_Q: 2, S_KV: 32768, TOPK: 2048, D_QK: 576, D_V: 512 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: b128_h128
+    args: { B: 128, H_Q: 128, S_Q: 2, S_KV: 32768, TOPK: 2048, D_QK: 576, D_V: 512 }
+    target_ratio: 1.20
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.50
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only. 2-CTA clusters NOT supported on this build."
+  - "FP8 e4m3 KV cache input, BF16 query/output, FP32 LSE accumulator."
+  - "KV cache layout MUST match FlashMLA V32 format exactly: per-token 656 bytes structured as 512 fp8_e4m3 NoPE + 16 bytes (4 fp32 scales for 4 chunks of 128 NoPE values) + 128 bytes (64 bf16 RoPE, unquantized). See tests/quant.py:quantize_k_cache for the V32_FP8Sparse case. Do NOT change this layout — the kernel's input format must be a drop-in replacement for FlashMLA."
+  - "Sparse attention required: each query attends to exactly `topk` tokens selected by per-query `indices[b, s_q, topk]` (int32, global token id = page_block_idx * page_block_size + offset_in_block). Page block size = 64."
+  - "sm_scale = d_qk ** -0.55 (FlashMLA test convention, NOT the standard d_qk^-0.5)."
+  - "TFLOPS measured over REAL FLOPs = 2 * H_Q * (B * S_Q * TOPK) * (D_QK + D_V), the FlashMLA-defined formula in tests/lib.py:count_flop_and_mem_vol_for_decode. NOT padded."
+  - "Output must match a host/GPU reference within max relative error < 1e-2."
+  - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include a reference comparison (CPU reference on a tiny sub-config, OR a slow GPU reference kernel on the same data, OR call FlashMLA via subprocess) and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). DO NOT remove this guard."
+  - "MANDATORY L2 FLUSH: your kernel benchmark MUST flush a 128 MB buffer (cudaMemset on a 128MB device buffer) immediately before each timed iteration. The FlashMLA baseline does this — comparison without matching flush is invalid. In real inference, attention + layernorm + other ops evict L2 between attention calls; the flush mirrors that. Reported TFLOPS must be median across NI per-iteration measurements (each iteration: flush, record start, kernel launch, record stop, sync), NOT a single batch event-pair around all iterations. Example pattern in baselines/fp8-mla-decode-dsv4/baseline_dsv4_decode.py."
+  - "Use tcgen05.mma.kind::f8f6f4 or kind::mxf8f6f4.block_scale for the QK^T and PV GEMMs. Software dequant + bf16 MMA is allowed for correctness baselines but unlikely to beat FlashMLA which uses hardware FP8 MMA. See examples/fp8-group-gemm/v007_dsv3_decode_verified_105.cu for a verified tcgen05 + block_scale pattern."
+
+hints: []
+
+budget:
+  max_iterations: 80
+  max_wall_minutes: 240
+
+output:
+  result_format: kernel_result_json
+  result_keys: [b2_h64, b64_h64, b128_h64, b2_h128, b64_h128, b128_h128]

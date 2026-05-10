@@ -176,8 +176,10 @@ class CudaOrchestratorV2:
             except Exception:
                 pass
 
-        # Hard 60s cap so runaway iter counts can't lock up scoring.
-        run_cmd = f"cd {ws_abs} && timeout 60 ./kernel 2>&1 | grep '^KERNEL_RESULT' | tail -2"
+        # Hard 180s cap so runaway iter counts can't lock up scoring. 60s is
+        # too tight — even a "normal" kernel with 8 configs + ref-implementation
+        # validation per config can need 90-120s end-to-end.
+        run_cmd = f"cd {ws_abs} && timeout 180 ./kernel 2>&1 | grep '^KERNEL_RESULT' | tail -2"
         out, _, _ = await self.sh(run_cmd)
 
         def parse(prefix):

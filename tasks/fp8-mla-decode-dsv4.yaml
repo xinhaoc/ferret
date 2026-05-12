@@ -79,24 +79,11 @@ references:
   - examples/fp8-group-gemm/v007_dsv3_decode_verified_105.cu
 
 configs:
-  # V4-Flash: h_q=64, CSA top-k = 512
-  - name: b2_v4flash
-    args: { B: 2,   H_Q: 64,  S_Q: 2, H_KV: 1, S_KV: 16384, TOPK: 128, EXTRA_S_K: 16384, EXTRA_TOPK: 512,  D_QK: 512, D_V: 512, BLOCK_SIZE: 256, EXTRA_BLOCK_SIZE: 64 }
-    target_ratio: 1.20
-    weight: 1.0
-  - name: b64_v4flash
-    args: { B: 64,  H_Q: 64,  S_Q: 2, H_KV: 1, S_KV: 16384, TOPK: 128, EXTRA_S_K: 16384, EXTRA_TOPK: 512,  D_QK: 512, D_V: 512, BLOCK_SIZE: 256, EXTRA_BLOCK_SIZE: 64 }
-    target_ratio: 1.20
-    weight: 1.0
-  - name: b128_v4flash
-    args: { B: 128, H_Q: 64,  S_Q: 2, H_KV: 1, S_KV: 16384, TOPK: 128, EXTRA_S_K: 16384, EXTRA_TOPK: 512,  D_QK: 512, D_V: 512, BLOCK_SIZE: 256, EXTRA_BLOCK_SIZE: 64 }
-    target_ratio: 1.20
-    weight: 1.0
-  # V4-Pro: h_q=128, CSA top-k = 1024
-  - name: b2_v4pro
-    args: { B: 2,   H_Q: 128, S_Q: 2, H_KV: 1, S_KV: 16384, TOPK: 128, EXTRA_S_K: 16384, EXTRA_TOPK: 1024, D_QK: 512, D_V: 512, BLOCK_SIZE: 256, EXTRA_BLOCK_SIZE: 64 }
-    target_ratio: 1.20
-    weight: 1.0
+  # NARROWED FOCUS: only the two production-shape configs where v033 still
+  # underperforms FlashMLA. The four other configs (b2_v4flash, b64_v4flash,
+  # b128_v4flash, b2_v4pro) already reach ≥0.97x at v033 and are dropped here
+  # to let the agent specialize on the hard ones. v033 is saved at
+  # examples/fp8-mla-decode-dsv4/v033_partial_match_785.cu for reference.
   - name: b64_v4pro
     args: { B: 64,  H_Q: 128, S_Q: 2, H_KV: 1, S_KV: 16384, TOPK: 128, EXTRA_S_K: 16384, EXTRA_TOPK: 1024, D_QK: 512, D_V: 512, BLOCK_SIZE: 256, EXTRA_BLOCK_SIZE: 64 }
     target_ratio: 1.20
@@ -136,4 +123,4 @@ budget:
 
 output:
   result_format: kernel_result_json
-  result_keys: [b2_v4flash, b64_v4flash, b128_v4flash, b2_v4pro, b64_v4pro, b128_v4pro]
+  result_keys: [b64_v4pro, b128_v4pro]

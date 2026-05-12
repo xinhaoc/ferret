@@ -1,4 +1,4 @@
-# ferret task spec — Sparse FP8 MLA Decode for DeepSeek V3.2 / V4 (V32 layout)
+# ferret task spec — Sparse FP8 MLA Decode for DeepSeek V4 (MODEL1 layout)
 
 name: fp8-mla-decode-dsv4
 gpu: B200
@@ -7,87 +7,102 @@ precision: FP8
 
 problem:
   description: |
-    Sparse FP8 Multi-head Latent Attention DECODE for DeepSeek V3.2 / V4 (V32),
-    matching the kernel vLLM dispatches at runtime via
-    flash_mla.flash_mla_with_kvcache(..., is_fp8_kvcache=True, indices=...).
+    Sparse FP8 Multi-head Latent Attention DECODE for DeepSeek V4
+    (V3.2 is a DIFFERENT layout — see WARNING below).
 
-    The reference kernel for this shape is FlashMLA at
+    The reference kernel for V4 is FlashMLA
         csrc/sm100/decode/head64/kernel.cuh
-    instantiated with ModelType::V32. See sparse_decode.h:Decode_Sm100_Head64_Impl
-    (h_q=64) and Decode_Sm100_Head64x2_Impl (h_q=128, calls head64 twice).
+    instantiated with **ModelType::MODEL1** (NOT V32). The MODEL1 enum is
+    the generic name FlashMLA gave to the V4 layout when open-sourcing
+    before V4's public release.
 
-    Shapes per config (s_q=2 for V3.2 MTP, h_kv=1, d_qk=576, d_v=512):
-      Q:           [b, s_q, h_q, d_qk]     bf16
-      K cache:     [num_blocks, page_block_size, 1, 656 bytes]   FP8 packed (V32)
-                       per token: 512 fp8_e4m3 NoPE
-                                + 16 bytes (4 fp32 scales, each per 128-elem NoPE chunk)
-                                + 128 bytes (64 bf16 RoPE, unquantized)
-      indices:     [b, s_q, topk]          int32 (global token id in paged KV)
-      Out:         [b, s_q, h_q, d_v]      bf16
-      LSE:         [b, s_q, h_q]           fp32
-      sm_scale:    d_qk ** -0.55           (FlashMLA test convention)
+    ── WARNING ──────────────────────────────────────────────────────────
+    Do NOT use ModelType::V32. That's DeepSeek V3.2 with different
+    dimensions (d_qk=576, 656 bytes/token, 4 scales/token, V_HAVE_ROPE=false).
+    V4 (MODEL1) has d_qk=512, 584 bytes/token, 8 scales/token,
+    V_HAVE_ROPE=true. See resources/flashmla-main/csrc/sm100/decode/head64/
+    config.h for the per-ModelType constants.
+    ─────────────────────────────────────────────────────────────────────
 
-    Sparse: each query attends to exactly `topk` tokens selected by `indices`.
-    Production: topk = 2048, s_kv = 32768.
+    Per V4 paper §2.3.1 (Compressed Sparse Attention, CSA):
+      - Token-level compressor: every m=4 KV tokens collapsed to 1
+        compressed entry (using Eq 9-12 in paper).
+      - Lightning indexer: scores all compressed entries vs query, picks
+        top-k. V4-Flash top-k=512, V4-Pro top-k=1024. (This indexer is
+        a SEPARATE kernel — DeepGEMM fp8_fp4_paged_mqa_logits — not what
+        we're benchmarking here.)
+      - Core attention: shared-K/V MQA over (top-k CSA entries + SWA
+        window) using a compressed KV entry as BOTH key AND value.
+        d_qk = d_v = c = 512 (Eq 18-19, paper §2.3.1).
+      - Additional SWA branch: n_win=128 recent uncompressed tokens
+        merged into the same attention call (paper §2.3.3).
+      - Partial RoPE: last 64 dims of queries / KV entries / output
+        (paper §2.3.3, RoPE applied in-place on the last 64 of c=512).
 
-    FP8 KV layout details (from FlashMLA flash_mla/flash_mla_interface.py docstring
-    and tests/quant.py:quantize_k_cache):
-      - First 512 bytes: 512 fp8_e4m3 NoPE values
-      - Next 16 bytes:   4 float32 scales (one per 128-element NoPE chunk)
-      - Last 128 bytes:  64 bf16 RoPE values
-      - num_heads_k must be 1 (MLA collapses KV heads via latent projection)
+    This task targets ONLY the core attention kernel of CSA, matching
+    what vLLM's deepseek_v4_attention.py:898 calls via
+    flash_mla_with_kvcache(is_fp8_kvcache=True, indices=...,
+    extra_k_cache=..., extra_indices_in_kvcache=...).
 
   shapes:
-    HEAD_DIM_QK: 576
+    HEAD_DIM_QK: 512
     HEAD_DIM_V:  512
-    D_NOPE:      512
+    D_NOPE:      448
     D_ROPE:      64
-    NUM_SCALES_PER_TOKEN: 4
-    QUANT_TILE_SIZE: 128
-    NUM_KV_HEADS: 1
-    PAGE_BLOCK_SIZE: 64
+    NUM_SCALES_PER_TOKEN: 8
+    QUANT_TILE_SIZE: 64
+    NUM_KV_HEADS: 1            # MQA: one shared K/V head
+    V_HAS_ROPE: true           # V uses full 512 dims (including RoPE), unlike V32
+    MAIN_PAGE_BLOCK_SIZE: 256  # SWA cache page block
+    EXTRA_PAGE_BLOCK_SIZE: 64  # CSA compressed pool page block
+    TOPK_MAIN: 128             # SWA window size (n_win=128)
+    TOPK_EXTRA_FLASH: 512      # V4-Flash CSA top-k
+    TOPK_EXTRA_PRO: 1024       # V4-Pro CSA top-k
 
 baseline:
-  source: "FlashMLA flash_mla.flash_mla_with_kvcache(is_fp8_kvcache=True, indices=...) — run: python3 baselines/fp8-mla-decode-dsv4/baseline_dsv4_decode.py"
+  source: "FlashMLA flash_mla.flash_mla_with_kvcache(is_fp8_kvcache=True, indices=..., extra_k_cache=..., extra_indices_in_kvcache=...) — run: python3 baselines/fp8-mla-decode-dsv4/baseline_dsv4_decode.py"
   reference_commit: "FlashMLA 7166110 (prepare for open source release, 2026-03-30). Source in resources/flashmla-main/ (identical kernel files). Built copy at /home/xinhaoc/mirage-cuda-agent/resources/flashmla-main/ used by baseline script."
 
 references:
-  # FlashMLA reference kernel — the one DSv4 actually dispatches to
+  # FlashMLA reference kernel — instantiated with MODEL1 for V4
   - resources/flashmla-main/csrc/sm100/decode/head64/kernel.cuh
   - resources/flashmla-main/csrc/sm100/decode/head64/config.h
+  - resources/flashmla-main/csrc/sm100/decode/head64/instantiations/model1.cu
   - resources/flashmla-main/csrc/api/sparse_decode.h
   - resources/flashmla-main/csrc/params.h
   - resources/flashmla-main/csrc/sm100/helpers.h
-  # FP8 KV layout reference (V32_FP8Sparse = DSv4 layout)
+  # FP8 KV layout reference (MODEL1_FP8Sparse = V4 layout, NOT V32_FP8Sparse)
   - resources/flashmla-main/tests/quant.py
   # CUTLASS Blackwell tcgen05 FP8 examples
   - resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm
-  # Prior verified FP8 tcgen05 + block_scale work (1.05-1.21x beat DG on DSv3 decode shapes)
+  # Prior verified FP8 tcgen05 + block_scale work (DSv3 grouped GEMM)
   - examples/fp8-group-gemm/v007_dsv3_decode_verified_105.cu
 
 configs:
-  - name: b2_h64
-    args: { B: 2, H_Q: 64, S_Q: 2, S_KV: 32768, TOPK: 2048, D_QK: 576, D_V: 512 }
+  # V4-Flash: h_q=64, CSA top-k = 512
+  - name: b2_v4flash
+    args: { B: 2,   H_Q: 64,  S_Q: 2, H_KV: 1, S_KV: 16384, TOPK: 128, EXTRA_S_K: 16384, EXTRA_TOPK: 512,  D_QK: 512, D_V: 512, BLOCK_SIZE: 256, EXTRA_BLOCK_SIZE: 64 }
     target_ratio: 1.20
     weight: 1.0
-  - name: b64_h64
-    args: { B: 64, H_Q: 64, S_Q: 2, S_KV: 32768, TOPK: 2048, D_QK: 576, D_V: 512 }
+  - name: b64_v4flash
+    args: { B: 64,  H_Q: 64,  S_Q: 2, H_KV: 1, S_KV: 16384, TOPK: 128, EXTRA_S_K: 16384, EXTRA_TOPK: 512,  D_QK: 512, D_V: 512, BLOCK_SIZE: 256, EXTRA_BLOCK_SIZE: 64 }
     target_ratio: 1.20
     weight: 1.0
-  - name: b128_h64
-    args: { B: 128, H_Q: 64, S_Q: 2, S_KV: 32768, TOPK: 2048, D_QK: 576, D_V: 512 }
+  - name: b128_v4flash
+    args: { B: 128, H_Q: 64,  S_Q: 2, H_KV: 1, S_KV: 16384, TOPK: 128, EXTRA_S_K: 16384, EXTRA_TOPK: 512,  D_QK: 512, D_V: 512, BLOCK_SIZE: 256, EXTRA_BLOCK_SIZE: 64 }
     target_ratio: 1.20
     weight: 1.0
-  - name: b2_h128
-    args: { B: 2, H_Q: 128, S_Q: 2, S_KV: 32768, TOPK: 2048, D_QK: 576, D_V: 512 }
+  # V4-Pro: h_q=128, CSA top-k = 1024
+  - name: b2_v4pro
+    args: { B: 2,   H_Q: 128, S_Q: 2, H_KV: 1, S_KV: 16384, TOPK: 128, EXTRA_S_K: 16384, EXTRA_TOPK: 1024, D_QK: 512, D_V: 512, BLOCK_SIZE: 256, EXTRA_BLOCK_SIZE: 64 }
     target_ratio: 1.20
     weight: 1.0
-  - name: b64_h128
-    args: { B: 64, H_Q: 128, S_Q: 2, S_KV: 32768, TOPK: 2048, D_QK: 576, D_V: 512 }
+  - name: b64_v4pro
+    args: { B: 64,  H_Q: 128, S_Q: 2, H_KV: 1, S_KV: 16384, TOPK: 128, EXTRA_S_K: 16384, EXTRA_TOPK: 1024, D_QK: 512, D_V: 512, BLOCK_SIZE: 256, EXTRA_BLOCK_SIZE: 64 }
     target_ratio: 1.20
     weight: 1.0
-  - name: b128_h128
-    args: { B: 128, H_Q: 128, S_Q: 2, S_KV: 32768, TOPK: 2048, D_QK: 576, D_V: 512 }
+  - name: b128_v4pro
+    args: { B: 128, H_Q: 128, S_Q: 2, H_KV: 1, S_KV: 16384, TOPK: 128, EXTRA_S_K: 16384, EXTRA_TOPK: 1024, D_QK: 512, D_V: 512, BLOCK_SIZE: 256, EXTRA_BLOCK_SIZE: 64 }
     target_ratio: 1.20
     weight: 1.0
 
@@ -102,14 +117,15 @@ constraints:
   - "No CUDA graphs."
   - "cta_group::1 only. 2-CTA clusters NOT supported on this build."
   - "FP8 e4m3 KV cache input, BF16 query/output, FP32 LSE accumulator."
-  - "KV cache layout MUST match FlashMLA V32 format exactly: per-token 656 bytes structured as 512 fp8_e4m3 NoPE + 16 bytes (4 fp32 scales for 4 chunks of 128 NoPE values) + 128 bytes (64 bf16 RoPE, unquantized). See tests/quant.py:quantize_k_cache for the V32_FP8Sparse case. Do NOT change this layout — the kernel's input format must be a drop-in replacement for FlashMLA."
-  - "Sparse attention required: each query attends to exactly `topk` tokens selected by per-query `indices[b, s_q, topk]` (int32, global token id = page_block_idx * page_block_size + offset_in_block). Page block size = 64."
+  - "KV cache layout MUST match FlashMLA MODEL1 (V4) format EXACTLY: per-token 584 bytes structured as 448 fp8_e4m3 NoPE + 64 bf16 RoPE + 7 e8m0 scale factors (one per 64-element NoPE chunk) + 1 byte pad. See resources/flashmla-main/tests/quant.py:quantize_k_cache for the MODEL1_FP8Sparse case. DO NOT use the V32 layout (656 bytes/tok, 4 scales) — that's V3.2 and will FAIL correctness against the reference."
+  - "Value uses the FULL 512 dims (V_HAVE_ROPE=true in MODEL1, unlike V32 where V uses only the 512 NoPE dims). The same compressed KV entry serves as BOTH attention key and value per V4 paper §2.3.1 Eq 18-19."
+  - "Two KV caches required: a MAIN cache (the SWA window, page block size = 256) with `indices` of length topk=128, AND an EXTRA cache (the CSA-compressed pool, page block size = 64) with `extra_indices_in_kvcache` of length extra_topk ∈ {512, 1024}. This dual-cache structure is what vLLM passes (deepseek_v4_attention.py:898). Your kernel must attend to BOTH index sets."
   - "sm_scale = d_qk ** -0.55 (FlashMLA test convention, NOT the standard d_qk^-0.5)."
-  - "TFLOPS measured over REAL FLOPs = 2 * H_Q * (B * S_Q * TOPK) * (D_QK + D_V), the FlashMLA-defined formula in tests/lib.py:count_flop_and_mem_vol_for_decode. NOT padded."
+  - "TFLOPS measured over REAL FLOPs = 2 * H_Q * (B * S_Q * (TOPK + EXTRA_TOPK)) * (D_QK + D_V), the FlashMLA-defined formula in tests/lib.py:count_flop_and_mem_vol_for_decode. Sums attended tokens across BOTH the main and extra index sets. NOT padded."
   - "Output must match a host/GPU reference within max relative error < 1e-2."
   - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include a reference comparison (CPU reference on a tiny sub-config, OR a slow GPU reference kernel on the same data, OR call FlashMLA via subprocess) and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). DO NOT remove this guard."
-  - "MANDATORY L2 FLUSH: your kernel benchmark MUST flush a 128 MB buffer (cudaMemset on a 128MB device buffer) immediately before each timed iteration. The FlashMLA baseline does this — comparison without matching flush is invalid. In real inference, attention + layernorm + other ops evict L2 between attention calls; the flush mirrors that. Reported TFLOPS must be median across NI per-iteration measurements (each iteration: flush, record start, kernel launch, record stop, sync), NOT a single batch event-pair around all iterations. Example pattern in baselines/fp8-mla-decode-dsv4/baseline_dsv4_decode.py."
-  - "Use tcgen05.mma.kind::f8f6f4 or kind::mxf8f6f4.block_scale for the QK^T and PV GEMMs. Software dequant + bf16 MMA is allowed for correctness baselines but unlikely to beat FlashMLA which uses hardware FP8 MMA. See examples/fp8-group-gemm/v007_dsv3_decode_verified_105.cu for a verified tcgen05 + block_scale pattern."
+  - "MANDATORY L2 FLUSH: your kernel benchmark MUST flush a 128 MB buffer (cudaMemset on a 128MB device buffer) immediately before each timed iteration. The FlashMLA baseline does this — comparison without matching flush is invalid. Reported TFLOPS must be median across NI per-iteration measurements (each iteration: flush, record start, kernel launch, record stop, sync), NOT a single batch event-pair around all iterations. Example pattern in baselines/fp8-mla-decode-dsv4/baseline_dsv4_decode.py."
+  - "Use tcgen05 MMA. FlashMLA itself uses BF16 MMA on dequantized FP8 KV (config.h: SM100_MMA_F16BF16_WS_*). Hardware FP8 MMA (kind::f8f6f4 or kind::mxf8f6f4.block_scale) is allowed but NOT required to match FlashMLA's compute pattern — the reference does the dequant→BF16 path. See examples/fp8-group-gemm/v007_dsv3_decode_verified_105.cu for a hardware FP8 MMA pattern if you want it."
 
 hints: []
 
@@ -119,4 +135,4 @@ budget:
 
 output:
   result_format: kernel_result_json
-  result_keys: [b2_h64, b64_h64, b128_h64, b2_h128, b64_h128, b128_h128]
+  result_keys: [b2_v4flash, b64_v4flash, b128_v4flash, b2_v4pro, b64_v4pro, b128_v4pro]

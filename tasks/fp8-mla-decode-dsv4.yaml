@@ -113,6 +113,7 @@ stage_gate:
   strict: false
 
 constraints:
+  - "Your kernel.cu may NOT link against, #include, call, or otherwise invoke any compute kernel from FlashMLA's source tree. This includes (but is not limited to): sm100::decode::head64::run_flash_splitkv_mla_fp8_sparse_kernel, sm100::fwd_for_small_topk::head128::run_fwd_for_small_topk_phase1_kernel, smxx::decode::run_flash_mla_combine_kernel, smxx::decode::run_get_decoding_sched_meta_kernel, and any other function in the sm100::, sm90::, or smxx:: namespaces from resources/flashmla-main/csrc/. You may #include resources/flashmla-main/csrc/params.h (for the SparseAttnDecodeParams struct definition only) but you may NOT link against the compiled FlashMLA library. All FP8/BF16 attention compute (FP8 dequant, QK^T, softmax, PV, output projection) must be implemented as __device__ or __global__ code WITHIN kernel.cu (or other .cu/.cuh files you commit to workspace/). Failure → INVALID (parsed as 0.0 TFLOPS, regardless of correctness). This constraint exists because previous iterations of the agent wrapped FlashMLA's kernel and reported the resulting measurement-overhead-gap as a 1.15x win — that is not a kernel optimization. You must WRITE the kernel, not call it. Reading FlashMLA's source code via read_reference() to learn the architecture is permitted and encouraged."
   - "Single CUDA stream only."
   - "No CUDA graphs."
   - "cta_group::1 only. 2-CTA clusters NOT supported on this build."

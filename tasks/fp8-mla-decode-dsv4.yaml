@@ -115,7 +115,30 @@ constraints:
   - "MANDATORY L2 FLUSH: your kernel benchmark MUST flush a 128 MB buffer (cudaMemset on a 128MB device buffer) immediately before each timed iteration. The FlashMLA baseline does this — comparison without matching flush is invalid. Reported TFLOPS must be median across NI per-iteration measurements (each iteration: flush, record start, kernel launch, record stop, sync), NOT a single batch event-pair around all iterations. Example pattern in baselines/fp8-mla-decode-dsv4/baseline_dsv4_decode.py."
   - "Use tcgen05 MMA. FlashMLA itself uses BF16 MMA on dequantized FP8 KV (config.h: SM100_MMA_F16BF16_WS_*). Hardware FP8 MMA (kind::f8f6f4 or kind::mxf8f6f4.block_scale) is allowed but NOT required to match FlashMLA's compute pattern — the reference does the dequant→BF16 path. See examples/fp8-group-gemm/v007_dsv3_decode_verified_105.cu for a hardware FP8 MMA pattern if you want it."
 
-hints: []
+hints:
+  - |
+    ARCHITECTURE HINT (specific to closing the gap on b64_v4pro / b128_v4pro):
+    Your current v033/v034 kernel uses THREE warpgroups
+    (WG0=softmax/epilogue, WG1=MMA/TMA/index, WG2=dequant — 384 threads).
+    FlashMLA's reference uses only TWO warpgroups
+    (resources/flashmla-main/csrc/sm100/decode/head64/kernel.cuh:134-440 —
+    WG0 is the Scale/Exp/softmax/epilogue warpgroup with reg_alloc<224>,
+    WG1 contains MMA + TMA + dequant + index loads via warp-level
+    specialization, e.g. `if (warp_idx == 4) { MMA warp; }` at line ~433
+    inside WG1 dispatches one specific warp to run MMA while the other
+    warps handle TMA loads / dequant work). This means FlashMLA's
+    dequant→MMA→softmax dependency chain crosses ONE WG boundary per tile
+    (WG1→WG0), whereas your kernel crosses TWO (WG2→WG1→WG0). On the
+    heavy shapes (b64_v4pro N_att≈1152 with 18 tiles per query, b128_v4pro
+    similar) those extra cross-WG barriers compound — your own NCU
+    profile flagged "barrier stalls dominate (~9.15 stall ratio)" which
+    matches this pattern. CONSIDER: collapse WG2's dequant work into
+    WG1 by dispatching dequant to specific warps inside WG1 (e.g. warps
+    0-3 for dequant, warp 4 for MMA, warp 5-7 for TMA load + index)
+    rather than as its own warpgroup. This matches FlashMLA's
+    warp-within-WG specialization pattern at kernel.cuh:135-440. Keep
+    your existing MMA atoms, NUM_BUFS=2, B_H=64, B_TOPK=64 — those are
+    structurally correct. Only the warpgroup partitioning needs to change.
 
 budget:
   max_iterations: 80

@@ -1,0 +1,128 @@
+# ferret task spec — Paged GQA Decode (Qwen3-30B-A3B shape)
+
+name: paged-gqa-decode-qwen3
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    Paged GQA attention for decode (Q_len=1), bf16, on B200.
+    Single request per launch. Causal mask is degenerate for Q_len=1
+    (only history attended).
+
+    Target model: Qwen3-30B-A3B per-rank shape under TP=4:
+      NUM_QO_HEADS=8, NUM_KV_HEADS=1 (GQA group = 8), HEAD_DIM=128
+      PAGE_SIZE=4096 (large page; one page covers seq≤4096)
+
+    Workload: Q_len=1 across 5 sequence lengths. KV-bandwidth-bound for
+    seq>=32k on B200; overhead-dominated at small seq.
+
+    Kernel signature (host-side):
+      Inputs (device pointers):
+        Q:                bf16 [Q_LEN, NUM_QO_HEADS, HEAD_DIM]  (Q_LEN=1)
+        paged_KV_cache:   bf16 [num_pages, 2, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM]
+                          (NHD layout, with [k_page; v_page] interleaved)
+        kv_indptr:        int32 [b+1]  (b=1 → length 2)
+        kv_indices:       int32 [num_pages_total]
+        kv_last_page_len: int32 [b]
+      Output:
+        Out: bf16 [Q_LEN, NUM_QO_HEADS, HEAD_DIM]
+      Scalar: sm_scale = 1/sqrt(HEAD_DIM)
+
+  shapes:
+    HEAD_DIM:       128
+    NUM_QO_HEADS:   8
+    NUM_KV_HEADS:   1
+    GQA_GROUP:      8
+    PAGE_SIZE:      4096
+    Q_LEN:          1
+
+baseline:
+  source: "FlashInfer BatchDecodeWithPagedKVCacheWrapper (use_tensor_cores=True) — run: python3 baselines/paged-gqa-decode-qwen3/baseline.py"
+  reference_commit: "flashinfer 0.6.8.post1"
+
+references:
+  # CUTLASS Blackwell tcgen05 + paged-KV-style example kernels
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
+  - resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm
+  # Prior verified Blackwell BF16 tcgen05 attention work (sparse decode v033)
+  - examples/fp8-mla-decode-dsv4/v033_partial_match_785.cu
+  # Prior verified tcgen05 + block_scale on grouped GEMM
+  - examples/fp8-group-gemm/v007_dsv3_decode_verified_105.cu
+  # FlashInfer source (for studying paged decode patterns — DO NOT LINK)
+  - resources/flashinfer-0.6.7.post3
+
+configs:
+  - name: seq128
+    args: { B: 1, Q_LEN: 1, SEQ_LEN: 128,    NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: seq512
+    args: { B: 1, Q_LEN: 1, SEQ_LEN: 512,    NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: seq4k
+    args: { B: 1, Q_LEN: 1, SEQ_LEN: 4096,   NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: seq32k
+    args: { B: 1, Q_LEN: 1, SEQ_LEN: 32768,  NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: seq128k
+    args: { B: 1, Q_LEN: 1, SEQ_LEN: 131072, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.50
+  strict: false
+
+constraints:
+  - "Single self-contained CUDA file kernel.cu that compiles standalone with: nvcc -arch=sm_100a -std=c++17 -O3 --expt-relaxed-constexpr -I resources/cutlass-4.4.2/include -o kernel kernel.cu -lcuda -lcudart. NO additional -l flags, NO external library links. The .cu MUST contain main() + fp32 reference + correctness check + benchmark + emit KERNEL_RESULT line."
+  - "Your kernel.cu may NOT link against, #include, or call FlashInfer's compiled kernels. You may READ FlashInfer's source via read_reference(resources/flashinfer-0.6.7.post3/...) to learn paged-decode patterns but you must IMPLEMENT the kernel yourself. Failure → INVALID."
+  - "Single CUDA stream only. No CUDA graphs."
+  - "cta_group::1 only. 2-CTA clusters NOT supported on this build."
+  - "BF16 input Q + bf16 KV cache, BF16 output. FP32 accumulator inside softmax/MMA."
+  - "KV cache layout MUST be NHD: shape [num_pages, 2, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM] where the second dim is [K_page; V_page]. Match FlashInfer's BatchDecodeWithPagedKVCacheWrapper(workspace, 'NHD') layout exactly so the kernel can be a drop-in replacement."
+  - "Indexing: paged_kv_indptr is int32 [b+1]; for a single request kv_indptr=[0, num_pages]. paged_kv_indices is int32 array of length num_pages giving the global page id of each logical page. last_page_len is int32 [b] giving the number of valid tokens in the final page (in [1, PAGE_SIZE])."
+  - "sm_scale = 1.0 / sqrt(HEAD_DIM) = 1.0/sqrt(128). NO additional log2 conversion needed beyond what the agent's softmax requires."
+  - "Causal mask: Q_LEN=1 so causal is degenerate — attend to ALL valid history tokens [0, SEQ_LEN). When generalizing later, q_token i would attend to positions [0, SEQ_LEN - Q_LEN + 1 + i] but that is not required for this Q_LEN=1 task."
+  - "TFLOPS measured over REAL FLOPs = 4 * NUM_QO_HEADS * SEQ_LEN * HEAD_DIM (QK^T term: 2*N_h*S*D + softmax·V term: 2*N_h*D*S). NOT padded."
+  - "Output must match fp32 reference within max relative error < 1e-2 AND max absolute error < 1.0 AND mean absolute error < 1e-2. The fp32 reference is computed in the same kernel.cu binary (after CPU build of K/V table from the same paged data the kernel reads)."
+  - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include a reference comparison (fp32 reference run on CPU OR on a slow GPU reference kernel on the same data) and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). DO NOT remove this guard."
+  - "MANDATORY L2 FLUSH: your kernel benchmark MUST flush a 128 MB buffer (cudaMemset on a 128MB device buffer) immediately before each timed iteration. The FlashInfer baseline does this — comparison without matching flush is invalid. In real inference, attention + layernorm + other ops evict L2 between attention calls; the flush mirrors that. Reported TFLOPS must be median across NI per-iteration measurements (each iteration: flush, record start, kernel launch, record stop, sync), NOT a single batch event-pair around all iterations. Use NI >= 100. Example pattern in baselines/paged-gqa-decode-qwen3/baseline.py."
+  - "Use tcgen05 MMA. For BF16 inputs use SM100_MMA_F16BF16_* atoms. The QK^T and PV GEMMs benefit from warp-specialization at long sequence lengths (seq>=32k). See examples/fp8-mla-decode-dsv4/v033_partial_match_785.cu for a verified 3-warpgroup warp-specialized BF16 tcgen05 attention skeleton on B200 — adapt the dequant-free version since this task does NOT use FP8."
+  - "Focus optimization on the long-sequence bandwidth-bound regime (seq32k, seq128k). At seq=131072 the KV read alone is 67 MB; B200 HBM is ~3 TB/s peak. FlashInfer baseline hits ~1.15 TB/s (38% of peak) on this shape. Going beyond requires deep pipelining + multi-buffered TMA loads."
+
+hints:
+  - |
+    Workload characterization:
+      seq=128:    KV = 2KB     → tiny, dominated by launch overhead. FlashInfer = 12 us.
+      seq=512:   KV = 8KB     → still launch-bound. FlashInfer = 16 us.
+      seq=4096:  KV = 64KB    → fits in L2. FlashInfer = 49 us (43 GB/s).
+      seq=32768: KV = 512KB   → spills L2, hits HBM. FlashInfer = 54 us (309 GB/s).
+      seq=131072:KV = 8 MB    → fully HBM-bound. FlashInfer = 58 us (1149 GB/s).
+
+    Key insight: the bandwidth-bound regime is what matters for the 1.20× target.
+    At Q=1 with 8 QO heads / 1 KV head, this is small-Q decode. Use:
+      - Split-KV: divide the seq_len across multiple CTAs (each does a partial
+        result, then a combine kernel produces the final output).
+      - Multi-buffered TMA loads with NUM_BUFS=2-4 to hide HBM latency.
+      - Warp-specialized layout: producer warps do TMA gather, consumer warps
+        do tcgen05 MMA + softmax.
+
+    For the short-seq configs (128, 512, 4k), launch overhead dominates the
+    FlashInfer baseline. A leaner kernel (less plan/setup work, fewer kernel
+    launches) can beat FlashInfer there even at lower nominal BW utilization.
+
+budget:
+  max_iterations: 80
+  max_wall_minutes: 240
+
+output:
+  result_format: kernel_result_json
+  result_keys: [seq128, seq512, seq4k, seq32k, seq128k]

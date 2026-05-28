@@ -29,10 +29,11 @@ NUM_KV_HEADS = 1
 HEAD_DIM = 128
 PAGE_SIZE = 4096
 FLUSH_BYTES = 128 * 1024 * 1024
-NI = 100
+NI = 300              # was 100 — more samples for tighter median
+WARMUP_SEC = 2.0      # ramp clocks to steady state then measure-while-hot
 
 # Q=1 decode shapes across seq_len axis
-SEQ_LENS = [128, 512, 4096, 32768, 131072]
+SEQ_LENS = [128, 512, 4096, 32768]   # seq128k removed per user instruction
 
 
 def bench(seq_len, ni=NI):
@@ -63,8 +64,12 @@ def bench(seq_len, ni=NI):
         q_data_type=DTYPE, kv_data_type=DTYPE,
     )
 
-    # Warmup
-    for _ in range(10):
+    # Warmup — run continuously for WARMUP_SEC to ramp GPU clocks to steady
+    # state. Without this, the first iterations measure rising clocks. With
+    # cooldown, the clocks decay before measurement. So: warm-and-measure-hot.
+    import time
+    t0 = time.time()
+    while time.time() - t0 < WARMUP_SEC:
         out = wrapper.run(q, kv_cache)
     torch.cuda.synchronize()
 

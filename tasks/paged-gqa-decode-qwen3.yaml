@@ -70,10 +70,8 @@ configs:
     args: { B: 1, Q_LEN: 1, SEQ_LEN: 32768,  NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
     target_ratio: 1.20
     weight: 1.0
-  - name: seq128k
-    args: { B: 1, Q_LEN: 1, SEQ_LEN: 131072, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
-    target_ratio: 1.20
-    weight: 1.0
+  # NOTE: seq128k removed — deep KV-bandwidth regime where the v007 attempt
+  # plateaued at ~0.52x of FlashInfer. Set aside per user instruction.
 
 scoring: min_ratio
 
@@ -125,4 +123,4 @@ budget:
 
 output:
   result_format: kernel_result_json
-  result_keys: [seq128, seq512, seq4k, seq32k, seq128k]
+  result_keys: [seq128, seq512, seq4k, seq32k]

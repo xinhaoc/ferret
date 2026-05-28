@@ -1,0 +1,268 @@
+# ferret task — UNIFIED Paged GQA for Qwen3-30B-A3B
+# One kernel handles Q in {1,2,3,4} x seq in {128, 512, 4k, 32k}.
+# Three already-verified specialized kernels exist; this task is to FUSE them
+# into a single binary that matches each at its sweet spot.
+
+name: paged-gqa-fused-qwen3
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    Unified paged GQA attention for Qwen3-30B-A3B (TP=4 per-rank shape).
+    Single kernel.cu binary handles ALL 16 configs:
+      Q_LEN in {1, 2, 3, 4}  x  SEQ_LEN in {128, 512, 4096, 32768}
+
+    Three already-verified specialized kernels exist (saved as artifacts):
+      (A) examples/paged-gqa-decode-qwen3/v012_q1_seq4k_2x.cu
+          — Q=1 paged decode. 2-launch (main + combine_kernel_q1).
+            Wins 2.18x vs FlashInfer at seq=4k, ties at seq=128/512/32k.
+      (B) examples/paged-gqa-multitoken-qwen3/v007_q234_seq4k_2x.cu
+          — Q=2/3/4 multi-token. 2-launch (main + combine_kernel_mt) with
+            split-KV across CTAs and SEPARATE combine kernel. Wins 2-3x at
+            seq=4k, loses at seq=128 (0.74-0.90x) and seq=32k (0.56-0.78x).
+      (C) Workspace v009 (NOT saved as artifact yet — agent should
+          re-derive)  — Q=2/3/4 single-launch FUSED atomic-combine version.
+          Wins 1.27-1.41x at seq=128. CORRECTNESS BREAKS at seq>=32k
+          when ns = (seq + kvc - 1) / kvc reaches 4096+ splits.
+
+    A naive "use v009 everywhere" approach was empirically tested and FAILED:
+      - q1_seq4k: 100us (vs v012's 21us — 5x slower; v009's atomic combine
+        is heavier than v012's dedicated combine for Q=1)
+      - q*_seq32k: CORRECTNESS FAILURE (mre=136-1033) — atomic combine
+        breaks at ns >= 4096 splits
+      - q[234]_seq4k: 100-120us (vs v007's 27-36us — 3-4x slower)
+
+    So a true fused kernel needs runtime dispatch INSIDE the kernel.cu file:
+      if (q_len == 1 && seq_len > 256)        path A (v012 design)
+      elif (seq_len >= 8192)                   path B (v007: separate combine)
+      else                                     path C (v009: atomic combine)
+    OR, equivalently, three separate __global__ kernels in the same file
+    dispatched from the host wrapper based on (q_len, seq_len).
+
+    The constraint is one binary (single kernel.cu), one stream, and matching
+    or beating each specialized kernel at its sweet spot. You are NOT
+    required to invent a single monolithic kernel — multiple __global__
+    functions in the same .cu file dispatched at host-side is acceptable.
+
+    Target model: Qwen3-30B-A3B per-rank shape under TP=4:
+      NUM_QO_HEADS=8, NUM_KV_HEADS=1 (GQA group = 8), HEAD_DIM=128
+      PAGE_SIZE=4096
+
+    Causal mask among query tokens (Q>1 only): query token i attends to KV
+    positions [0, SEQ_LEN - Q_LEN + 1 + i). Query 0 sees fewest, query Q-1
+    sees all SEQ_LEN positions.
+
+    Kernel signature (host-side):
+      Inputs (device pointers):
+        Q:                bf16 [Q_LEN, NUM_QO_HEADS, HEAD_DIM]
+        paged_KV_cache:   bf16 [num_pages, 2, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM]
+                          (NHD layout, [K_page; V_page] interleaved)
+        qo_indptr:        int32 [b+1]  (for b=1, [0, Q_LEN])
+        kv_indptr:        int32 [b+1]  (for b=1, [0, num_pages])
+        kv_indices:       int32 [num_pages_total]
+        kv_last_page_len: int32 [b]
+      Output:
+        Out: bf16 [Q_LEN, NUM_QO_HEADS, HEAD_DIM]
+      Scalar: sm_scale = 1/sqrt(HEAD_DIM)
+
+  shapes:
+    HEAD_DIM:       128
+    NUM_QO_HEADS:   8
+    NUM_KV_HEADS:   1
+    GQA_GROUP:      8
+    PAGE_SIZE:      4096
+
+baseline:
+  source: "FlashInfer paged GQA — Q=1 uses BatchDecodeWithPagedKVCacheWrapper(use_tensor_cores=True), Q>1 uses BatchPrefillWithPagedKVCacheWrapper(causal=True). Run: python3 baselines/paged-gqa-fused-qwen3/baseline.py"
+  reference_commit: "flashinfer 0.6.8.post1"
+
+references:
+  # Saved Q=1 architecture (path A in the dispatcher above)
+  - examples/paged-gqa-decode-qwen3/v012_q1_seq4k_2x.cu
+  # Saved Q=2/3/4 separate-combine architecture (path B) — winner at seq=4k
+  - examples/paged-gqa-multitoken-qwen3/v007_q234_seq4k_2x.cu
+  # Saved Q=2/3/4 single-launch fused atomic-combine (path C) — winner at seq=128
+  - examples/paged-gqa-multitoken-qwen3/v009_q234_atomic_combine_seq128_1.4x.cu
+  # CUTLASS Blackwell FMHA examples
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
+  - resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm
+  # Prior verified tcgen05 attention work
+  - examples/fp8-mla-decode-dsv4/v033_partial_match_785.cu
+  # FlashInfer source — study both decode and prefill paths
+  - resources/flashinfer-0.6.7.post3
+
+configs:
+  # Target ratios match what the specialized kernels independently measure.
+  # The fused kernel must NOT regress below these at each config.
+  # min_ratio scoring — the worst config drags the score, forcing the
+  # agent to address ALL regimes, not just the easy wins.
+
+  # ===== Q=1 (decode wrapper) =====
+  - name: q1_seq128
+    args: { B: 1, Q_LEN: 1, SEQ_LEN: 128, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 0.85   # v012 ties FlashInfer here (launch-overhead floor)
+    weight: 1.0
+  - name: q1_seq512
+    args: { B: 1, Q_LEN: 1, SEQ_LEN: 512, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+  - name: q1_seq4k
+    args: { B: 1, Q_LEN: 1, SEQ_LEN: 4096, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.50   # v012 hits 2.18x here, easy headroom
+    weight: 1.0
+  - name: q1_seq32k
+    args: { B: 1, Q_LEN: 1, SEQ_LEN: 32768, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 0.85
+    weight: 1.0
+
+  # ===== Q=2 (prefill wrapper, causal) =====
+  - name: q2_seq128
+    args: { B: 1, Q_LEN: 2, SEQ_LEN: 128, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20   # workspace v009 hits 1.27x here
+    weight: 1.0
+  - name: q2_seq512
+    args: { B: 1, Q_LEN: 2, SEQ_LEN: 512, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+  - name: q2_seq4k
+    args: { B: 1, Q_LEN: 2, SEQ_LEN: 4096, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.50   # v007 hits 2x here
+    weight: 1.0
+  - name: q2_seq32k
+    args: { B: 1, Q_LEN: 2, SEQ_LEN: 32768, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 0.50   # v007 loses 0.56x here (bandwidth-bound)
+    weight: 1.0
+
+  # ===== Q=3 (prefill wrapper, causal) =====
+  - name: q3_seq128
+    args: { B: 1, Q_LEN: 3, SEQ_LEN: 128, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.30   # v009 hits 1.41x here
+    weight: 1.0
+  - name: q3_seq512
+    args: { B: 1, Q_LEN: 3, SEQ_LEN: 512, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+  - name: q3_seq4k
+    args: { B: 1, Q_LEN: 3, SEQ_LEN: 4096, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.50   # v007 hits 3x here
+    weight: 1.0
+  - name: q3_seq32k
+    args: { B: 1, Q_LEN: 3, SEQ_LEN: 32768, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 0.50
+    weight: 1.0
+
+  # ===== Q=4 (prefill wrapper, causal) =====
+  - name: q4_seq128
+    args: { B: 1, Q_LEN: 4, SEQ_LEN: 128, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.30   # v009 hits 1.35x here
+    weight: 1.0
+  - name: q4_seq512
+    args: { B: 1, Q_LEN: 4, SEQ_LEN: 512, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.00
+    weight: 1.0
+  - name: q4_seq4k
+    args: { B: 1, Q_LEN: 4, SEQ_LEN: 4096, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.50   # v007 hits 3x here
+    weight: 1.0
+  - name: q4_seq32k
+    args: { B: 1, Q_LEN: 4, SEQ_LEN: 32768, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 0.50
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.40
+  strict: false
+
+constraints:
+  - "Single self-contained CUDA file kernel.cu that compiles standalone with: nvcc -arch=sm_100a -std=c++17 -O3 --expt-relaxed-constexpr -I resources/cutlass-4.4.2/include -o kernel kernel.cu -lcuda -lcudart. NO additional -l flags, NO external library links. The .cu MUST contain main() + fp32 reference + correctness check + benchmark + emit KERNEL_RESULT line for ALL 16 configs."
+  - "Your kernel.cu may NOT link against, #include, or call FlashInfer's compiled kernels. You MAY read FlashInfer source via read_reference(resources/flashinfer-0.6.7.post3/...) but must IMPLEMENT the kernel yourself. Failure → INVALID."
+  - "Single CUDA stream only. No CUDA graphs. No graph capture tricks."
+  - "cta_group::1 only. 2-CTA clusters NOT supported on this build."
+  - "BF16 input Q + bf16 KV cache, BF16 output. FP32 accumulator inside softmax/MMA."
+  - "KV cache layout MUST be NHD: shape [num_pages, 2, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM] where the second dim is [K_page; V_page]. Match the saved Q=1 and Q=2/3/4 artifacts exactly."
+  - "qo_indptr is int32 [b+1]; for b=1 with Q_LEN=k, qo_indptr=[0, k]. The kernel must support ALL Q_LEN in {1, 2, 3, 4}."
+  - "CAUSAL MASK among query tokens (Q>1 only): query i (0-indexed) attends to KV positions [0, SEQ_LEN - Q_LEN + 1 + i). Earlier queries see fewer cache positions. The kernel MUST apply this mask correctly — incorrect causal mask is INVALID even if numerics pass on data that happens not to expose the bug. Use distinct values per KV position in your test data so a mask bug shows up in mean_rel_err."
+  - "sm_scale = 1.0 / sqrt(HEAD_DIM) = 1.0/sqrt(128)."
+  - "TFLOPS measured over REAL causal FLOPs. For Q>1: flops = 4 * NUM_QO_HEADS * HEAD_DIM * Q * (SEQ_LEN - (Q-1)/2). For Q=1: flops = 4 * NUM_QO_HEADS * HEAD_DIM * SEQ_LEN. Do NOT count work for masked positions."
+  - "Output must match fp32 reference within max relative error < 1e-2 AND max absolute error < 1.0 AND mean absolute error < 1e-2. The fp32 reference is computed in the same kernel.cu binary."
+  - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include a reference comparison and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). DO NOT remove this guard. ALL 16 configs MUST pass correctness — including seq=32k for all Q values. A previously-attempted atomic-combine architecture (v009-style) failed correctness at seq=32k with mre=136-1033; this is the failure mode you MUST avoid. If seq>=8192 you likely need the SEPARATE combine kernel architecture (v007-style) to maintain precision across many splits."
+  - "MANDATORY L2 FLUSH: kernel benchmark MUST flush a 128 MB buffer (cudaMemset on a 128MB device buffer) immediately before each timed iteration. Reported TFLOPS must be median across NI per-iteration measurements. Use NI >= 300. Use a continuous warmup of >= 2.0 seconds (loop until 2 seconds elapsed) BEFORE the timed loop, to ramp GPU clocks to steady state. See baselines/paged-gqa-fused-qwen3/baseline.py for the exact methodology."
+  - "Reuse the EXACT same benchmark harness shape (cudaMemset flush, 2-sec warmup, 300-iter median, sorted median) as baselines/paged-gqa-fused-qwen3/baseline.py. Mismatched measurement methodology gives false ratios."
+
+hints:
+  - |
+    Empirical baseline numbers (FlashInfer, B200, measured 2026-05-28):
+      q1_seq128: ~11us   q1_seq512: ~13us   q1_seq4k: ~47us   q1_seq32k: ~57us
+      q2_seq128: ~16us   q2_seq512: ~21us   q2_seq4k: ~56us   q2_seq32k: ~57us
+      q3_seq128: ~16us   q3_seq512: ~21us   q3_seq4k: ~87us   q3_seq32k: ~64us
+      q4_seq128: ~16us   q4_seq512: ~22us   q4_seq4k: ~87us   q4_seq32k: ~91us
+
+    Specialized-kernel reference numbers (saved artifacts):
+      v012 (Q=1 only):   seq128: 13us  seq512: 13us  seq4k: 22us  seq32k: 56us
+      v007 (Q=2/3/4):    seq128: 17us  seq512: 25us  seq4k: 27us  seq32k: 102us
+      v009 (Q=2/3/4 fused at seq=128): seq128: 12us  (FAILS at seq>=32k)
+
+    Suggested kernel.cu structure (3 __global__ kernels + host dispatcher):
+      __global__ paged_gqa_q1_dual()       // v012 design — Q=1 only
+      __global__ paged_gqa_mt_split()      // v007 design — main split-KV pass
+      __global__ paged_gqa_mt_combine()    // v007 design — separate combine
+      __global__ paged_gqa_mt_fused()      // v009 design — single-launch atomic combine
+
+      void paged_gqa_unified(...) {
+        int ns = (seq_len + KV_CHUNK - 1) / KV_CHUNK;
+        if (q_len == 1) {
+          launch q1_dual + combine_q1;
+        } else if (ns >= SPLIT_THRESHOLD) {  // e.g. seq >= ~4096
+          launch mt_split + mt_combine;
+        } else {
+          launch mt_fused;                   // small seq, few splits → atomic OK
+        }
+      }
+
+    The architecture choice matters because:
+      - v009's atomic combine is fast for ns <= 64 splits but breaks numerics
+        at ns >= 4096 (seq=32k with KV_CHUNK=8). Don't try to atomic-combine
+        across thousands of splits.
+      - v007's separate combine kernel is safe at any ns but has a 2nd launch
+        cost; only worth it when ns is large enough that the split work
+        dominates the extra launch.
+      - v012's Q=1 path uses a simpler combine because Q=1 means no causal
+        mask among query tokens and only 1 row of output per head.
+
+    For seq=512 (the middle regime), neither saved kernel was tuned. The agent
+    has freedom here to pick whichever path is faster, or to introduce a 4th
+    code path optimized for that range.
+
+    KV_CHUNK sizes used in saved artifacts:
+      v012 (Q=1):       kvc = 8
+      v007 (Q=2,3):     kvc = 64
+      v007 (Q=4):       kvc = 32
+      v009 (Q=2,3,4):   kvc = 8
+
+budget:
+  max_iterations: 100
+  max_wall_minutes: 300
+
+output:
+  result_format: kernel_result_json
+  result_keys:
+    - q1_seq128
+    - q1_seq512
+    - q1_seq4k
+    - q1_seq32k
+    - q2_seq128
+    - q2_seq512
+    - q2_seq4k
+    - q2_seq32k
+    - q3_seq128
+    - q3_seq512
+    - q3_seq4k
+    - q3_seq32k
+    - q4_seq128
+    - q4_seq512
+    - q4_seq4k
+    - q4_seq32k

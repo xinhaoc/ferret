@@ -70,16 +70,55 @@ references:
   - resources/flashinfer-0.6.7.post3
 
 configs:
-  - name: q2
-    args: { B: 1, Q_LEN: 2, SEQ_LEN: 4096, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+  # Q=2 across seq_len axis
+  - name: q2_seq128
+    args: { B: 1, Q_LEN: 2, SEQ_LEN: 128,   NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
     target_ratio: 1.20
     weight: 1.0
-  - name: q3
-    args: { B: 1, Q_LEN: 3, SEQ_LEN: 4096, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+  - name: q2_seq512
+    args: { B: 1, Q_LEN: 2, SEQ_LEN: 512,   NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
     target_ratio: 1.20
     weight: 1.0
-  - name: q4
-    args: { B: 1, Q_LEN: 4, SEQ_LEN: 4096, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+  - name: q2_seq4k
+    args: { B: 1, Q_LEN: 2, SEQ_LEN: 4096,  NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: q2_seq32k
+    args: { B: 1, Q_LEN: 2, SEQ_LEN: 32768, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  # Q=3 across seq_len axis
+  - name: q3_seq128
+    args: { B: 1, Q_LEN: 3, SEQ_LEN: 128,   NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: q3_seq512
+    args: { B: 1, Q_LEN: 3, SEQ_LEN: 512,   NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: q3_seq4k
+    args: { B: 1, Q_LEN: 3, SEQ_LEN: 4096,  NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: q3_seq32k
+    args: { B: 1, Q_LEN: 3, SEQ_LEN: 32768, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  # Q=4 across seq_len axis
+  - name: q4_seq128
+    args: { B: 1, Q_LEN: 4, SEQ_LEN: 128,   NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: q4_seq512
+    args: { B: 1, Q_LEN: 4, SEQ_LEN: 512,   NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: q4_seq4k
+    args: { B: 1, Q_LEN: 4, SEQ_LEN: 4096,  NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: q4_seq32k
+    args: { B: 1, Q_LEN: 4, SEQ_LEN: 32768, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
     target_ratio: 1.20
     weight: 1.0
 
@@ -139,4 +178,4 @@ budget:
 
 output:
   result_format: kernel_result_json
-  result_keys: [q2, q3, q4]
+  result_keys: [q2_seq128, q2_seq512, q2_seq4k, q2_seq32k, q3_seq128, q3_seq512, q3_seq4k, q3_seq32k, q4_seq128, q4_seq512, q4_seq4k, q4_seq32k]

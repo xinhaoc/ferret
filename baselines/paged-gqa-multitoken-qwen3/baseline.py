@@ -37,13 +37,23 @@ FLUSH_BYTES = 128 * 1024 * 1024
 NI = 300
 WARMUP_SEC = 2.0
 
-# Q in {2, 3, 4} at fixed seq_len = 4096 (the seq where the Q=1 kernel
-# had its clearest win — good test for whether the architecture generalizes).
+# Q in {2, 3, 4} crossed with seq_len in {128, 512, 4096, 32768}.
+# Tests the multi-token kernel across both the overhead-dominated regime
+# (small seq) and the bandwidth-bound regime (long seq).
 CONFIGS = [
-    # (name,    Q_LEN, SEQ_LEN)
-    ("q2",      2,     4096),
-    ("q3",      3,     4096),
-    ("q4",      4,     4096),
+    # (name,        Q_LEN, SEQ_LEN)
+    ("q2_seq128",   2,     128),
+    ("q2_seq512",   2,     512),
+    ("q2_seq4k",    2,     4096),
+    ("q2_seq32k",   2,     32768),
+    ("q3_seq128",   3,     128),
+    ("q3_seq512",   3,     512),
+    ("q3_seq4k",    3,     4096),
+    ("q3_seq32k",   3,     32768),
+    ("q4_seq128",   4,     128),
+    ("q4_seq512",   4,     512),
+    ("q4_seq4k",    4,     4096),
+    ("q4_seq32k",   4,     32768),
 ]
 
 

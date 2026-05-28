@@ -17,11 +17,24 @@ Thumbs.db
 
 # Agent runtime state (per-run, not source)
 workspace/
+workspace[0-9]/
+workspace[0-9][0-9]/
 *.log
 cache_trace.jsonl
 tool_calls.jsonl
 conversation.jsonl
 file_reads.json
+
+# Shared machine-level knowledge for Claude-Code subagents — populated at
+# runtime by the memory-keeper agent. Not source. (The tracked template
+# lives in docs/dev-memory-seed/ and is copied into here by cc-init.sh.)
+docs/dev-memory/
+
+# Claude Code runtime artefacts. The committed subagents live in
+# .claude/agents/, so we ignore everything else under .claude/.
+.claude/*
+!.claude/agents/
+.claude/agents/*.lock
 
 # Build artifacts
 *.cubin

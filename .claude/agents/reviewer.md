@@ -98,6 +98,38 @@ delegate to `memory-keeper` with the category (`machine` / `quirks` /
 `tips`) and the one-paragraph fact. Do not edit `docs/dev-memory/`
 yourself.
 
+### 5. Convergence — extract Mirage-ready `kernel.cuh`
+
+Run this check **only after** steps 1–3 finished:
+
+```bash
+PYTHONPATH=$(dirname $FERRET_ROOT) python3 -m ferret.state \
+    "$FERRET_WORKSPACE" "$FERRET_WORKSPACE/task.yaml" 2>&1 | tee /tmp/state.out
+grep -E "advance\?.*True" /tmp/state.out >/dev/null && echo CONVERGED
+grep -vE "✓|target_ratio|stage|score|advance|RunState|per-config|----" /tmp/state.out \
+    | grep -E "%.*\(target" | grep -v "✓" | grep -q . && echo "INCOMPLETE: missing ✓"
+```
+
+If `CONVERGED` AND no `INCOMPLETE` row AND the API check above was
+`PASS` or `NOT VERIFIED` (NOT `FAIL`):
+
+- Invoke `Task(subagent_type=kernel-extractor, prompt='Extract
+  $FERRET_WORKSPACE/kernel.cu into a Mirage-ready kernel.cuh. Tag
+  source: <this tag>. Mirage target task header lives under
+  $MIRAGE_ROOT/include/mirage/persistent_kernel/tasks/<gpu_family>/
+  — pick a sibling that matches our task family.')`.
+- Record the extractor's reply (extracted path, sibling used,
+  signature) in your Review block under a `convergence:` line.
+
+If `CONVERGED` but API check returned `FAIL`: do **not** invoke
+extractor. Record "convergence blocked on API alignment — fix
+kernel.cu signature first" and flag it for the mainthread. The
+kernel-extractor refuses on API FAIL anyway, but we'd waste a Task
+call by trying.
+
+If the run has not converged yet: skip step 5 entirely. Extraction
+only runs at the final tag.
+
 ## Output — append to `progress.md`
 
 Use `Edit` exactly once. Find the end of file marker and append:
@@ -110,6 +142,10 @@ Use `Edit` exactly once. Find the end of file marker and append:
 - **Output keys:** <PASS | FAIL — missing X>
 - **Constraints:** <PASS | violations: ...>
 - **Iterator follow-through:** <summary or n/a>
+- **Convergence:** <not converged yet | converged — kernel-extractor
+                  wrote $FERRET_WORKSPACE/kernel.cuh from sibling
+                  <sibling.cuh> | converged but extractor skipped
+                  due to <reason>>
 - **Blockers for next iteration:** <list, or "none">
 - **Notes:** <any longer remarks; keep ≤ 80 words>
 ```
@@ -124,11 +160,12 @@ proceed or to address blockers before its next change.
   You only edit `progress.md`.
 - **Never edit `task.yaml`.** It's the spec; not yours to revise.
 - **Never edit `docs/dev-memory/`.** Use `memory-keeper`.
-- **`Task` restricted.** Your `tools:` list includes `Task` only so you
-  can call `codex-dispatcher` (for API verification) and
-  `memory-keeper` (for new host facts). Do not invoke `iterator`,
-  `planner`, `profiler`, or `reviewer` (yourself) — those are the
-  mainthread's to invoke.
+- **`Task` restricted.** Your `tools:` list includes `Task` so you can
+  call `codex-dispatcher` (for API verification), `memory-keeper`
+  (for new host facts), and **at convergence** `kernel-extractor`
+  (for `.cu` → `.cuh` extraction; see step 5). Do not invoke
+  `iterator`, `planner`, `profiler`, or `reviewer` (yourself) — those
+  are the mainthread's to invoke.
 - **One review per tag.** If you've already reviewed this tag (look
   for an existing `## Review (post-tag <tag>) — ...` heading in
   `progress.md`), refuse — duplicate reviews waste tokens.

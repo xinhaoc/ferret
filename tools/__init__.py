@@ -1,11 +1,16 @@
-"""Code tools for the CUDA agent — no LLM calls, pure shell commands + parsing."""
+"""ferret tools — pure helpers (no LLM calls).
 
-from .compiler import Compiler, CompileResult
-from .profiler import ProfileMetrics, extract_kernel_names
-from .doc_loader import DocLoader
+Only ncu parsing lives here now. The previous Compiler / DocLoader helpers
+were tied to the API-driven motus orchestrator path and have been removed
+in favour of the Claude-Code mainthread invoking nvcc / Read / Grep tools
+directly.
+"""
+
+from .profiler import ProfileMetrics, extract_kernel_names, parse_ncu_csv, QUICK_METRICS
 
 __all__ = [
-    "Compiler", "CompileResult",
-    "ProfileMetrics", "extract_kernel_names",
-    "DocLoader",
+    "ProfileMetrics",
+    "extract_kernel_names",
+    "parse_ncu_csv",
+    "QUICK_METRICS",
 ]

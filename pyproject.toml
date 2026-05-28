@@ -1,14 +1,15 @@
 [project]
 name = "ferret"
-version = "0.1.0"
-description = "Autonomous CUDA kernel optimization agent with structured task specs and per-config scoring"
+version = "0.2.0"
+description = "Autonomous CUDA kernel optimization agent — Claude Code mainthread + scoped subagents (planner / iterator / profiler / reviewer / codex-dispatcher / memory-keeper / kernel-extractor) operating on per-workspace .git histories."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "lithosai-motus>=0.2.0",
     "pyyaml>=6.0",
 ]
 
-# Note: ferret is currently run in place (python -m ferret.main ...) rather
-# than installed. A src/ferret/ restructure is future work; until then this
-# file declares metadata + deps but is not a buildable distribution.
+# ferret runs in place: each workspace is driven by a Claude Code mainthread
+# launched via scripts/cc-run.sh. There is no Python entry point that drives
+# the agent loop anymore; ferret.{state,profile,task_spec,cc_goal} are pure
+# helper modules invoked by the subagents through Bash. Future work: src/
+# restructure + ship as an installable package.

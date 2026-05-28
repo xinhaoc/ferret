@@ -65,6 +65,7 @@ It prints `stage`, `score`, per-config ratios, and `worst_config`.
 | OPTIMIZE stage, want a profile | `profiler` | One workspace per call. Reads `.profile_last.json` automatically. |
 | Reviewer needs Mirage-API check | `reviewer` calls `codex-dispatcher` itself — you don't invoke it directly |
 | Discovered host-level fact | `memory-keeper` | Pass `{category, fact}` — never edit `docs/dev-memory/` yourself |
+| Goal reached (convergence) | `kernel-extractor` is called automatically by `reviewer` after the last tag; you don't invoke it directly | You read `$FERRET_WORKSPACE/kernel.cuh` after to confirm |
 
 **You never call `codex-dispatcher` or `memory-keeper` directly.** They
 are invoked only via `reviewer`. Calling them from the mainthread
@@ -75,6 +76,7 @@ bypasses the audit trail and confuses the review record.
 | Path | Writer | You may read? |
 |------|--------|---------------|
 | `$FERRET_WORKSPACE/kernel.cu` | **You** | yes |
+| `$FERRET_WORKSPACE/kernel.cuh` | `kernel-extractor` ONLY (at convergence, triggered by reviewer) | yes |
 | `$FERRET_WORKSPACE/progress.md` | You + `reviewer` (the reviewer appends `## Review (post-tag ...)` blocks) | yes |
 | `$FERRET_WORKSPACE/.git/...` | You (commits + tags) | yes |
 | `$FERRET_WORKSPACE/.profile_last.json` | `ferret.profile` CLI (via `profiler` subagent) | yes |
@@ -170,6 +172,61 @@ These go into the commit body (the orchestrator parses them).
   SAME GPU (one `pick_gpu.sh` invocation per benchmark run).
 - Always `eval $(./pick_gpu.sh)` first.
 
+## 6.5. Loop discipline — the ONLY thing that should stop you
+
+You are an autonomous optimization agent. You must keep iterating until
+**one** of the following is true:
+
+- The task's stage gate is met AND every config hits its own
+  `target_ratio` (i.e. `python3 -m ferret.state $FERRET_WORKSPACE
+  $FERRET_WORKSPACE/task.yaml` reports `advance? True` and every per-config
+  row shows the ✓ marker). This is "goal reached".
+- The user explicitly tells you to stop.
+- A hard, unrecoverable error (out of disk, GPU offline) that you
+  cannot fix by changing the kernel. Document the error in
+  `progress.md` first.
+- You have just spent **6 consecutive iterations** with the same
+  `worst_config` and the same `score` (to 3 decimal places). At that
+  point write a `## Stall (iter N)` block into `progress.md` summarizing
+  what you tried and what's left, then keep going on a fundamentally
+  different approach — do NOT stop, just pivot.
+
+**Forbidden stop reasons:**
+
+- "This is hard, let me come back later" — implement now or move the
+  idea into `## Untried (Hard)` with a one-line concrete reason
+  (specific TMEM lane bug, specific compile error you don't yet
+  understand). Vague "this is complex" lines are not allowed.
+- "I've made good progress, the user can take it from here" — no. You
+  do not get to declare done. The state CLI declares done.
+- "Let me summarize what I've done so far" mid-session, then stop. The
+  reviewer is your summarization channel. Do not narrate; iterate.
+- "I'll wait for the user to confirm before continuing" — autonomous
+  mode. Do not stall on confirmations the spec already gives you.
+
+**Between iterations** (after `git tag` + reviewer returns):
+
+1. Re-run the state CLI. Did `score` go up?
+2. If yes and goal not reached → call iterator, plan next change.
+3. If no and you're under 6 same-score iterations → call iterator
+   asking for a different direction than the last two attempts.
+4. If yes and goal reached → run state CLI one more time as proof,
+   then call the reviewer (it will invoke `kernel-extractor` to
+   produce the Mirage-ready `kernel.cuh`), append a final
+   `## Goal reached at <tag>` block to progress.md, exit cleanly.
+
+**Deliverable at convergence:** two files live in the workspace once
+the run is done — `kernel.cu` (the standalone benchmark artifact, what
+you tagged) and `kernel.cuh` (Mirage-ready device function header,
+written by `kernel-extractor` via the reviewer). The mirage-side
+dispatcher consumes `kernel.cuh` directly. Do NOT write `kernel.cuh`
+yourself — let the extractor do it after the reviewer triggers it.
+
+You may receive a standing goal via `/goal` (Claude Code slash command)
+or `--append-system-prompt` (set by `cc-run.sh --goal`). Treat that goal
+as the contract; do not stop until it is met or a stop condition above
+fires.
+
 ## 7. Forbidden patterns (from prompts.py — agent failure modes)
 
 - "complex to implement" / "multi-iteration project" / "next run
@@ -214,12 +271,14 @@ Do **not** read, copy from, or git-fetch from a sibling workspace.
   ThunderKittens, DeepGemm, FlashMLA). Don't try to be exhaustive —
   follow the trail your iterator/reviewer points at.
 
-## 10. The legacy motus path
+## 10. There is no other path
 
-`orchestrator.py`, `agents.py`, `main.py`, `prompts.py`, `cost_tracker.py`
-implement the previous API-driven loop. They are kept for parity but are
-not part of the Claude-Code mainthread path. Don't import from them and
-don't `python -m ferret.main` — that's the legacy entry point.
-
-The Claude-Code path is: `scripts/cc-init.sh` → `scripts/cc-run.sh` →
-this `CLAUDE.md` + the six subagents under `.claude/agents/`.
+Earlier versions of ferret had a motus / Anthropic-API loop driven by
+`orchestrator.py` + `agents.py` + `main.py` + `prompts.py` +
+`cost_tracker.py`. Those files were removed when this CLAUDE.md became
+the contract. The only entry point now is `scripts/cc-init.sh` →
+`scripts/cc-run.sh` → this CLAUDE.md + the seven subagents under
+`.claude/agents/` (planner, iterator, profiler, reviewer,
+codex-dispatcher, memory-keeper, kernel-extractor). If you see a
+reference to `python -m ferret.main` anywhere, it's stale — update or
+delete it.

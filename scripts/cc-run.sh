@@ -27,10 +27,12 @@ FERRET_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 PRINT_ONLY=0
 SEED_PROMPT=""
+GOAL_TEXT=""
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --prompt)      SEED_PROMPT="${2:-}"; shift 2 ;;
+        --goal)        GOAL_TEXT="${2:-}"; shift 2 ;;
         --print-only)  PRINT_ONLY=1; shift ;;
         -h|--help)
             sed -n '2,21p' "$0"; exit 0 ;;
@@ -111,17 +113,47 @@ echo
 
 cd "$FERRET_DIR"
 
+# ── Default standing goal (overridable via --goal "<text>") ───────────────
+# This is injected via --append-system-prompt so the mainthread sees it on
+# every turn — not just the first one. The goal also gets echoed as the
+# leading `/goal` line in the seed prompt for the slash-command channel.
+#
+# The default goal is rendered from task.yaml by ferret.cc_goal so it
+# contains the concrete SOTA name + per-config target ratios — not an
+# abstract "iterate until done". This gives the session-scoped Stop hook
+# (installed by /goal) a numerical success condition.
+if [[ -z "$GOAL_TEXT" ]]; then
+    if GOAL_TEXT=$(python3 -m ferret.cc_goal "$WS" --label "$FERRET_WORKSPACE" 2>/dev/null); then
+        : # rendered cleanly
+    else
+        # Fallback if cc_goal.py crashes for any reason — never block launch.
+        GOAL_TEXT="Drive $FERRET_WORKSPACE's task.yaml to completion. Iterate write → compile → benchmark → commit + tag → reviewer continuously until \`python3 -m ferret.state $FERRET_WORKSPACE $FERRET_WORKSPACE/task.yaml\` reports advance? True AND every per-config row shows the ✓ marker. See CLAUDE.md §6.5 for stop conditions."
+    fi
+fi
+EFFECTIVE_GOAL="$GOAL_TEXT"
+
+echo "goal                : $EFFECTIVE_GOAL"
+echo
+
+# Assemble the claude command. --append-system-prompt makes the goal
+# system-level (survives every iteration); we also prefix the seed with
+# /goal so the slash-command skill registers it where applicable.
+CLAUDE_ARGS=(
+    --append-system-prompt "STANDING GOAL: $EFFECTIVE_GOAL"
+)
+
 if [[ "$PRINT_ONLY" -eq 1 ]]; then
     if [[ -n "$SEED_PROMPT" ]]; then
-        echo "WOULD EXEC: claude -p \"$SEED_PROMPT\""
+        echo "WOULD EXEC: claude ${CLAUDE_ARGS[*]} -p \"/goal $EFFECTIVE_GOAL"$'\n\n'"$SEED_PROMPT\""
     else
-        echo "WOULD EXEC: claude"
+        echo "WOULD EXEC: claude ${CLAUDE_ARGS[*]}  (interactive)"
+        echo "  (will prompt mainthread to read CLAUDE.md and act on goal)"
     fi
     exit 0
 fi
 
 if [[ -n "$SEED_PROMPT" ]]; then
-    exec claude -p "$SEED_PROMPT"
+    exec claude "${CLAUDE_ARGS[@]}" -p "/goal $EFFECTIVE_GOAL"$'\n\n'"$SEED_PROMPT"
 else
-    exec claude
+    exec claude "${CLAUDE_ARGS[@]}"
 fi

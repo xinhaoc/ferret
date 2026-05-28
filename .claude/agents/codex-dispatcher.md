@@ -116,9 +116,13 @@ The reviewer invokes you with a prompt containing:
 - **Graceful degradation.** Never raise an error that aborts the
   mainthread. If Codex is unavailable, return the `codex_unavailable`
   status and let the reviewer record it.
-- **Short timeouts.** If `codex exec` runs longer than ~3 minutes,
-  abort with `{"status": "codex_timeout"}`. Mirage headers are small;
-  verification should be quick.
+- **Timeout.** If `codex exec` runs longer than **5 minutes** (300 s),
+  abort with `{"status": "codex_timeout"}`. Mirage headers are small,
+  but `codex` itself takes 20–40 s to boot, parse, and inspect — a
+  90 s cap can clip real verdicts. 300 s gives genuine room while
+  still preventing the mainthread from blocking forever. Use:
+  `timeout 300 codex exec ...` — do not rely on Codex's internal
+  timeout.
 - **Don't speak for Codex.** Just package, run, parse. If Codex says
   PASS but you noticed something, that's still PASS — the reviewer
   decides what to do with it.

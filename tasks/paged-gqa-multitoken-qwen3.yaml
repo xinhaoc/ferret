@@ -1,0 +1,142 @@
+# ferret task spec — Paged GQA Multi-Token Decode (Q=2/3/4) for Qwen3-30B-A3B
+
+name: paged-gqa-multitoken-qwen3
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    Paged GQA attention for MULTI-TOKEN decode (Q_len in {2, 3, 4}) on B200.
+    Multi-token / speculative-decode / MTP regime — small Q (2-4 tokens),
+    bf16, causal mask among query tokens.
+
+    Causal mask: query token i (0-indexed) attends to positions
+        [0, seq_len - Q_LEN + 1 + i)
+    i.e., query 0 sees seq_len - Q_LEN + 1 positions, query 1 sees one
+    more, ..., query Q_LEN-1 sees all seq_len positions.
+
+    Target model: Qwen3-30B-A3B per-rank shape under TP=4:
+      NUM_QO_HEADS=8, NUM_KV_HEADS=1 (GQA group = 8), HEAD_DIM=128
+      PAGE_SIZE=4096
+
+    Workload: Q in {2, 3, 4} at fixed seq_len=4096. This is the regime
+    where the Q=1 win artifact (examples/paged-gqa-decode-qwen3/
+    v012_q1_seq4k_2x.cu) may or may not generalize — Q>1 gives tensor
+    cores enough work to amortize their fixed setup cost, so FlashInfer's
+    FA2-via-prefill kernel becomes much more competitive.
+
+    Reference: examples/paged-gqa-decode-qwen3/v012_q1_seq4k_2x.cu has
+    the verified Q=1 architecture (CUDA-core, split-KV, SMEM-staged,
+    warp-per-head). Q>1 requires extending the kernel to handle multiple
+    query rows with a causal mask among them; the existing architecture
+    likely needs more work per query (more compute per CTA, possibly
+    tensor cores) to remain competitive.
+
+    Kernel signature (host-side):
+      Inputs (device pointers):
+        Q:                bf16 [Q_LEN, NUM_QO_HEADS, HEAD_DIM]
+        paged_KV_cache:   bf16 [num_pages, 2, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM]
+                          (NHD layout, with [K_page; V_page] interleaved)
+        qo_indptr:        int32 [b+1]  (for b=1, [0, Q_LEN])
+        kv_indptr:        int32 [b+1]  (for b=1, [0, num_pages])
+        kv_indices:       int32 [num_pages_total]
+        kv_last_page_len: int32 [b]
+      Output:
+        Out: bf16 [Q_LEN, NUM_QO_HEADS, HEAD_DIM]
+      Scalar: sm_scale = 1/sqrt(HEAD_DIM)
+
+  shapes:
+    HEAD_DIM:       128
+    NUM_QO_HEADS:   8
+    NUM_KV_HEADS:   1
+    GQA_GROUP:      8
+    PAGE_SIZE:      4096
+    SEQ_LEN_FIXED:  4096
+
+baseline:
+  source: "FlashInfer BatchPrefillWithPagedKVCacheWrapper (causal=True) — run: python3 baselines/paged-gqa-multitoken-qwen3/baseline.py"
+  reference_commit: "flashinfer 0.6.8.post1"
+
+references:
+  # The Q=1 verified architecture — best starting point for this task
+  - examples/paged-gqa-decode-qwen3/v012_q1_seq4k_2x.cu
+  # CUTLASS Blackwell FMHA examples
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
+  - resources/cutlass-4.4.2/examples/72_blackwell_narrow_precision_gemm
+  # Prior verified tcgen05 attention work
+  - examples/fp8-mla-decode-dsv4/v033_partial_match_785.cu
+  # FlashInfer source — study the prefill (Q>1) path
+  - resources/flashinfer-0.6.7.post3
+
+configs:
+  - name: q2
+    args: { B: 1, Q_LEN: 2, SEQ_LEN: 4096, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: q3
+    args: { B: 1, Q_LEN: 3, SEQ_LEN: 4096, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+  - name: q4
+    args: { B: 1, Q_LEN: 4, SEQ_LEN: 4096, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
+    target_ratio: 1.20
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.50
+  strict: false
+
+constraints:
+  - "Single self-contained CUDA file kernel.cu that compiles standalone with: nvcc -arch=sm_100a -std=c++17 -O3 --expt-relaxed-constexpr -I resources/cutlass-4.4.2/include -o kernel kernel.cu -lcuda -lcudart. NO additional -l flags, NO external library links. The .cu MUST contain main() + fp32 reference + correctness check + benchmark + emit KERNEL_RESULT line."
+  - "Your kernel.cu may NOT link against, #include, or call FlashInfer's compiled kernels. You may READ FlashInfer's source via read_reference(resources/flashinfer-0.6.7.post3/...) to learn paged-prefill patterns but you must IMPLEMENT the kernel yourself. Failure → INVALID."
+  - "Single CUDA stream only. No CUDA graphs."
+  - "cta_group::1 only. 2-CTA clusters NOT supported on this build."
+  - "BF16 input Q + bf16 KV cache, BF16 output. FP32 accumulator inside softmax/MMA."
+  - "KV cache layout MUST be NHD: shape [num_pages, 2, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM] where the second dim is [K_page; V_page]. Match the Q=1 task layout exactly."
+  - "qo_indptr is int32 [b+1]; for b=1 with Q_LEN=k, qo_indptr=[0, k]. The kernel must support arbitrary Q_LEN in {2, 3, 4}."
+  - "CAUSAL MASK among query tokens: query i (0-indexed) attends to KV positions [0, SEQ_LEN - Q_LEN + 1 + i). Earlier queries see fewer cache positions. The kernel MUST apply this mask correctly — incorrect causal mask is INVALID even if numerics pass on data that happens not to expose the bug."
+  - "sm_scale = 1.0 / sqrt(HEAD_DIM) = 1.0/sqrt(128)."
+  - "TFLOPS measured over REAL causal FLOPs:  flops = 4 * NUM_QO_HEADS * HEAD_DIM * sum_{i=0..Q-1}(SEQ_LEN - Q + 1 + i)  =  4 * NUM_QO_HEADS * HEAD_DIM * Q * (SEQ_LEN - (Q-1)/2). Do NOT count work for masked positions."
+  - "Output must match fp32 reference within max relative error < 1e-2 AND max absolute error < 1.0 AND mean absolute error < 1e-2. The fp32 reference is computed in the same kernel.cu binary."
+  - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include a reference comparison and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). DO NOT remove this guard. Validation MUST verify the causal mask was correctly applied — use distinct values per KV position so a mask bug shows up in mean_rel_err."
+  - "MANDATORY L2 FLUSH: your kernel benchmark MUST flush a 128 MB buffer (cudaMemset on a 128MB device buffer) immediately before each timed iteration. Reported TFLOPS must be median across NI per-iteration measurements. Use NI >= 300. Use a continuous warmup of >= 2.0 seconds (loop wrapper.run() until 2 seconds elapsed) BEFORE the timed loop, to ramp GPU clocks to steady state. See baselines/paged-gqa-multitoken-qwen3/baseline.py for the exact methodology."
+  - "Consider tcgen05 MMA for the QK^T and PV GEMMs at Q>1. At Q=1 (the prior task) tensor cores didn't pay off due to per-launch setup cost; at Q=2-4 the work per CTA is 2-4x larger and tensor cores may now amortize. See examples/fp8-mla-decode-dsv4/v033_partial_match_785.cu for a verified 3-warpgroup warp-specialized BF16 tcgen05 attention skeleton on B200. NOT REQUIRED — if a CUDA-core variant of v012 with causal-mask extension beats FlashInfer at these Q values, that is acceptable."
+
+hints:
+  - |
+    Reference baseline numbers (FlashInfer FA2 prefill at b=1, h=8, h_k=1,
+    head_dim=128, seq_len=4096, causal=True; measured 2026-05-28 on B200):
+      q2: 0.60 TFLOPS, 56 us, 37 GB/s
+      q3: 0.58 TFLOPS, 87 us, 24 GB/s   <- notice q3 and q4 take SAME time;
+      q4: 0.77 TFLOPS, 87 us, 24 GB/s     FlashInfer rounds Q up to MMA tile.
+
+    Key observation: FlashInfer's per-launch fixed cost ~50us (same as Q=1).
+    For q=2 the kernel adds only ~6us of useful work on top of that floor.
+    For q=3,4 there's a step to ~87us (likely a tile-size threshold).
+
+    The Q=1 architecture (v012) had no tcgen05 setup cost and got 25us at
+    seq=4k. Extending it to Q=2 with causal mask might still beat the
+    FA2 56us floor. At Q=3,4 the comparison is harder because:
+      (a) The agent's kernel must do Q times the QK^T work per CTA
+      (b) FlashInfer's TC kernel has more useful work per setup, amortizing
+          the 50us better
+
+    Suggested strategy:
+      - Start from v012 (paged-gqa-decode-qwen3/v012_q1_seq4k_2x.cu).
+      - Extend the per-CTA loop to handle Q query rows with causal mask
+        (each row sees a different number of valid positions).
+      - For Q=2 try the CUDA-core extension first.
+      - For Q=3, 4, consider tcgen05 MMA where the (Q, HEAD_DIM)x(HEAD_DIM, B_TOPK)
+        GEMM has enough work to fill an MMA atom (M=16, N=8, K=16 atom would fit
+        Q=2 with padding, larger Q amortizes better).
+
+budget:
+  max_iterations: 80
+  max_wall_minutes: 240
+
+output:
+  result_format: kernel_result_json
+  result_keys: [q2, q3, q4]

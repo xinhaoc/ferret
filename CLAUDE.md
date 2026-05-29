@@ -57,19 +57,25 @@ It prints `stage`, `score`, per-config ratios, and `worst_config`.
 
 ## 2. When to call which subagent
 
+**Orchestration rule (2026-05-29 redesign): the MAINTHREAD is the sole
+orchestrator. Subagents do NOT invoke other subagents** — nested subagent
+dispatch is unreliable (it silently failed in prior runs: the reviewer
+could never actually invoke codex-dispatcher/kernel-extractor, so the API
+check never ran and no kernel was ever delivered). YOU invoke every
+subagent and act on what it returns.
+
 | Trigger | Subagent | Call signature |
 |---------|---------|----------------|
 | Cold-start (workspace empty) | `planner` | `Task(subagent_type=planner, prompt="cold-start $FERRET_WORKSPACE")` |
 | Before each iteration's `Edit` | `iterator` | Pass it the state CLI output + last 3 commit bodies + worst config name |
-| After `git tag v###` or `a###` | `reviewer` | Pass tag name + iterator's last list (if any) |
+| After `git tag v###` or `a###` | `reviewer` | Pass tag name + iterator's last list (if any). The reviewer runs the Mirage-API check ITSELF via its Bash tool (`codex exec`, inlined — it no longer delegates to a codex-dispatcher subagent) and RETURNS a verdict block: API status, output/constraint checks, and a `FINALIZE?` flag. |
+| Reviewer's verdict says a new host fact emerged | `memory-keeper` | YOU invoke it: `Task(subagent_type=memory-keeper, prompt="{category, fact}")`. |
+| FINALIZE triggered (see §6.5) | `kernel-extractor` | YOU invoke it directly with the best tag + `best_effort` flag. Then read `$FERRET_WORKSPACE/kernel.cuh` to confirm delivery. |
 | OPTIMIZE stage, want a profile | `profiler` | One workspace per call. Reads `.profile_last.json` automatically. |
-| Reviewer needs Mirage-API check | `reviewer` calls `codex-dispatcher` itself — you don't invoke it directly |
-| Discovered host-level fact | `memory-keeper` | Pass `{category, fact}` — never edit `docs/dev-memory/` yourself |
-| Goal reached (convergence) | `kernel-extractor` is called automatically by `reviewer` after the last tag; you don't invoke it directly | You read `$FERRET_WORKSPACE/kernel.cuh` after to confirm |
 
-**You never call `codex-dispatcher` or `memory-keeper` directly.** They
-are invoked only via `reviewer`. Calling them from the mainthread
-bypasses the audit trail and confuses the review record.
+`codex-dispatcher.md` is retained only as a reference for the exact
+`codex exec` invocation the reviewer now runs inline; you never dispatch
+it as a subagent.
 
 ## 3. Files: who owns what
 
@@ -174,22 +180,43 @@ These go into the commit body (the orchestrator parses them).
 
 ## 6.5. Loop discipline — the ONLY thing that should stop you
 
-You are an autonomous optimization agent. You must keep iterating until
-**one** of the following is true:
+You are an autonomous optimization agent, but your job is to **DELIVER a
+usable kernel**, not to chase an unreachable target forever. You keep
+iterating until **one** of the following triggers a FINALIZE (see below):
 
-- The task's stage gate is met AND every config hits its own
-  `target_ratio` (i.e. `python3 -m ferret.state $FERRET_WORKSPACE
-  $FERRET_WORKSPACE/task.yaml` reports `advance? True` and every per-config
-  row shows the ✓ marker). This is "goal reached".
+- **Goal reached** — stage gate met AND every config hits its `target_ratio`
+  (`python3 -m ferret.state ...` reports `advance? True`, every row ✓).
+- **Best-effort delivery** — the stage gate is met (you're in OPTIMIZE, i.e.
+  a *correct, working* kernel that already beats the `stage_gate.ratio`
+  exists) AND one of:
+    * **Stall**: 3 consecutive `a###` attempts on the SAME `worst_config`
+      with no score gain (to 3 dp). One pivot is allowed; a SECOND
+      fundamentally-different approach that also fails to move the worst
+      config means that config is at its **achievable ceiling** — stop
+      pivoting.
+    * **Budget**: you've run ~25 total iterations, or a per-config
+      `target_ratio` is provably infeasible under the task `constraints`
+      (e.g. it needs `cta_group::2` but the spec forbids it, or it's
+      HBM-bandwidth-bound at the measured roofline). Note the infeasibility
+      in `progress.md` `## Ceiling` and treat that config as best-effort.
+  → In all best-effort cases the deliverable is the **best tagged kernel so
+    far** (highest `min_ratio`, correct on every config). Do NOT keep
+    pivoting into rabbit holes burning budget on a config that is at its
+    architectural ceiling — a correct kernel that beats the stage gate IS a
+    usable result for the consumer (Mirage).
 - The user explicitly tells you to stop.
-- A hard, unrecoverable error (out of disk, GPU offline) that you
-  cannot fix by changing the kernel. Document the error in
-  `progress.md` first.
-- You have just spent **6 consecutive iterations** with the same
-  `worst_config` and the same `score` (to 3 decimal places). At that
-  point write a `## Stall (iter N)` block into `progress.md` summarizing
-  what you tried and what's left, then keep going on a fundamentally
-  different approach — do NOT stop, just pivot.
+- A hard, unrecoverable error (out of disk, GPU offline) you can't fix by
+  changing the kernel. Document it in `progress.md` first.
+
+**FINALIZE (you, the mainthread, run this — NOT the reviewer):** when any
+trigger above fires, (1) re-run the state CLI as the record, (2) pick the
+best tag, (3) **invoke `kernel-extractor` yourself** (`Task(subagent_type=
+kernel-extractor, ...)`) to write `$FERRET_WORKSPACE/kernel.cuh` from that
+tag — passing `best_effort=true` if it was a best-effort (not all-✓) stop,
+(4) append a `## Goal reached at <tag>` or `## Delivered (best-effort) at
+<tag>` block to progress.md, (5) exit cleanly. The deliverable is
+`kernel.cuh`; a run that ends WITHOUT producing it has failed, even if the
+kernel was good — delivery is the point.
 
 **Forbidden stop reasons:**
 
@@ -226,6 +253,33 @@ You may receive a standing goal via `/goal` (Claude Code slash command)
 or `--append-system-prompt` (set by `cc-run.sh --goal`). Treat that goal
 as the contract; do not stop until it is met or a stop condition above
 fires.
+
+## 6.6. Episode mode (dispatcher-driven loop) — READ IF YOUR SEED SAYS "EPISODE"
+
+The mirage-side dispatcher now runs ferret as a **loop of bounded episodes**
+(it replaced the old single-long-session model). When your seed prompt
+identifies you as "ONE bounded EPISODE (round N) in a dispatcher loop":
+
+- Do a **SMALL chunk** from the CURRENT workspace state — at most ~4
+  iterations (iterator → Edit kernel.cu → nvcc → ./kernel → commit+tag →
+  reviewer) — then **STOP and exit**. Print a final line:
+  `EPISODE_STATUS stage=<REPRODUCE|OPTIMIZE> score=<x.xxx> best_tag=<v###> advance=<true|false> note=<short>`.
+- This **supersedes the §6.5 "never stop / keep iterating forever" rule for
+  the SESSION**: in episode mode, exiting after your bounded chunk is CORRECT
+  — the dispatcher re-invokes you for the next round. Running forever inside
+  one `claude -p` is WRONG (it risks the 5-hr limit landing mid-work and
+  losing the session). §6.5 still defines when the WHOLE RUN is done; the
+  DISPATCHER owns that outer decision based on the state CLI between episodes.
+- If your seed says `FINALIZE=<goal|best-effort>`: do NOT iterate. Invoke
+  `kernel-extractor` (pass `best_effort=true` when mode is best-effort) on the
+  best tag to write `kernel.cuh`, sanity-compile it, append a
+  `## Delivered at <tag>` block to progress.md, and exit. This is the
+  delivery episode.
+- Resume cleanly: on entry, run §0's checklist (state CLI, git log) to see
+  what prior episodes left; pick up from there. Never restart from scratch.
+
+If your seed does NOT mention episodes (e.g. a human ran `cc-run.sh`
+interactively), use the classic §6.5 self-driven loop instead.
 
 ## 7. Forbidden patterns (from prompts.py — agent failure modes)
 

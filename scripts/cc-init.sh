@@ -44,12 +44,26 @@ if [[ ! -f "$TASK" ]]; then
     exit 2
 fi
 
-# ── Sanity-check parent repo HEAD (same logic as scripts/run.sh) ───────────
+# ── Sanity-check parent repo HEAD ──────────────────────────────────────────
+# A workspace's git ops can leak an agent-format commit ("vNNN:"/"aNNN:") onto
+# the ferret ROOT repo's HEAD; that pollution should be cleaned before launch.
+# NOTE: do NOT recommend `git reset --hard origin/main` — origin/main may be
+# BEHIND the working branch (e.g. the `cc` branch carries the whole Claude-Code
+# implementation that was never pushed to main), so that reset would DESTROY
+# real work. The safe cleanup is a soft reset of just the stray commit. Set
+# FERRET_ALLOW_AGENT_HEAD=1 to bypass when the HEAD commit is legitimate (e.g.
+# a real commit that merely happens to use the vNNN/aNNN message format).
 cd "$FERRET_DIR"
 HEAD_SUBJ=$(git log -1 --format=%s 2>/dev/null || echo "")
-if [[ "$HEAD_SUBJ" =~ ^(v|a)[0-9]{3}: ]]; then
+if [[ "$HEAD_SUBJ" =~ ^(v|a)[0-9]{3}: ]] && [[ "${FERRET_ALLOW_AGENT_HEAD:-0}" != "1" ]]; then
     echo "ERROR: ferret HEAD looks like an agent commit ($HEAD_SUBJ)." >&2
-    echo "       Run: git fetch origin && git reset --hard origin/main" >&2
+    echo "       If it is a STRAY workspace commit, drop it (keeps files):" >&2
+    echo "           git reset --soft HEAD~1" >&2
+    echo "       If the commit is legitimate, relabel it:" >&2
+    echo "           git commit --amend -m '<non-vNNN message>'" >&2
+    echo "       Or bypass this check:  FERRET_ALLOW_AGENT_HEAD=1 <relaunch>" >&2
+    echo "       Do NOT 'git reset --hard origin/main' — origin/main may be" >&2
+    echo "       behind this branch and the reset would discard real work." >&2
     exit 3
 fi
 

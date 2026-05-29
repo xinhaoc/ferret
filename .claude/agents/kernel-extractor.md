@@ -17,29 +17,49 @@ device functions in Mirage's task ABI.
 
 ## Preconditions (verify yourself)
 
-Refuse with a one-line error if any of these fail:
+The mainthread invokes you at FINALIZE in one of two modes. It passes the
+mode in its prompt:
+
+- **default (goal-reached)** — full convergence expected.
+- **`best_effort=true`** — a *correct, stage-gate-beating* kernel exists but
+  one or more configs are below their `target_ratio` (often an architectural
+  ceiling, e.g. needs `cta_group::2` which the spec forbids). Deliver the
+  BEST tag anyway — a working kernel that beats the stage gate is a usable
+  result for Mirage. This is the normal outcome for hard tasks; do not
+  refuse just because not every config has ✓.
+
+Checks (refuse with a one-line error only on a TRUE blocker):
 
 ```bash
-# 1. State CLI reports goal met.
+# 1. kernel.cu exists.
+test -f "$FERRET_WORKSPACE/kernel.cu" || echo "FAIL: no kernel.cu"
+
+# 2. A correct, stage-gate-beating kernel exists (stage == OPTIMIZE means
+#    score >= stage_gate.ratio AND the kernel passed its own host-reference
+#    validation when tagged). REQUIRED in BOTH modes — never extract a kernel
+#    that is still architecturally wrong / failing correctness.
 PYTHONPATH=$(dirname $FERRET_ROOT) python3 -m ferret.state "$FERRET_WORKSPACE" \
-    "$FERRET_WORKSPACE/task.yaml" | grep -E "advance\?.*True" >/dev/null
+    "$FERRET_WORKSPACE/task.yaml" | grep -E "stage *: *OPTIMIZE" >/dev/null \
+    || echo "FAIL: still in REPRODUCE — no correct stage-gate kernel to deliver"
 
-# 2. Every per-config row has ✓ (no rows missing the marker).
-PYTHONPATH=$(dirname $FERRET_ROOT) python3 -m ferret.state "$FERRET_WORKSPACE" \
-    "$FERRET_WORKSPACE/task.yaml" | grep -E "%.*(target|target_ratio)" \
-    | grep -v "✓" | grep -q . && echo "FAIL: at least one config missing ✓"
+# 3. In DEFAULT mode only, also require full convergence (every ✓).
+#    In best_effort mode, SKIP this check.
+if [ "$BEST_EFFORT" != "true" ]; then
+  PYTHONPATH=$(dirname $FERRET_ROOT) python3 -m ferret.state "$FERRET_WORKSPACE" \
+      "$FERRET_WORKSPACE/task.yaml" | grep -E "%.*(target|target_ratio)" \
+      | grep -v "✓" | grep -q . && echo "FAIL(default-mode): a config missing ✓ — caller should pass best_effort=true to deliver anyway"
+fi
 
-# 3. kernel.cu exists in the workspace.
-test -f "$FERRET_WORKSPACE/kernel.cu"
-
-# 4. progress.md has a `## Review` block whose API line says PASS or
-#    NOT VERIFIED (not FAIL). If FAIL: refuse — the kernel doesn't match
-#    Mirage's ABI yet, fix that first.
+# 4. API must not be FAIL (a FAIL means the .cuh won't load into Mirage).
+#    NOT VERIFIED is acceptable (delivery proceeds; reviewer flags it).
 grep -E "API:.*FAIL" "$FERRET_WORKSPACE/progress.md" | tail -1 | grep -q . \
-    && echo "FAIL: most recent Review still has API FAIL"
+    && echo "FAIL: most recent Review has API FAIL — fix the signature first"
 ```
 
-If none of those checks fail, proceed.
+Extract the **best tag** (highest `min_ratio`, correct on every config):
+`git -C $FERRET_WORKSPACE describe` won't tell you which — read the
+`## Current Best` line in progress.md or pick the highest `v###`. Proceed
+if checks 1, 2, 4 pass (and 3 in default mode).
 
 ## What you read
 

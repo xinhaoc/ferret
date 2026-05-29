@@ -41,19 +41,35 @@ If the prompt is missing the tag name, resolve via
 
 ## Four checks (run in this order; record each result)
 
-### 1. Mirage API alignment
+### 1. Mirage API alignment — MANUAL READ is the primary method (you have the Read tool)
 
-Use `Task(subagent_type=codex-dispatcher, ...)` with a prompt that
-names the relevant Mirage headers and asks Codex to compare the
-`kernel.cu` extern-C entry against Mirage's expected task signature.
-Pass through `$FERRET_WORKSPACE` and the Mirage file list.
+Do this check yourself with `Read` — it's reliable, free, and always possible.
+(Do NOT dispatch a subagent; you cannot reliably do that. And on this host
+`codex` is bwrap-broken — see the optional fast-path note below — so do NOT
+depend on it.)
 
-Record verbatim whichever it returns:
-- `PASS` + detail line → write a 1-line "API: PASS" entry.
-- `FAIL` + detail → write "API: FAIL — <detail>" and **flag this as a
-  blocker the mainthread must address in the next iteration**.
-- `codex_unavailable` / `codex_parse_error` / `codex_timeout` → write
-  "API: NOT VERIFIED (<status>)". Never block on this.
+Steps:
+1. Resolve MIRAGE_ROOT: `MIRAGE_ROOT="${MIRAGE_ROOT:-$(grep -oE '/[^ ]*/mirage' docs/dev-memory/machine.md | head -1)}"`.
+2. `grep -nE "task_impl|__device__ __noinline__" "$FERRET_WORKSPACE/kernel.cu"` to get your kernel's device-function signature(s).
+3. `Read` the closest sibling Mirage header under
+   `$MIRAGE_ROOT/include/mirage/persistent_kernel/tasks/<gpu_family>/` (same op
+   family — for this split-K dense GEMM task it's
+   `fp8_gemm_dense_decode_splitk_sm100.cuh`; its
+   `fp8_gemm_dense_decode_splitk_sm100_task_impl<BN,NS,NE,SPLIT_K>(...)` is the
+   target ABI). Compare arg list by hand: parameter order, dtype, `__restrict__`,
+   `const`, `CUtensorMap const *` vs raw pointers, template params.
+4. Record:
+   - matches → "API: PASS (manual) — <one-line why>".
+   - mismatch → "API: FAIL (manual) — <exact mismatch>" and **flag a blocker**
+     (a FAIL means the .cuh won't load into Mirage).
+   - truly undeterminable → "API: NOT VERIFIED — <reason>" (last resort; a manual
+     read is almost always possible, so prefer PASS/FAIL).
+
+**Optional codex fast-path (skip if it errors):** if you want a second opinion
+AND a quick `codex exec -C "$MIRAGE_ROOT" -s read-only - <<<'echo ok'` prints
+`ok` (i.e. bwrap actually works), you may run codex to cross-check. But on this
+host bwrap fails (`RTM_NEWADDR: Operation not permitted`), so the manual Read
+above is authoritative. Never let a doomed codex call block the review.
 
 ### 2. Output-key + constraint alignment
 
@@ -98,37 +114,39 @@ delegate to `memory-keeper` with the category (`machine` / `quirks` /
 `tips`) and the one-paragraph fact. Do not edit `docs/dev-memory/`
 yourself.
 
-### 5. Convergence — extract Mirage-ready `kernel.cuh`
+### 5. FINALIZE verdict — tell the mainthread whether to deliver
 
-Run this check **only after** steps 1–3 finished:
+**You do NOT invoke `kernel-extractor`** (nested subagent dispatch is
+unreliable — that's why nothing was ever delivered before). Your job here
+is only to COMPUTE the finalize verdict and return it; the MAINTHREAD
+invokes the extractor based on what you return.
+
+Run after steps 1–3:
 
 ```bash
 PYTHONPATH=$(dirname $FERRET_ROOT) python3 -m ferret.state \
     "$FERRET_WORKSPACE" "$FERRET_WORKSPACE/task.yaml" 2>&1 | tee /tmp/state.out
-grep -E "advance\?.*True" /tmp/state.out >/dev/null && echo CONVERGED
-grep -vE "✓|target_ratio|stage|score|advance|RunState|per-config|----" /tmp/state.out \
-    | grep -E "%.*\(target" | grep -v "✓" | grep -q . && echo "INCOMPLETE: missing ✓"
+grep -E "advance\?.*True" /tmp/state.out >/dev/null && echo GOAL_REACHED
+grep -E "stage *: *OPTIMIZE" /tmp/state.out >/dev/null && echo STAGE_GATE_MET
 ```
 
-If `CONVERGED` AND no `INCOMPLETE` row AND the API check above was
-`PASS` or `NOT VERIFIED` (NOT `FAIL`):
+Decide the verdict (and put it in the Review block + your reply):
 
-- Invoke `Task(subagent_type=kernel-extractor, prompt='Extract
-  $FERRET_WORKSPACE/kernel.cu into a Mirage-ready kernel.cuh. Tag
-  source: <this tag>. Mirage target task header lives under
-  $MIRAGE_ROOT/include/mirage/persistent_kernel/tasks/<gpu_family>/
-  — pick a sibling that matches our task family.')`.
-- Record the extractor's reply (extracted path, sibling used,
-  signature) in your Review block under a `convergence:` line.
+- **`FINALIZE: goal-reached`** — `advance? True` (every config ✓) AND the
+  API check is PASS or NOT VERIFIED (not FAIL). The mainthread should
+  extract immediately.
+- **`FINALIZE: best-effort-ready`** — stage gate met (OPTIMIZE: a correct
+  kernel beating `stage_gate.ratio` exists) AND the API check is not FAIL.
+  This means a *usable* kernel exists even if some config is below its
+  `target_ratio`. Whether to actually finalize now is the mainthread's call
+  per §6.5 (it finalizes on stall/budget/infeasible-target); you just report
+  that a deliverable exists.
+- **`FINALIZE: no`** — still in REPRODUCE (no correct/stage-gate kernel yet),
+  or the API check returned FAIL. Note the blocker; keep iterating.
 
-If `CONVERGED` but API check returned `FAIL`: do **not** invoke
-extractor. Record "convergence blocked on API alignment — fix
-kernel.cu signature first" and flag it for the mainthread. The
-kernel-extractor refuses on API FAIL anyway, but we'd waste a Task
-call by trying.
-
-If the run has not converged yet: skip step 5 entirely. Extraction
-only runs at the final tag.
+Never trigger extraction yourself. If the API check is FAIL, say so loudly
+— a FAIL means the kernel won't load into Mirage and must be fixed before
+any finalize.
 
 ## Output — append to `progress.md`
 

@@ -1,54 +1,72 @@
-# machine.md — host-specific facts
+# machine.md — host-specific facts (committed generic template)
+
+> This is the generic committed seed. The live runtime copy at
+> `docs/dev-memory/machine.md` is gitignored and is bootstrapped from this
+> file on first launch, then appended to by the `memory-keeper` subagent
+> with host-specific facts. Keep this template machine-agnostic: use
+> `$MIRAGE_ROOT` / `$FERRET_ROOT` / `$USER` / `python3` placeholders, never
+> a real username, host, absolute home path, or device UUID.
 
 Edited only by the `memory-keeper` subagent. Append-only; updates go below
 the original entry as `Updated YYYY-MM-DD:` blocks.
 
 ## Paths
 
-- 2026-05-28 — `MIRAGE_ROOT=~/mirage` (i.e. `/home/$USER/mirage`). Mirage's
-  public C++ kernel-launch API is under `$MIRAGE_ROOT/include/mirage/` —
-  notably `kernel/`, `persistent_kernel/`, and `transpiler/`. The
-  `codex-dispatcher` subagent reads these to verify ferret-generated
-  `kernel.cu` exposes a compatible `extern "C"` entry.
-- 2026-05-28 — ferret root: `~/ferret` (`/home/$USER/ferret`). The
+- `MIRAGE_ROOT` points at the Mirage checkout (export it; defaults to
+  `$HOME/mirage`). Mirage's public C++ kernel-launch API is under
+  `$MIRAGE_ROOT/include/mirage/` — notably `kernel/`, `persistent_kernel/`,
+  and `transpiler/`. The `codex-dispatcher` subagent reads these to verify
+  a ferret-generated `kernel.cu` exposes a compatible `extern "C"` entry.
+- `FERRET_ROOT` is the ferret checkout (defaults to `$HOME/ferret`). The
   mainthread is launched with cwd at this directory; `$FERRET_WORKSPACE`
   is a relative path under it (`workspace1`..`workspace8`).
-- 2026-05-28 — Python: `scripts/run.sh` references `/home/xinhaoc/miniconda3/bin/python3`
-  for the legacy motus path. For the Claude-Code path use the host's
-  `python3` (3.12). All Python helpers (`ferret.state`, `ferret.task_spec`,
-  `ferret.profile`) are runnable as modules from the ferret root.
+- Python: use the host's `python3`. All Python helpers (`ferret.state`,
+  `ferret.task_spec`, `ferret.profile`) are runnable as modules from the
+  ferret root. To run them outside `$FERRET_ROOT`, put the parent of
+  `$FERRET_ROOT` on `PYTHONPATH` (e.g.
+  `PYTHONPATH=$(dirname $FERRET_ROOT) python3 -m ferret.state ...`).
 
-## GPU selection (catalyst-fleet1 shared cluster)
+## GPU selection (shared cluster)
 
-- 2026-05-28 — `eval $(./pick_gpu.sh)` before every benchmark / profile.
-  It writes `export CUDA_VISIBLE_DEVICES=...` to stdout. Different
-  invocations pick different GPUs, so measure your kernel AND its
-  baseline in the same `pick_gpu` invocation (i.e. the same shell
-  session) to keep the comparison honest.
+- `eval $(./pick_gpu.sh)` before every benchmark / profile. It writes
+  `export CUDA_VISIBLE_DEVICES=...` to stdout. Different invocations pick
+  different GPUs, so measure your kernel AND its baseline in the same
+  `pick_gpu` invocation (i.e. the same shell session) to keep the
+  comparison honest.
 
 ## ncu / profiling
 
-- 2026-05-28 — On this cluster ncu fails with "Unknown error on device 0"
-  when its default `/tmp` is read-only or full. Workaround:
+- On a shared cluster, ncu can fail with "Unknown error on device 0" when
+  its default `/tmp` is read-only or full. Workaround:
   `export TMPDIR=/tmp/$USER` (the `ferret.profile` CLI sets this for you).
-  Source: AGENT_EVOLUTION.md item 10.
-- 2026-05-28 — Always use `python3 -m ferret.profile <workspace>` instead
-  of hand-crafting ncu commands. The wrapper picks the GPU, sets TMPDIR,
-  runs the standard 7-metric ncu invocation, parses CSV, and persists a
+- Always use `python3 -m ferret.profile <workspace>` instead of
+  hand-crafting ncu commands. The wrapper picks the GPU, sets TMPDIR, runs
+  the standard 7-metric ncu invocation, parses CSV, and persists a
   `.profile_last.json` snapshot so the next run prints a delta line.
 
-## Codex sub-agent
+## Codex sub-agent (read-only, MCP)
 
-- 2026-05-28 — `codex` CLI present at `~/.nvm/versions/node/v25.9.0/bin/codex`.
-  The `codex-dispatcher` subagent shells out to it in
-  `--sandbox read-only --ask-for-approval on-request` mode for Mirage-API
-  verification work. Use `-C $MIRAGE_ROOT` so Codex reads the right repo.
-  If the CLI is missing or login expired, the dispatcher must degrade to
-  `{status: "codex_unavailable", reason: ...}` and let the reviewer
-  record that — never crash the mainthread.
+- Codex is reached over the **MCP protocol**, not a CLI. The `codex` MCP
+  server is configured in `$FERRET_ROOT/.mcp.json` (`{"command": "codex",
+  "args": ["mcp-server"]}`); restart Claude Code to load it. The
+  `codex-dispatcher` subagent calls the `mcp__codex__codex` /
+  `mcp__codex__codex-reply` tools — never the retired `codex exec` CLI.
+- Always dispatch with `sandbox: "read-only"` and
+  `approval-policy: "never"`, and `cwd: $MIRAGE_ROOT` for grounding. Codex
+  is used only for read-only Mirage-API / ABI verification of a generated
+  `kernel.cu` / `kernel.cuh`.
+- Codex on this MCP server has **no non-shell file-read path**, and we
+  forbid shell exec — so it cannot read files from `cwd` on its own.
+  Pre-feeding is mandatory: the dispatcher must `Read` and paste every
+  file Codex needs (the kernel source AND the relevant Mirage-ABI header
+  snippets) directly into the prompt. Citing a path alone gets Codex
+  nothing.
+- If the `mcp__codex__*` tools are absent (the MCP server didn't connect),
+  the dispatcher degrades to `{"status": "codex_unavailable", "reason":
+  ...}` and lets the reviewer record it — never crash the mainthread.
 
 ## Compute / binaries
 
-- 2026-05-28 — B200 nvcc default flags expected by ferret tasks:
+- B200 (SM100a) nvcc default flags expected by ferret tasks:
   `-gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lcuda -lcudart`.
   Do NOT use `-arch=sm_100a` (loses the `a` tier of tcgen05 instructions).

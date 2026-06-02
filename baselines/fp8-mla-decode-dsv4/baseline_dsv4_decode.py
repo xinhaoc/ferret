@@ -39,10 +39,11 @@ Usage:
     python3 baselines/fp8-mla-decode-dsv4/baseline_dsv4_decode.py
 """
 import argparse
+import os
 import sys
 
-# FlashMLA installation path on catalyst-fleet1 (built extension)
-FLASHMLA_DIR = "/home/xinhaoc/mirage-cuda-agent/resources/flashmla-main"
+# FlashMLA installation path (built extension)
+FLASHMLA_DIR = os.environ.get("FLASHMLA_DIR", os.path.join(os.path.dirname(__file__), "../../resources/flashmla-main"))
 sys.path.insert(0, FLASHMLA_DIR)
 sys.path.insert(0, FLASHMLA_DIR + "/tests")
 

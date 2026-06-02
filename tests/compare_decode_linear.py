@@ -37,10 +37,10 @@ Methodology differences from bench.cu that ferret agent uses internally:
     bench.cu's cublas numbers (observed ~0-15% spread).
 
 Run:
-    cd ~/repos/ferret/workspace
+    cd $FERRET_ROOT/workspace
     nvcc -O3 -std=c++17 -arch=sm_100a --use_fast_math -Xcompiler -fPIC \\
          -shared -o kernel.so kernel.cu
-    cd ~/repos/ferret
+    cd $FERRET_ROOT
     eval $(./pick_gpu.sh)   # claim a free GPU on shared cluster
     python3 tests/compare_decode_linear.py --so workspace/kernel.so
 

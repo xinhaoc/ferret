@@ -48,3 +48,9 @@ kernel.cubin
 resources/**/__pycache__/
 resources/**/*.pyc
 resources/**/build/
+
+# Session-local files (per-run scratch, not source). *.log and __pycache__/
+# are already covered above.
+docs/WORKFLOW_AUDIT.md
+calib_scratch/
+*.pid

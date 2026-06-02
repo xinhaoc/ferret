@@ -34,12 +34,49 @@ import yaml
 
 
 @dataclass
+class IoTensor:
+    """One kernel input/output tensor in MPK's format.
+
+    A machine-readable, MPK-format I/O+shape contract so the dispatcher and the
+    validator agree on the exact interface (the user's "明确接口规范" directive).
+    shape entries may be symbolic strings ("K/128", "N", "M") or ints.
+    """
+    name: str                       # e.g. "A", "SFA", "D"
+    shape: list[Any]                # e.g. ["M", "K"] or [128, "K/128"]; symbolic dims allowed
+    dtype: str                      # fp8_e4m3 | bf16 | fp32 | int32 | ...
+    layout: str = ""                # k_major | row_major | n_major | "" (unspecified)
+    role: str = ""                  # optional, e.g. "act_scale_1x128", "weight_scale_128x128"
+    prezeroed: bool = False         # optional; True = caller pre-zeroes (e.g. atomic-accum output)
+
+
+@dataclass
+class ReduceHint:
+    """How the kernel's K-reduction (or any cross-CTA accumulation) should be done.
+
+    A perf HINT for the coding agent, not a hard constraint. `method` is the
+    accumulation strategy:
+      - internal_atomic : inter-CTA accumulation via red.global atomics into a
+                          pre-zeroed output, all inside ONE kernel (no reduce task).
+      - tma_reduce      : use TMA reduction (cp.reduce.async.bulk / tcgen05 TMA
+                          store-reduce) to accumulate partials in gmem/smem. PREFER
+                          this when applicable — it is generally faster than naive
+                          red.global atomics for the split-K reduce on Blackwell.
+      - external_reduce : emit a SEPARATE reduce task/kernel that sums partials
+                          (the builder-side split-K hop ferret usually wants to AVOID).
+    """
+    method: str = ""                # internal_atomic | tma_reduce | external_reduce | ""
+    op: str = ""                    # optional, e.g. "red.global.add.noftz.bf16x2"
+    separate_task: bool = False     # True = reduction is a distinct task/kernel (external_reduce)
+
+
+@dataclass
 class ConfigEntry:
     """One (shape, baseline) pair the kernel must satisfy."""
     name: str                       # e.g. "Q1"
     args: dict[str, Any]            # e.g. {"Q_LEN": 1}
     target_ratio: float = 0.95      # 1.0 = match reference, 0.95 = within 5%, 1.10 = beat by 10%
     weight: float = 1.0             # only used by scoring=weighted_avg
+    target_latency_us: float | None = None  # optional ABSOLUTE latency goal (μs); None = ratio-only
     # baseline_tflops removed — baselines are now measured at runtime by the
     # agent's benchmark and emitted as KERNEL_RESULT_REFERENCE alongside
     # KERNEL_RESULT. See compute_score / orchestrator render.
@@ -82,6 +119,9 @@ class TaskSpec:
     shapes: dict[str, Any]          # machine-checkable shape facts
     baseline: BaselineSpec
     configs: list[ConfigEntry]
+    io_inputs: list[IoTensor] = field(default_factory=list)   # structured MPK-format input tensor contract (problem.io.inputs)
+    io_outputs: list[IoTensor] = field(default_factory=list)  # structured MPK-format output tensor contract (problem.io.outputs)
+    reduce: ReduceHint = field(default_factory=ReduceHint)    # K-reduction / cross-CTA accumulation hint (problem.reduce)
     references: list[str] = field(default_factory=list)  # REPRODUCE reading list — architectural templates (e.g. examples/tcgen05-gemm/). Separate from baseline: these are what to read, not what to beat.
     scoring: str = "min_ratio"      # min_ratio | weighted_avg | focus
     focus_config: str = ""          # only used when scoring == "focus"
@@ -99,6 +139,32 @@ class TaskSpec:
 
 
 _VALID_SCORING = ("min_ratio", "weighted_avg", "focus")
+# Recognized reduce-accumulation strategies (problem.reduce.method). tma_reduce
+# is INTENTIONALLY first-class — the agent should be hinted to prefer it for the
+# split-K reduce when applicable (generally faster than naive red.global atomics
+# on Blackwell). Unknown methods are rejected so a typo doesn't silently drop the
+# perf hint.
+_VALID_REDUCE_METHODS = ("internal_atomic", "tma_reduce", "external_reduce")
+
+
+def _parse_io_tensor(d: Any, where: str) -> IoTensor:
+    """Parse one problem.io.{inputs,outputs}[] entry into an IoTensor."""
+    if not isinstance(d, dict):
+        raise ValueError(f"{where} must be a mapping")
+    for req in ("name", "shape", "dtype"):
+        if req not in d:
+            raise ValueError(f"{where} missing required field: {req}")
+    shape = d["shape"]
+    if not isinstance(shape, list):
+        raise ValueError(f"{where}.shape must be a list (ints or symbolic strings like 'K/128')")
+    return IoTensor(
+        name=str(d["name"]),
+        shape=list(shape),
+        dtype=str(d["dtype"]),
+        layout=str(d.get("layout", "")),
+        role=str(d.get("role", "")),
+        prezeroed=bool(d.get("prezeroed", False)),
+    )
 
 
 def load_task_spec(path: str | Path) -> TaskSpec:
@@ -135,6 +201,41 @@ def load_task_spec(path: str | Path) -> TaskSpec:
         raise ValueError("task spec.problem missing required field: shapes")
     if not isinstance(problem["shapes"], dict):
         raise ValueError("task spec.problem.shapes must be a mapping")
+
+    # problem.io — OPTIONAL structured MPK-format I/O contract. Back-compat:
+    # absent => empty lists (old yamls keep loading).
+    io_inputs: list[IoTensor] = []
+    io_outputs: list[IoTensor] = []
+    io_data = problem.get("io", {}) or {}
+    if not isinstance(io_data, dict):
+        raise ValueError("task spec.problem.io must be a mapping")
+    inputs_data = io_data.get("inputs", []) or []
+    outputs_data = io_data.get("outputs", []) or []
+    if not isinstance(inputs_data, list):
+        raise ValueError("task spec.problem.io.inputs must be a list")
+    if not isinstance(outputs_data, list):
+        raise ValueError("task spec.problem.io.outputs must be a list")
+    for j, t in enumerate(inputs_data):
+        io_inputs.append(_parse_io_tensor(t, f"problem.io.inputs[{j}]"))
+    for j, t in enumerate(outputs_data):
+        io_outputs.append(_parse_io_tensor(t, f"problem.io.outputs[{j}]"))
+
+    # problem.reduce — OPTIONAL K-reduction / cross-CTA accumulation hint.
+    # Back-compat: absent => default ReduceHint (empty method).
+    reduce_data = problem.get("reduce", {}) or {}
+    if not isinstance(reduce_data, dict):
+        raise ValueError("task spec.problem.reduce must be a mapping")
+    reduce_method = str(reduce_data.get("method", ""))
+    if reduce_method and reduce_method not in _VALID_REDUCE_METHODS:
+        raise ValueError(
+            f"task spec.problem.reduce.method {reduce_method!r} invalid. "
+            f"Must be one of {_VALID_REDUCE_METHODS} (or omitted)"
+        )
+    reduce = ReduceHint(
+        method=reduce_method,
+        op=str(reduce_data.get("op", "")),
+        separate_task=bool(reduce_data.get("separate_task", False)),
+    )
 
     # baseline block
     baseline_data = data["baseline"]
@@ -177,12 +278,23 @@ def load_task_spec(path: str | Path) -> TaskSpec:
             raise ValueError(f"config[{i}] ({name}).target_ratio must be > 0")
         if weight < 0:
             raise ValueError(f"config[{i}] ({name}).weight must be >= 0")
+        target_latency_us: float | None = None
+        if c.get("target_latency_us") is not None:
+            try:
+                target_latency_us = float(c["target_latency_us"])
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"config[{i}] ({name}).target_latency_us must be a number"
+                ) from e
+            if target_latency_us <= 0:
+                raise ValueError(f"config[{i}] ({name}).target_latency_us must be > 0")
         # baseline_tflops silently ignored if present in old yaml — measured at runtime now
         configs.append(ConfigEntry(
             name=name,
             args=c["args"],
             target_ratio=target_ratio,
             weight=weight,
+            target_latency_us=target_latency_us,
         ))
 
     # scoring policy
@@ -257,6 +369,9 @@ def load_task_spec(path: str | Path) -> TaskSpec:
         shapes=dict(problem["shapes"]),
         baseline=baseline,
         configs=configs,
+        io_inputs=io_inputs,
+        io_outputs=io_outputs,
+        reduce=reduce,
         references=references,
         scoring=scoring,
         focus_config=focus_config,
@@ -328,6 +443,32 @@ def parse_kernel_output(stdout: str) -> dict[str, float]:
     return results
 
 
+_KERNEL_LATENCY_RE = re.compile(r"KERNEL_LATENCY_US\s+(\{[^\n]*\})")
+
+
+def parse_latency_output(stdout: str) -> dict[str, float]:
+    """Parse per-config measured latency (μs) — KERNEL_LATENCY_US JSON line.
+
+    Only used when a config carries an absolute `target_latency_us`. The agent's
+    benchmark emits, alongside KERNEL_RESULT / KERNEL_RESULT_REFERENCE:
+        KERNEL_LATENCY_US {"<config>": <kernel-latency-us>, ...}
+    Returns {} if the line is absent (latency gating then silently no-ops).
+    """
+    if not stdout:
+        return {}
+    m = _KERNEL_LATENCY_RE.search(stdout)
+    if not m:
+        return {}
+    try:
+        data = json.loads(m.group(1))
+        if isinstance(data, dict):
+            return {str(k): float(v) for k, v in data.items()
+                    if isinstance(v, (int, float))}
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return {}
+
+
 def parse_reference_output(stdout: str) -> dict[str, float]:
     """Parse REFERENCE baseline TFLOPS — KERNEL_RESULT_REFERENCE JSON line.
 
@@ -365,6 +506,7 @@ def compute_score(
     results: dict[str, float],
     reference: dict[str, float],
     spec: TaskSpec,
+    latencies: dict[str, float] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Compute aggregate score + per-config ratios.
 
@@ -372,16 +514,27 @@ def compute_score(
         results:    own-kernel TFLOPS per config (parse_kernel_output)
         reference:  baseline reference TFLOPS per config (parse_reference_output)
         spec:       task spec
+        latencies:  optional own-kernel measured latency (μs) per config
+                    (parse_latency_output). Only consulted for configs that set
+                    `target_latency_us`. None / missing => latency branch no-ops
+                    and scoring is the legacy TFLOPS-ratio behavior.
 
     Returns:
         (aggregate_score, per_config_ratios)
         ratio[cfg] = results[cfg] / reference[cfg]
         Missing reference (ref==0) → ratio 0 (can't score without reference).
 
+        LATENCY BRANCH: if cfg.target_latency_us is set and a measured latency
+        exists, a latency-attainment ratio (target_us / measured_us; >=1.0 means
+        the absolute goal is met) is folded in by taking min(tflops_ratio,
+        latency_ratio). The config is only "done" once BOTH the relative-TFLOPS
+        bar and the absolute-latency goal are satisfied.
+
     aggregate_score is the single number that drives stage gating and "is this
     kernel better than the previous one". per_config_ratios is for display in
     iteration prompts so the agent sees which config is the bottleneck.
     """
+    latencies = latencies or {}
     ratios: dict[str, float] = {}
     for cfg in spec.configs:
         ref = reference.get(cfg.name, 0.0)
@@ -389,7 +542,15 @@ def compute_score(
             ratios[cfg.name] = 0.0
             continue
         tflops = results.get(cfg.name, 0.0)
-        ratios[cfg.name] = tflops / ref
+        ratio = tflops / ref
+        # Optional absolute-latency branch — only when this config sets a goal
+        # AND we have a measurement for it.
+        if cfg.target_latency_us is not None:
+            meas_us = latencies.get(cfg.name, 0.0)
+            if meas_us > 0:
+                lat_ratio = cfg.target_latency_us / meas_us  # >=1.0 => goal met
+                ratio = min(ratio, lat_ratio)
+        ratios[cfg.name] = ratio
 
     if not ratios:
         return 0.0, ratios
@@ -420,6 +581,12 @@ def should_advance_stage(
     score must reach spec.stage_gate.ratio. If stage_gate.strict is set, every
     config must also independently clear its own target_ratio (so the agent can't
     enter OPTIMIZE on the strength of one config carrying the aggregate).
+
+    The optional absolute-latency goal (config.target_latency_us) is honored
+    transparently here: compute_score already folds latency-attainment into each
+    config's ratio (min of TFLOPS-ratio and target_us/measured_us), so a config
+    whose throughput is fine but whose latency is still above target stays below
+    its target_ratio and (under strict) blocks advancing.
     """
     if score < spec.stage_gate.ratio:
         return False

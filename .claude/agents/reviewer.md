@@ -44,9 +44,9 @@ If the prompt is missing the tag name, resolve via
 ### 1. Mirage API alignment — MANUAL READ is the primary method (you have the Read tool)
 
 Do this check yourself with `Read` — it's reliable, free, and always possible.
-(Do NOT dispatch a subagent; you cannot reliably do that. And on this host
-`codex` is bwrap-broken — see the optional fast-path note below — so do NOT
-depend on it.)
+For a cross-check second opinion, the primary path is now the
+`codex-dispatcher` subagent, which dispatches to Codex over the **MCP**
+protocol (read-only, no shell) — see the codex cross-check note below.
 
 Steps:
 1. Resolve MIRAGE_ROOT: `MIRAGE_ROOT="${MIRAGE_ROOT:-$(grep -oE '/[^ ]*/mirage' docs/dev-memory/machine.md | head -1)}"`.
@@ -65,11 +65,12 @@ Steps:
    - truly undeterminable → "API: NOT VERIFIED — <reason>" (last resort; a manual
      read is almost always possible, so prefer PASS/FAIL).
 
-**Optional codex fast-path (skip if it errors):** if you want a second opinion
-AND a quick `codex exec -C "$MIRAGE_ROOT" -s read-only - <<<'echo ok'` prints
-`ok` (i.e. bwrap actually works), you may run codex to cross-check. But on this
-host bwrap fails (`RTM_NEWADDR: Operation not permitted`), so the manual Read
-above is authoritative. Never let a doomed codex call block the review.
+**Optional codex cross-check (via MCP):** for a second opinion, dispatch the
+`codex-dispatcher` subagent — it now talks to Codex over the **MCP** protocol
+(`~/ferret/.mcp.json` → `codex mcp-server`), read-only and no-shell, pre-feeding
+the pasted kernel + ABI. The manual Read above stays authoritative; if the Codex
+MCP server isn't connected the dispatcher returns `codex_unavailable` and you
+just record "API: PASS (manual)". Never let a Codex call block the review.
 
 ### 2. Output-key + constraint alignment
 

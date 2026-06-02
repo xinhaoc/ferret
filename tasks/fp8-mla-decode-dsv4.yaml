@@ -61,7 +61,7 @@ problem:
 
 baseline:
   source: "FlashMLA flash_mla.flash_mla_with_kvcache(is_fp8_kvcache=True, indices=..., extra_k_cache=..., extra_indices_in_kvcache=...) — run: python3 baselines/fp8-mla-decode-dsv4/baseline_dsv4_decode.py"
-  reference_commit: "FlashMLA 7166110 (prepare for open source release, 2026-03-30). Source in resources/flashmla-main/ (identical kernel files). Built copy at /home/xinhaoc/mirage-cuda-agent/resources/flashmla-main/ used by baseline script."
+  reference_commit: "FlashMLA 7166110 (prepare for open source release, 2026-03-30). Source in resources/flashmla-main/ (identical kernel files). Built copy at resources/flashmla-main/ used by baseline script."
 
 references:
   # FlashMLA reference kernel — instantiated with MODEL1 for V4

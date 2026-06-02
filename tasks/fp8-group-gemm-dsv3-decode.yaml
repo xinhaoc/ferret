@@ -32,6 +32,32 @@ problem:
     HIDDEN: 7168
     EXPERT_INTERMEDIATE: 2048
 
+  # Structured MPK-format I/O contract (machine-readable interface spec).
+  # Contiguous DG-compatible layout; rows of A ordered by expert. Symbolic dims
+  # (K/128, N/128, M_total) resolve per-config from args. Mirrors the ASCII block.
+  io:
+    inputs:
+      - { name: A,         shape: [M_total, K],            dtype: fp8_e4m3, layout: k_major }
+      - { name: A_scale,   shape: [M_total, "K/128"],      dtype: fp32,     layout: k_major, role: act_scale_1x128 }
+      - { name: W,         shape: [E, N, K],               dtype: fp8_e4m3, layout: k_major }   # per-expert weight
+      - { name: W_scale,   shape: [E, "N/128", "K/128"],   dtype: fp32,     layout: k_major, role: weight_scale_128x128 }
+      - { name: m_indices, shape: [M_total],               dtype: int32,    layout: row_major, role: expert_id_per_row }
+    outputs:
+      - { name: Out,       shape: [M_total, N],            dtype: bf16,     layout: row_major }
+
+  # K-reduction strategy hint. TODAY the decode group GEMM is SINGLE-PASS-K: one
+  # CTA owns one (expert, n_tile) and accumulates the whole K in the tensor-core
+  # accumulator, so there is no cross-CTA reduce and no separate reduce task.
+  # method=tma_reduce is the PREFERRED upgrade WHERE APPLICABLE: if the agent
+  # split-Ks the larger-K group GEMM (gate_up K=7168, down K=2048) to fill idle
+  # SMs at small M_per_expert, accumulate the partials with TMA reduction
+  # (cp.reduce.async.bulk / tcgen05 TMA store-reduce) rather than naive
+  # red.global atomics — generally faster on Blackwell. Keep it INTERNAL (one
+  # kernel); do NOT emit a separate reduce task.
+  reduce:
+    method: tma_reduce
+    separate_task: false
+
 baseline:
   source: "DeepGEMM (deep_gemm.m_grouped_fp8_gemm_nt_contiguous, padded layout) — run: python3 baselines/fp8-group-gemm/baseline_dsv3_decode.py"
 
@@ -47,6 +73,12 @@ configs:
   - name: gate_up_M1
     args: { M_PER_EXPERT: 1, NUM_GROUPS: 32, K: 7168, N: 4096 }
     target_ratio: 1.10
+    # Absolute per-call decode-latency goal (μs) the agent iterates TOWARD, in
+    # addition to the relative-vs-DeepGEMM bar. INDICATIVE — DeepGEMM is benched
+    # live each run; the W13/W2 group GEMM is ~75μs/layer combined today (~1.9×
+    # DeepGEMM), so this gate_up call is in the low-30s μs. Scoring folds in
+    # min(tflops_ratio, target_us/measured_us), so this only tightens the gate.
+    target_latency_us: 30.0
     weight: 1.0
 
   - name: gate_up_M4

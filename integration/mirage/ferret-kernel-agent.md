@@ -222,7 +222,7 @@ prints concise lines as it works; key events:
 Poll the state CLI between iterations to read the live score:
 
 ```bash
-PYTHONPATH=/home/muhengl python3 -m ferret.state \
+PYTHONPATH=$(dirname $FERRET_ROOT) python3 -m ferret.state \
     ~/ferret/workspace<N> ~/ferret/workspace<N>/task.yaml
 ```
 
@@ -250,7 +250,7 @@ The mainthread will write a `## Goal reached at v###` block to
 ```bash
 git -C ~/ferret/workspace<N> describe --tags --abbrev=0    # latest v###
 git -C ~/ferret/workspace<N> log -1 --format=%B            # commit body with KERNEL_RESULT
-PYTHONPATH=/home/muhengl python3 -m ferret.state \
+PYTHONPATH=$(dirname $FERRET_ROOT) python3 -m ferret.state \
     ~/ferret/workspace<N> ~/ferret/workspace<N>/task.yaml  # advance? True expected
 ```
 

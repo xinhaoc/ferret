@@ -1,0 +1,65 @@
+"""Pattern B build for an in-MPK validation wrapper (TEMPLATE).
+
+Fill @@MODULE_NAME@@ (must equal the CUDAExtension name AND match
+TORCH_EXTENSION_NAME used by PYBIND11_MODULE in runtime_kernel_wrapper.cu).
+
+This compiles the hand-written __global__ wrapper that calls the ferret
+kernel's __device__ task_impl, with the MPK include tree on the path so the
+`#include "mirage/persistent_kernel/tasks/blackwell/<name>.cuh"` resolves.
+
+Build + run (mpk_validate.sh does this for you):
+    cd <this_dir>
+    CUDA_VISIBLE_DEVICES=<gpu> python setup.py build_ext --inplace
+    CUDA_VISIBLE_DEVICES=<gpu> python test_<name>.py     # ship a driver too!
+
+NOTE: a Pattern B dir MUST also contain a `test_*.py` (or `run.py`) that
+imports the built module, drives the kernel on real tensors with a
+sentinel-filled output + arange qo_indptr for decode-gated kernels, computes
+an FP32 reference, and prints a `cos=...` and `sentinel_rows=...` line so
+mpk_validate.sh's grep-based verdict logic can score it. See
+templates/README.md "Pattern B driver contract".
+"""
+from setuptools import setup
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+import os
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+# MPK repo root: prefer env (mpk_validate exports nothing, so default to ~/mirage).
+repo_root = os.environ.get("MIRAGE_ROOT", os.path.expanduser("~/mirage"))
+cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda-13.2")
+os.environ["CUDA_HOME"] = cuda_home
+os.environ["PATH"] = os.path.join(cuda_home, "bin") + ":" + os.environ.get("PATH", "")
+
+setup(
+    name="@@MODULE_NAME@@",
+    ext_modules=[
+        CUDAExtension(
+            name="@@MODULE_NAME@@",
+            sources=[os.path.join(this_dir, "runtime_kernel_wrapper.cu")],
+            include_dirs=[
+                os.path.join(repo_root, "include"),
+                os.path.join(repo_root, "include/mirage/persistent_kernel"),
+                os.path.join(cuda_home, "include"),
+            ],
+            libraries=["cuda"],
+            library_dirs=[
+                os.path.join(cuda_home, "lib64"),
+                os.path.join(cuda_home, "lib64", "stubs"),
+            ],
+            extra_compile_args={
+                "cxx": ["-std=c++17"],
+                "nvcc": [
+                    "-O3",
+                    # MUST use -gencode (not -arch) for sm_100a — `-arch=sm_100a`
+                    # gets silently downgraded to sm_100 by ptxas on CUDA 13.2,
+                    # which then rejects tcgen05.* instructions.
+                    "-gencode=arch=compute_100a,code=sm_100a",
+                    "-std=c++17",
+                    "--expt-relaxed-constexpr",
+                    "-lineinfo",
+                ],
+            },
+        )
+    ],
+    cmdclass={"build_ext": BuildExtension},
+)

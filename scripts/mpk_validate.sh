@@ -11,13 +11,19 @@
 #
 # It ALSO reports the kernel-under-test's faithful single-kernel in-MPK latency
 # (test mode's MAIN purpose): a profiling-enabled driver emits a Perfetto trace
-# + CSV from which scripts/parse_profile.py reads the per-task `duration_ns`.
-# When the driver also runs the BASELINE kernel the split-K replaces, it prints
-# a `PERF_SUMMARY: splitk_us=.. mediumm_us=.. ratio=..` line; the harness
-# surfaces candidate_us / baseline_us / ratio in its verdict. Perf is reported
-# ALONGSIDE correctness — correctness (cos>0.99 + zero sentinel rows) still
-# gates PASS/FAIL; a PASS with no perf number is flagged as a WARNING because
-# the standalone-vs-in-MPK latency is exactly what this harness must capture.
+# + CSV from which scripts/parse_profile.py reads the per-task timings. The
+# kernel-latency metric is the WALL-SPAN = max(end_ts) - min(begin_ts) over the
+# task's events (first CTA start -> last CTA finish), NOT the median/avg
+# duration_ns. Decode GEMMs are BIMODAL — most of their grid_dim=128 CTAs
+# idle-exit in <1us while only a handful do real work — so the median is an
+# *idle CTA* and understates latency by ~30x; using it gives a nonsense ratio
+# (~0.06x). When the driver also runs the BASELINE kernel the split-K replaces,
+# it prints a `PERF_SUMMARY: splitk_wall_us=.. mediumm_wall_us=.. ratio=..`
+# line; the harness surfaces candidate_us / baseline_us / ratio (all WALL-SPAN)
+# in its verdict. Perf is reported ALONGSIDE correctness — correctness
+# (cos>0.99 + zero sentinel rows) still gates PASS/FAIL; a PASS with no perf
+# number is flagged as a WARNING because the standalone-vs-in-MPK latency is
+# exactly what this harness must capture.
 #
 # Usage:
 #   scripts/mpk_validate.sh <WS_INDEX> <KERNEL_NAME> <TEST_DRIVER> [options]
@@ -42,8 +48,10 @@
 #
 # Exit code: 0 = PASS, 1 = FAIL/crash, 2 = harness/setup error.
 #
-# Output: a single machine-greppable verdict line (perf_us/baseline_us/ratio
-#         are '-' if the driver was not profiling-enabled):
+# Output: a single machine-greppable verdict line. perf_us/baseline_us are the
+#         candidate/baseline WALL-SPAN in us; ratio = baseline_wall/cand_wall
+#         (>1 => candidate faster). All '-' if the driver was not
+#         profiling-enabled:
 #   MPK_VALIDATE: <PASS|FAIL> kernel=<name> gpu=<N> cos=<x> sentinel_rows=<n> \
 #       perf_us=<f|-> baseline_us=<f|-> ratio=<f|-> reason=<...>
 set -uo pipefail
@@ -273,34 +281,49 @@ print(max(vals) if vals else 0)
 PYEOF
 )"
 
-# ── PERFORMANCE: extract the in-MPK single-kernel duration from the log ──────
+# ── PERFORMANCE: extract the in-MPK single-kernel WALL-SPAN from the log ─────
 # Test mode's MAIN purpose is the faithful single-kernel latency on 1 GPU. A
 # profiling-enabled driver emits a Perfetto trace + CSV; it then runs
-# scripts/parse_profile.py to print the kernel-under-test's `duration_ns` and,
-# if it ran the BASELINE kernel too, a `PERF_SUMMARY:` line with the ratio.
-# We scrape three things, in priority order, and surface them in the verdict:
-#   PERF_SUMMARY: splitk_us=<f> mediumm_us=<f> ratio=<f>   (candidate vs baseline)
-#   PERF: kernel=<TASK> ... median_ns=<n> (median_us=<f>)  (candidate only)
+# scripts/parse_profile.py --stat wall to print the kernel-under-test's
+# WALL-SPAN and, if it ran the BASELINE kernel too, a `PERF_SUMMARY:` line.
+#
+# KERNEL-LATENCY METRIC = WALL-SPAN, NOT median. Decode GEMMs are bimodal: most
+# of grid_dim=128 CTAs idle-exit in <1us, only a handful do real work, so the
+# median duration_ns is an *idle CTA* (~0.66us) and gives a nonsense ratio
+# (~0.06x). The correct latency = max(end_ts)-min(begin_ts) over the task's
+# events (= `--stat wall` / the WALL_us field). We scrape, in priority order:
+#   PERF_SUMMARY: splitk_wall_us=<f> mediumm_wall_us=<f> ratio=<f> (cand vs base)
+#   PERF: kernel=<TASK> ... WALL_us=<f>                            (candidate)
+# with back-compat fallbacks to the legacy splitk_us / median_us field names so
+# an older driver still surfaces *something* (flagged via the field it matched).
 # This block NEVER changes PASS/FAIL — correctness still gates (cos + sentinel).
 # A missing perf number is reported as `perf=-` so the caller sees the driver
 # was not profiling-enabled (and should be refined to add a profiler_tensor).
 read -r PERF_CAND_US PERF_BASE_US PERF_RATIO PERF_NS <<EOF
 $("$PY" - "$LOG" <<'PYEOF'
 import re, sys
-cand_us = base_us = ratio = ns = None
+cand_us = base_us = ratio = wall = None
 with open(sys.argv[1], errors="ignore") as f:
     text = f.read()
-# 1) Prefer the explicit PERF_SUMMARY line (candidate + baseline + ratio).
-m = re.search(r"PERF_SUMMARY:\s*splitk_us=([\d.]+)\s+mediumm_us=([\d.]+)"
-              r"\s+ratio=([\d.]+)", text)
+# 1) Prefer the explicit PERF_SUMMARY line, WALL-SPAN field names first.
+m = re.search(r"PERF_SUMMARY:\s*splitk_wall_us=([\d.]+)\s+"
+              r"mediumm_wall_us=([\d.]+)\s+ratio=([\d.]+)", text)
+if not m:
+    # Back-compat: legacy PERF_SUMMARY used splitk_us / mediumm_us (median).
+    m = re.search(r"PERF_SUMMARY:\s*splitk_us=([\d.]+)\s+"
+                  r"mediumm_us=([\d.]+)\s+ratio=([\d.]+)", text)
 if m:
     cand_us, base_us, ratio = m.group(1), m.group(2), m.group(3)
-# 2) Fall back to the last PERF: median_ns / median_us for the candidate.
-for mm in re.finditer(r"median_ns=([\d.]+).*?median_us=([\d.]+)", text):
-    ns = mm.group(1)
+# 2) Fall back to the last per-candidate PERF line. WALL_us is the latency
+#    metric; only if no WALL_us is present do we accept median_us (legacy).
+for mm in re.finditer(r"WALL_us=([\d.]+)", text):
+    wall = mm.group(1)
     if cand_us is None:
-        cand_us = mm.group(2)
-print(cand_us or "-", base_us or "-", ratio or "-", ns or "-")
+        cand_us = mm.group(1)
+if cand_us is None:
+    for mm in re.finditer(r"median_us=([\d.]+)", text):
+        cand_us = mm.group(1)
+print(cand_us or "-", base_us or "-", ratio or "-", wall or "-")
 PYEOF
 )
 EOF
@@ -366,14 +389,15 @@ echo "────────────────────────�
 # the driver was not profiling-enabled — surface that as a warning so the
 # harness gets refined to add a profiler_tensor + trace_name.
 if [[ "$PERF_CAND_US" == "-" && "$PERF_NS" == "-" ]]; then
-    echo "  PERF: WARNING — no in-MPK duration_ns found in log."
+    echo "  PERF: WARNING — no in-MPK WALL-SPAN found in log."
     echo "        The driver must enable profiling (params['profiler_tensor'] +"
     echo "        params['trace_name'] before pk.compile()) and run"
-    echo "        scripts/parse_profile.py <csv> <TASK_NAME> --stat all so the"
-    echo "        kernel-under-test's single-kernel latency is reported."
+    echo "        scripts/parse_profile.py <csv> <TASK_NAME> --stat wall so the"
+    echo "        kernel-under-test's single-kernel WALL-SPAN latency is"
+    echo "        reported (median/avg are bimodal-skewed — do NOT use them)."
 else
-    echo "  PERF: candidate_us=$PERF_CAND_US baseline_us=$PERF_BASE_US"\
-         "ratio(base/cand)=$PERF_RATIO candidate_median_ns=$PERF_NS"
+    echo "  PERF: candidate_wall_us=$PERF_CAND_US baseline_wall_us=$PERF_BASE_US"\
+         "ratio(base/cand)=$PERF_RATIO candidate_WALL_us=$PERF_NS"
 fi
 echo "─────────────────────────────────────────────────────────────────"
 

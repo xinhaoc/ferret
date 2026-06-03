@@ -184,9 +184,29 @@ it.
 
 Correctness is necessary but NOT sufficient: a kernel can be fast standalone
 (ferret's dedicated-worker bench) yet slow in the shared-worker megakernel. The
-faithful number is the kernel's `duration_ns` inside the real MPK run, which
+faithful number is the kernel's **WALL-SPAN** inside the real MPK run, which
 test mode exposes via the profiler. Make every test-mode driver report it; the
-validator contract now REQUIRES a perf number alongside the correctness gate.
+validator contract now REQUIRES a WALL-SPAN perf number alongside the
+correctness gate.
+
+### KERNEL-LATENCY METRIC = WALL-SPAN, NOT median (the bimodal-CTA pitfall)
+
+The profiler CSV's per-task `duration_ns` is a **per-CTA** span. At decode these
+kernels are **BIMODAL**: the kernel launches `grid_dim` (e.g. 128) CTAs sized
+for the compile-time M=mbt, but only `ceil(active_rows * N / tile)` of them do
+real work — the rest idle-exit in <1us (decode has active_rows=1). So the
+MEDIAN duration_ns is an *idle CTA*: for the mediumm dense-GEMM, median ≈ 0.66us
+while the real work takes ≈ 29us. Ranking kernels by median is therefore
+GROSSLY wrong — split-K vs mediumm by median is ratio ≈ **0.06x** (it would
+declare the FASTER kernel "16x slower").
+
+The correct kernel latency is the **WALL-SPAN** = `max(end_ts) - min(begin_ts)`
+over the task's events — wallclock from the first CTA starting to the last CTA
+finishing. By WALL-SPAN: split-K = 22.27us, mediumm = 29.31us ⇒ ratio = **1.32x**
+(split-K faster), which matches reality. `scripts/parse_profile.py --stat wall`
+returns this (with 32-bit %globaltimer wrap correction); `--stat all` also
+includes `wall_ns`/`wall_us`. **Drive every WIN/SLOWER decision off WALL-SPAN;
+median/max are secondary characterization of the per-CTA work split only.**
 
 ### How a driver emits the trace (opt-in, before compile)
 
@@ -204,36 +224,41 @@ pk(); torch.cuda.synchronize()                # CSV exists after this
 The buffer MUST be `uint64` on CUDA; `3000*128` is the demo-conventional size
 (2 entries per task event). See the MPK `test-mode` skill, section "Profiling".
 
-### How a driver reads the duration_ns back
+### How a driver reads the WALL-SPAN back
 
-Run `scripts/parse_profile.py <csv> <TASK_NAME> --stat all` (JSON out with
-`min_ns`/`avg_ns`/`median_ns`/`count`). `TASK_NAME` is the TaskType enum name as
-it appears in the CSV — e.g. `TASK_FP8_GEMM_DENSE_QKVA_SPLITK_SM100` for the
-split-K candidate, `TASK_FP8_GEMM_DENSE_MEDIUMM_SM100` for the mediumm baseline;
-`--list` enumerates what ran if you're unsure. Print a machine-greppable line
-`mpk_validate.sh` scrapes:
+Run `scripts/parse_profile.py <csv> <TASK_NAME> --stat wall` (JSON out with
+`wall_ns`/`wall_us`/`count`), or `--stat all` (which adds `wall_ns`/`wall_us`
+alongside `min_ns`/`max_ns`/`avg_ns`/`median_ns`). `TASK_NAME` is the TaskType
+enum name as it appears in the CSV — e.g. `TASK_FP8_GEMM_DENSE_QKVA_SPLITK_SM100`
+for the split-K candidate, `TASK_FP8_GEMM_DENSE_MEDIUMM_SM100` for the mediumm
+baseline; `--list` enumerates what ran if you're unsure. Print a
+machine-greppable line `mpk_validate.sh` scrapes (WALL_us is the latency metric;
+median/max are secondary, do NOT rank on them):
 
 ```python
-# PERF: kernel=<TASK_NAME> count=.. min_ns=.. avg_ns=.. median_ns=.. (median_us=..)
+# PERF: kernel=<TASK_NAME> count=.. WALL_us=.. (median_us=.. max_us=.. avg_us=..)
 ```
 
 ### Report a RATIO, not just an absolute
 
 To know whether the candidate actually beats what it replaces *in-MPK*, run the
 BASELINE kernel through the SAME test-mode harness at the SAME shape (same
-A/B/scales/reference, so the two `duration_ns` are directly comparable) and
-print:
+A/B/scales/reference, so the two WALL-SPANs are directly comparable) and print
+(field names are `*_wall_us`; ratio = mediumm_wall/splitk_wall):
 
 ```python
-# PERF_SUMMARY: splitk_us=<f> mediumm_us=<f> ratio=<f>   # ratio = mediumm/splitk; >1 = splitk faster
+# PERF_SUMMARY: splitk_wall_us=<f> mediumm_wall_us=<f> ratio=<f>   # >1 = splitk faster
 ```
 
-`mpk_validate.sh` scrapes `PERF_SUMMARY:` (preferred) or the last `PERF:
-median_ns/median_us` and surfaces `perf_us=`/`baseline_us=`/`ratio=` in its
-verdict line. `perf_us=-` means the driver was not profiling-enabled — fix it.
-Perf is reported ALONGSIDE correctness; cos+sentinel still gate PASS/FAIL. The
-canonical driver runs the qkv_a shape through BOTH `kernel="splitk"` and
-`kernel="mediumm"` and prints the `PERF_SUMMARY:` ratio — copy its structure.
+`mpk_validate.sh` scrapes `PERF_SUMMARY:` (preferred — WALL-SPAN field names,
+with back-compat fallback to the legacy `splitk_us`/`mediumm_us`) or the last
+`PERF: WALL_us` and surfaces `perf_us=`/`baseline_us=`/`ratio=` (all WALL-SPAN)
+in its verdict line. `perf_us=-` means the driver was not profiling-enabled —
+fix it. Perf is reported ALONGSIDE correctness; cos+sentinel still gate
+PASS/FAIL. The canonical driver
+(`tests/runtime_python/blackwell/sm100_fp8_gemm_dense/test_fp8_gemm_dense_qkva_splitk_v2_testmode.py`)
+runs the qkv_a shape through BOTH `kernel="splitk"` and `kernel="mediumm"` and
+prints the WALL-SPAN `PERF_SUMMARY:` ratio — copy its structure.
 
 ---
 
@@ -267,10 +292,12 @@ A Pattern B dir MUST ship a `test_<name>.py` (or `run.py`) that
 4. parses the verdict: PASS iff **no crash/timeout** AND **no CUDA sentinel
    error** in the log AND **every `cos=` > 0.99** AND **`sentinel_rows=` == 0**
    on every line AND no `FAIL`/`Traceback`.
-5. scrapes the **PERFORMANCE** number(s): a `PERF_SUMMARY:` line
-   (`splitk_us`/`mediumm_us`/`ratio`) if present, else the candidate's `PERF:
-   median_ns/median_us`. This is reported ALONGSIDE the verdict (it does NOT
-   change PASS/FAIL); a missing perf number is flagged as a WARNING.
+5. scrapes the **PERFORMANCE** WALL-SPAN number(s): a `PERF_SUMMARY:` line
+   (`splitk_wall_us`/`mediumm_wall_us`/`ratio`, back-compat to legacy
+   `splitk_us`/`mediumm_us`) if present, else the candidate's `PERF: WALL_us`.
+   WALL-SPAN is the latency metric, NOT median (decode kernels are bimodal — the
+   median is an idle CTA; see the PERFORMANCE section). Reported ALONGSIDE the
+   verdict (does NOT change PASS/FAIL); a missing perf number is a WARNING.
 6. **reverts the `.cuh` copy** (restores the backup) so the MPK tree is never
    left dirty — this is a *validator*, not an integrator. `--keep-on-pass`
    overrides on success; `--no-revert` keeps it regardless.

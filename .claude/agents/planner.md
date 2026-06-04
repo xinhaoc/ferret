@@ -43,6 +43,13 @@ clean fresh workspace passes all three checks.
    one's first ~200 lines to learn its tile / warp / pipeline shape.
 4. `examples/<task-family>/` (if a directory matching the task name
    exists, the strongest prior kernel lives here).
+5. **KernelWiki SOTA prior-art** (via the `kernelwiki` skill): query for the
+   closest external SOTA kernel to this task's op/precision/arch —
+   `python3 "${FERRET_ROOT:-$HOME/ferret}/resources/kernelwiki/scripts/query.py" "<op precision arch>" --type kernel --architecture <arch> --compact --limit 5`,
+   then `get_page.py <id> --follow-sources` for the named baseline + perf_claim.
+   This grounds you in EXTERNAL SOTA (the user's rule: refs = external SOTA, not
+   our in-tree kernel) and anchors `target_ratio`. See the skill for the M=1 /
+   scope / "perf_claim is a hint not achieved" caveats.
 
 ## Decisions you must make
 
@@ -55,6 +62,9 @@ Pick exactly one file the mainthread should copy as the first
   ferret runs frozen as "known-good starting points".
 - The first file in `task.yaml.references[]` if it's a hand-written
   kernel (not a library header).
+- A KernelWiki page's `--include-code` dump (step 5) when it is closer to
+  this exact shape/precision than the frozen example — esp. for a NEW task
+  with no `examples/` dir yet (saves the human pre-wiring `references[]`).
 - If neither exists, point at the closest `examples/tcgen05-gemm/` PTX
   example (this guarantees the agent doesn't fall back to CUDA cores).
 

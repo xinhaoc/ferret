@@ -35,6 +35,14 @@ docs/dev-memory/
 .claude/*
 !.claude/agents/
 .claude/agents/*.lock
+# ...plus the committed kernelwiki skill (the rest of .claude/skills/ stays local).
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/kernelwiki/
+!.claude/skills/kernelwiki/**
+
+# Runtime logs (e.g. scripts/update_kernelwiki.sh writes logs/kernelwiki-update.log)
+logs/
 
 # Build artifacts
 *.cubin

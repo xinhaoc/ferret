@@ -12,6 +12,33 @@ loadable through Mirage's public C++ kernel-launch ABI (headers under
 `$MIRAGE_ROOT/include/mirage/`). The `reviewer` subagent + Codex verifies
 this for you on every tagged version.
 
+### ⚠ Mirage megakernel co-residency invariants (HARD — for any `tcgen05` kernel)
+
+Your kernel does NOT run alone in Mirage — it runs as one task inside a
+**persistent megakernel** where ~136 worker CTAs (1/SM) co-reside, and at
+DeepSeek-V3 decode it shares each SM with **MLA-TP-decode, which holds the
+FULL 512-column TMEM pool (no relinquish) for its whole task**. Your
+standalone benchmark has the GPU to itself, so it can NEVER see this — a
+kernel that is correct + fast standalone can still **IMA/crash at multi-rank
+(TP≥2) decode**. (This is the 2026-06-04 FP8 split-K crash: every FP8 split-K
+crashed multi-rank; the BF16 split-K did not.) So:
+
+1. **SAME-WARP `tcgen05.alloc`/`dealloc`.** Issue alloc AND dealloc from the
+   SAME warp (e.g. both warp 0), warp-uniform. **Cross-warp** (alloc warp 2 /
+   dealloc warp 0) violates the CuTe permit invariant and drifts under
+   Independent Thread Scheduling + multi-rank scheduler jitter → corrupt/zero
+   `taddr` → IMA. Reference that SURVIVES: `linear_sm100_mpk.cuh` (BF16
+   split-K, warp0 alloc + warp0 free). The MMA warp that *uses* TMEM may be a
+   different warp — only the alloc/dealloc PERMIT must be same-warp.
+2. **Minimize TMEM columns.** MLA-TP holds 512; the SM has 512 total. A
+   co-resident GEMM that allocs 256 cols (N baked into the accumulator,
+   `TCA = NE*BN`) fights the pool and widens the crash window. Prefer the BF16
+   pattern: small `MMA_N` (16) with N tiled across the GRID → TMEM is
+   N-independent (~32 cols), NOT N-baked (256).
+3. The crash is a **co-residency** phenomenon you cannot reproduce standalone
+   — note it for the Mirage main agent, who validates the OUTPUT against the
+   in-MPK **multi-rank decode** surface (not just standalone TFLOPS).
+
 ## 0. Session start — first 60 seconds
 
 Run these, in this order, before anything else:
@@ -324,6 +351,18 @@ Do **not** read, copy from, or git-fetch from a sibling workspace.
 - `resources/<lib>/` — submoduled vendor code (FlashInfer, CUTLASS,
   ThunderKittens, DeepGemm, FlashMLA). Don't try to be exhaustive —
   follow the trail your iterator/reviewer points at.
+- `resources/kernelwiki/` — **KernelWiki**, a SOTA-kernel prior-art corpus
+  (merged PRs + synthesis pages from DeepGEMM/CUTLASS/vLLM/SGLang/
+  FlashInfer/FlashMLA, Blackwell/Hopper) queried via the `kernelwiki`
+  skill (`scripts/query.py` / `get_page.py`, offline). It is wired into
+  the workflow at two points: the **planner** queries it at cold-start
+  (closest SOTA template + a `target_ratio` anchor) and the **iterator**
+  queries it **on stall** (by bottleneck symptom). It grounds the
+  "refs = external SOTA, not our in-tree kernel" rule. Refresh the corpus
+  with `scripts/update_kernelwiki.sh` (see `docs/kernelwiki-refresh.md`).
+  Caveats live in the skill: M=1/skinny-M decode ≠ DeepGEMM's large-M
+  mainloop; the perf_claim is a ceiling-hint, the in-tree `mediumm` bar
+  still governs.
 
 ## 10. There is no other path
 

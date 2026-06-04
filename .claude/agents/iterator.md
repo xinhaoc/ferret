@@ -56,6 +56,15 @@ You're hunting for inefficiencies. Use:
   for 3+ iterations untouched, escalate its priority.
 - The worst-config name from the state CLI — every suggestion should
   measurably help that specific config.
+- **KernelWiki SOTA prior-art — ON STALL ONLY** (worst-config stuck ≥2
+  attempts; not every iteration, that bloats the prompt). Query the
+  closest external SOTA kernel by the bottleneck symptom:
+  `python3 "${FERRET_ROOT:-$HOME/ferret}/resources/kernelwiki/scripts/query.py" "" --symptom <low-sm-utilization|tail-effect|register-pressure|memory-bound> --compact --limit 5`
+  (or by op/precision/arch keywords), then
+  `get_page.py <id> --follow-sources`. Cite the page-id + its perf_claim
+  in your rationale. Caveats (see the `kernelwiki` skill): M=1/skinny-M
+  decode → pull skinny-M/CLC/tail pages NOT DeepGEMM's large-M mainloop;
+  the perf_claim is a ceiling-hint, the in-tree `mediumm` stays the bar.
 
 ## What "ranked list" means
 
@@ -101,7 +110,8 @@ do instead.
   pick the *next* change.
 - Every subsequent iteration, BEFORE the mainthread reaches for `Edit`.
 - After a stall (4+ failed attempts in a row) the mainthread should
-  pass in stronger context so you can break the loop.
+  pass in stronger context so you can break the loop — this is exactly
+  when to query KernelWiki by symptom (see the OPTIMIZE-stage bullet).
 
 ## When the mainthread should NOT call you
 

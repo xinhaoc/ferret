@@ -54,6 +54,10 @@ async def shell_local(cmd: str) -> tuple[str, str, int]:
     return stdout.decode(), stderr.decode(), proc.returncode
 
 
+# shell_remote (ssh + rsync wrapper for routing GPU work to a remote host)
+# lives in remote.py — imported lazily only when --remote-host is set.
+
+
 async def main():
     parser = argparse.ArgumentParser(
         description="ferret — autonomous CUDA kernel optimization agent",
@@ -82,6 +86,15 @@ async def main():
         "--arch",
         default=None,
         help="Override env FERRET_ARCH (default: sm_100a)",
+    )
+    parser.add_argument(
+        "--remote-host",
+        default=None,
+        help=("If set, ssh every shell command to this host and rsync the "
+              "workspace before/after each call. Use an SSH config alias "
+              "(e.g. 'nebius-b200') with ControlMaster for speed. The remote "
+              "must have the agent root at the same absolute path as local "
+              "and resources/ already staged. Default: run all shells locally."),
     )
     args = parser.parse_args()
 
@@ -115,6 +128,17 @@ async def main():
     arch = args.arch or os.environ.get("FERRET_ARCH", "sm_100a")
     max_iterations = args.max_iterations or spec.budget.max_iterations
 
+    # Pick which shell to use. Default = local (unchanged behavior). With
+    # --remote-host, every shell command goes through ssh + rsync. Selection
+    # happens BEFORE the orchestrator is constructed so the tool layer
+    # doesn't need to know which one it got.
+    if args.remote_host:
+        from .remote import make_shell_remote
+        sh_fn = make_shell_remote(args.remote_host, ws_path, env_file=AGENT_ROOT / ".env")
+        logger.info(f"Remote host  : {args.remote_host} (workspace mirrored to same path)")
+    else:
+        sh_fn = shell_local
+
     logger.info(f"Agent root   : {AGENT_ROOT}")
     logger.info(f"Workspace    : {ws_path}")
     logger.info(f"Task spec    : {task_yaml_path}")
@@ -131,7 +155,7 @@ async def main():
         client=client,
         model_name=model,
         workspace_path=str(ws_path),
-        sh_fn=shell_local,
+        sh_fn=sh_fn,
         agent_root=AGENT_ROOT,
         task_yaml=task_yaml_path,
         arch=arch,

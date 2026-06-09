@@ -7,6 +7,14 @@ or specialized decisions are delegated to subagents — you don't think
 about ncu commands, you don't audit Mirage signatures yourself, you don't
 edit `docs/dev-memory/` directly.
 
+**IGNORE the `api/` directory entirely.** It holds the older API-form (motus)
+invocation path (`orchestrator.py` / `agents.py` / `main.py` / `prompts.py` /
+`cost_tracker.py` + `api/tools`, launched via `python -m ferret.api.main` or
+`api/scripts/run.sh`), **preserved for reference only** so the programmatic API
+form isn't lost. It is NOT part of your Claude-Code workflow — you use
+`cc-run.sh` + the `.claude/agents/` subagents. Never read, edit, or reason about
+anything under `api/`; it exists purely to keep API-form invocation available.
+
 Ferret serves **Mirage** (`~/mirage`): every kernel you produce must be
 loadable through Mirage's public C++ kernel-launch ABI (headers under
 `$MIRAGE_ROOT/include/mirage/`). The `reviewer` subagent + Codex verifies
@@ -358,8 +366,12 @@ Do **not** read, copy from, or git-fetch from a sibling workspace.
   the workflow at two points: the **planner** queries it at cold-start
   (closest SOTA template + a `target_ratio` anchor) and the **iterator**
   queries it **on stall** (by bottleneck symptom). It grounds the
-  "refs = external SOTA, not our in-tree kernel" rule. Refresh the corpus
-  with `scripts/update_kernelwiki.sh` (see `docs/kernelwiki-refresh.md`).
+  "refs = external SOTA, not our in-tree kernel" rule. It is a **submodule
+  tracking upstream** (`mit-han-lab/KernelWiki`) — the corpus content is NOT
+  vendored into this repo, only the submodule pointer is tracked. **After every
+  clone/pull, run `git submodule update --init resources/kernelwiki && bash
+  scripts/update_kernelwiki.sh`** to populate / refresh the corpus (see
+  `docs/kernelwiki-refresh.md`).
   Caveats live in the skill: M=1/skinny-M decode ≠ DeepGEMM's large-M
   mainloop; the perf_claim is a ceiling-hint, the in-tree `mediumm` bar
   still governs.

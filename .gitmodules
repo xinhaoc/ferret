@@ -31,3 +31,4 @@
 [submodule "resources/kernelwiki"]
 	path = resources/kernelwiki
 	url = https://github.com/mit-han-lab/KernelWiki
+	branch = master

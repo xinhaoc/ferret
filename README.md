@@ -2,22 +2,37 @@
 
 Autonomous CUDA kernel optimization agent on top of **Claude Code**.
 Structured task specs, per-config scoring, two-stage REPRODUCE→OPTIMIZE
-workflow, git-tagged version tracking, six scoped subagents driving
+workflow, git-tagged version tracking, scoped subagents driving
 planner / iterator / profiler / reviewer / codex-dispatcher / memory-keeper /
 kernel-extractor responsibilities.
 
-A ferret run is one `claude` process per workspace. The mainthread reads
-`CLAUDE.md`, follows the loop discipline (§6.5), and delegates specialized
-work to the subagents under `.claude/agents/`. Mirage consumes the final
-`kernel.cuh` produced by `kernel-extractor` at convergence.
+## How ferret is invoked (the dispatch model)
 
-## Lineage
+ferret is not run by hand in the normal flow — **it is dispatched as a separate
+Claude Code session, on demand, from Mirage.**
 
-ferret v0.2 is the migration of v0.1's motus / Anthropic-API path
-(`orchestrator.py` + `agents.py` + `main.py` + `prompts.py` +
-`cost_tracker.py` — all removed in this cut) onto Claude Code subscription.
-v0.1 lives in git history; the working subset that survives is the
-**state CLI + task spec loader + scoring + ncu wrapper + profile CLI**.
+1. **The whole coding agent runs as its own Claude Code session.** One ferret run
+   = one headless `claude` mainthread bound to a single workspace
+   (`FERRET_WORKSPACE=workspaceN`), launched by `scripts/cc-run.sh`. That session
+   reads `CLAUDE.md`, follows the loop discipline, and drives the scoped subagents
+   under `.claude/agents/`. It is a self-contained agent — its own context, its
+   own git-tagged kernel history — not a library call inside the caller's process.
+
+2. **You dispatch it via a Mirage subagent.** When Mirage needs a new/faster
+   kernel, its mainthread invokes the
+   [`ferret-kernel-agent` subagent](https://github.com/mirage-project/mirage/blob/mpk/.claude/agents/ferret-kernel-agent.md).
+   That subagent translates the Mirage-side kernel requirement into a ferret
+   `task.yaml`, picks a free `workspace[1-8]/`, launches `scripts/cc-run.sh` in
+   non-interactive headless mode with the standing goal injected, monitors the
+   workspace's git tags + `KERNEL_RESULT` lines until the goal is met or the
+   wall-time budget expires, then hands the winning `workspace<N>/kernel.cuh`
+   (Mirage-ready, no host code) back into the Mirage tree. So from Mirage's point
+   of view, "optimize this kernel" is a single subagent call; ferret is the
+   separate Claude-Code session that call spins up.
+
+> **`api/` is NOT this path.** The directory `api/` preserves the older
+> programmatic / `motus`-API invocation form (`python -m ferret.api.main`) for
+> reference only — the Claude-Code agent **ignores** it. See `api/README.md`.
 
 ## Requirements
 
@@ -31,53 +46,51 @@ v0.1 lives in git history; the working subset that survives is the
 
 ```bash
 pip install pyyaml         # ferret has zero runtime deps beyond stdlib + pyyaml
+git submodule update --init resources/kernelwiki && bash scripts/update_kernelwiki.sh
 ```
 
-ferret runs in place — no pip install of the package itself. The launcher
-exports `PYTHONPATH=$(dirname FERRET_DIR)` so subagents can `python -m
-ferret.{state,profile,task_spec,cc_goal}` from any cwd.
+ferret runs in place — no pip install of the package itself. `cc-run.sh` exports
+`PYTHONPATH=$(dirname FERRET_DIR)` so subagents can `python -m
+ferret.{state,profile,task_spec,cc_goal}` from any cwd. The `resources/` library
+sources + `resources/kernelwiki` are git submodules — run the submodule-update +
+`update_kernelwiki.sh` once after cloning (KernelWiki content is NOT vendored,
+only the upstream pointer is tracked).
 
 ## Usage
 
+Normally a Mirage dispatch drives this (above). To launch a workspace directly:
+
 ```bash
-# Init + launch a workspace (creates ~/ferret/workspace3/ with its own .git,
-# copies task.yaml, picks a GPU, exports env, exec claude with the
-# /goal + --append-system-prompt channels wired up).
+# Init + launch workspace3 (own .git, copies task.yaml, picks a GPU, exports env,
+# execs claude with the /goal + --append-system-prompt channels wired up).
 bash scripts/cc-run.sh 3 tasks/mla-mtp-decode-q1to4-kv4096.yaml
 ```
 
-The mainthread reads `CLAUDE.md`, runs the session-start checklist, and
-either dispatches to `planner` (cold start) or to `iterator` (resume).
-It keeps iterating until `python3 -m ferret.state` reports `advance? True`
-AND every config has the ✓ marker — at which point the `reviewer` invokes
-`kernel-extractor` to emit a Mirage-ready `kernel.cuh`. The Mirage-side
-dispatcher subagent (`~/mirage/.claude/agents/ferret-kernel-agent.md`)
-picks up `workspace<N>/kernel.cuh` and `cp`'s it into the Mirage tree.
+The mainthread reads `CLAUDE.md`, runs the session-start checklist, and either
+dispatches to `planner` (cold start) or `iterator` (resume). It keeps iterating
+until `python3 -m ferret.state` reports `advance? True` AND every config has the
+✓ marker — at which point `reviewer` invokes `kernel-extractor` to emit a
+Mirage-ready `kernel.cuh`, which the Mirage-side dispatcher `cp`'s into the tree.
 
 ### Authoring a new task
 
-Copy `tasks/template.yaml`, fill in problem description, shapes, baseline
-SOTA name (just a label — the kernel measures it live), per-config target
-ratios, constraints, and hints. Validate with:
+Copy `tasks/template.yaml`, fill in problem description, shapes, baseline SOTA
+name (a label — the kernel measures it live), per-config target ratios,
+constraints, hints. Validate with:
 
 ```bash
 PYTHONPATH=/home/$USER python3 task_spec.py tasks/your_task.yaml
 ```
 
-The Mirage-side dispatcher can author this for you automatically — see
-`~/mirage/.claude/agents/ferret-kernel-agent.md` (steps 1–4).
+The Mirage-side dispatcher authors this for you automatically (steps 1–4 of the
+`ferret-kernel-agent` subagent).
 
 ### Inspecting the current state
 
 ```bash
-# Latest tag's per-config TFLOPS + spec-driven RunState
-PYTHONPATH=/home/$USER python3 -m ferret.state workspace<N>/ workspace<N>/task.yaml
-
-# Concrete goal text rendered from a task.yaml
-PYTHONPATH=/home/$USER python3 -m ferret.cc_goal workspace<N>/
-
-# One-shot ncu profile (in OPTIMIZE stage, after compile)
-PYTHONPATH=/home/$USER python3 -m ferret.profile workspace<N>/
+PYTHONPATH=/home/$USER python3 -m ferret.state  workspace<N>/ workspace<N>/task.yaml  # per-config TFLOPS + RunState
+PYTHONPATH=/home/$USER python3 -m ferret.cc_goal workspace<N>/                          # rendered /goal text
+PYTHONPATH=/home/$USER python3 -m ferret.profile workspace<N>/                          # one-shot ncu profile
 ```
 
 ## Layout
@@ -94,74 +107,57 @@ ferret/
 ├── tasks/               authored task.yaml specs (+ template.yaml)
 ├── baselines/           reference baseline.py scripts the kernel re-runs
 ├── examples/            saved best kernels from prior runs
-├── docs/
-│   ├── dev-memory/      gitignored, populated at runtime by memory-keeper
-│   ├── dev-memory-seed/ committed template (cc-init bootstraps from here)
-│   ├── architecture/    GPU-level limits (B200, etc.)
-│   ├── patterns/        optimization techniques (swapab, split-K, chunked)
-│   ├── ptx-isa-9.2/     instruction semantics
-│   └── MAPPING.md       topic → reference file table
-├── resources/           git-submodule library sources (CUTLASS, FlashInfer …)
-├── scripts/
-│   ├── cc-init.sh       create workspace<N>/ skeleton with own .git
-│   ├── cc-run.sh        launch claude bound to workspace<N> + goal + env
-│   └── check_resource_refs.py   submodule path sanity-check
-├── .claude/agents/
-│   ├── planner.md
-│   ├── iterator.md
-│   ├── profiler.md
-│   ├── reviewer.md
-│   ├── codex-dispatcher.md
-│   ├── memory-keeper.md
-│   └── kernel-extractor.md
-└── workspace<N>/        (gitignored) per-run kernel.cu + kernel.cuh +
-                         progress.md + own .git
+├── docs/                dev-memory(-seed) + architecture/patterns/ptx-isa refs
+├── resources/           git-submodule library sources (CUTLASS, FlashInfer,
+│                        … + kernelwiki, upstream-tracked, run the update script)
+├── scripts/             cc-init.sh / cc-run.sh / update_kernelwiki.sh / check_resource_refs.py
+├── .claude/agents/      planner · iterator · profiler · reviewer ·
+│                        codex-dispatcher · memory-keeper · kernel-extractor
+├── api/                 PRESERVED API-form (motus) path — agent IGNORES it (see api/README.md)
+└── workspace<N>/        (gitignored) per-run kernel.cu + kernel.cuh + progress.md + own .git
 ```
 
 ## How the loop works (one workspace)
 
-1. `cc-init.sh <N> <task.yaml>` creates `workspace<N>/` with own `.git`,
+1. `cc-init.sh <N> <task.yaml>` creates `workspace<N>/` with its own `.git`,
    copies task.yaml, writes a `progress.md` skeleton.
-2. `cc-run.sh <N>` picks a GPU, exports `FERRET_WORKSPACE`/`PYTHONPATH`/
-   `TMPDIR`, renders the goal from task.yaml via `ferret.cc_goal`, and
-   `exec`s `claude` with both `--append-system-prompt "STANDING GOAL: …"`
-   and a leading `/goal …` slash command (the latter installs a
-   session-scoped Stop hook so the mainthread cannot exit before goal-
-   met).
-3. Mainthread runs the §0 session-start checklist, decides cold-start
-   vs resume, dispatches to `planner` or `iterator`.
+2. `cc-run.sh <N>` picks a GPU, exports `FERRET_WORKSPACE`/`PYTHONPATH`/`TMPDIR`,
+   renders the goal via `ferret.cc_goal`, and `exec`s `claude` with
+   `--append-system-prompt "STANDING GOAL: …"` plus a leading `/goal …` slash
+   command (installs a session-scoped Stop hook so the mainthread cannot exit
+   before goal-met).
+3. Mainthread runs the §0 session-start checklist, decides cold-start vs resume,
+   dispatches to `planner` or `iterator`.
 4. Each iteration: write/edit kernel.cu → nvcc → `./kernel` → observe
-   `KERNEL_RESULT` / `KERNEL_RESULT_REFERENCE` lines → `git add … &&
-   commit -m "v###: …" && git tag v###`.
-5. After every tag, dispatch `reviewer`. Reviewer runs 4 checks (API
-   alignment via `codex-dispatcher`, output keys, constraints, iterator
-   follow-through), optionally escalates new host facts to
-   `memory-keeper`, and at convergence dispatches `kernel-extractor`
-   which writes `workspace<N>/kernel.cuh` (Mirage-ready, no host code).
-6. Goal met → reviewer's last block records `convergence:` →
-   mainthread exits cleanly.
+   `KERNEL_RESULT` / `KERNEL_RESULT_REFERENCE` → `git commit -m "v###: …" && git tag v###`.
+5. After every tag, dispatch `reviewer` (4 checks: ABI alignment via
+   `codex-dispatcher`, output keys, constraints, iterator follow-through;
+   escalates new host facts to `memory-keeper`; at convergence dispatches
+   `kernel-extractor` → `workspace<N>/kernel.cuh`).
+6. Goal met → reviewer records `convergence:` → mainthread exits cleanly; the
+   Mirage dispatcher collects `kernel.cuh`.
 
 ## Submodule maintenance
 
 ```bash
-python3 scripts/check_resource_refs.py           # must exit 0
+python3 scripts/check_resource_refs.py           # must exit 0 (verifies resources/<sub>/<path> refs)
 python3 scripts/check_resource_refs.py --verbose # per-submodule ref counts
 ```
 
-The script walks `*.md` / `*.py` and verifies every `resources/<sub>/<path>`
-reference resolves in the pinned submodule. Catches drift between
-`.gitmodules` and the on-disk tree.
+## Lineage
 
-## Status
-
-`cc` branch contains the Claude-Code path. Smoke-tested end-to-end
-(planner → 3× write→compile→run→tag→reviewer→codex-dispatcher,
-convergence-triggered kernel-extractor producing `kernel.cuh`); see
-`workspace1/progress.md` for the validation transcript.
+ferret v0.2 migrated v0.1's `motus` / Anthropic-API path
+(`orchestrator.py` + `agents.py` + `main.py` + `prompts.py` + `cost_tracker.py`)
+onto the Claude-Code subscription + subagents design. That v0.1 API form is
+**preserved under `api/`** (not active; the agent ignores it). The surviving
+shared core is the **state CLI + task spec loader + scoring + ncu wrapper +
+profile CLI** at the repo root.
 
 ## See also
 
-- `~/mirage/.claude/agents/ferret-kernel-agent.md` — the mirage-side
-  dispatcher (how mirage's mainthread invokes ferret).
+- [`ferret-kernel-agent` subagent](https://github.com/mirage-project/mirage/blob/mpk/.claude/agents/ferret-kernel-agent.md)
+  — the Mirage-side dispatcher (how Mirage invokes ferret).
 - `tasks/template.yaml` — full task.yaml schema with annotations.
 - `CLAUDE.md` — mainthread contract; §6.5 is the loop discipline.
+- `api/README.md` — the preserved API-form path (reference only).
+```

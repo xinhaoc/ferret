@@ -201,6 +201,29 @@ KERNEL_RESULT {"<config>": <kernel-tflops>, ...}
 KERNEL_RESULT_REFERENCE {"<config>": <reference-tflops>, ...}
 ```
 
+### Self-submit to a remote GPU (when `FERRET_REMOTE_HOST` is set)
+
+If this box has no usable GPU (or you're told to run on a remote one), **do NOT
+stop and hand the work back to a Mirage session — submit it yourself.** Wrap your
+compile+benchmark in `scripts/remote_run.sh`, which ssh+rsyncs the work to
+`$FERRET_REMOTE_HOST` and forwards the `KERNEL_RESULT` lines straight back:
+
+```bash
+bash "$FERRET_ROOT/scripts/remote_run.sh" \
+  'cd "$FERRET_WORKSPACE" && nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -lcuda -lcudart kernel.cu -o kernel && ./kernel'
+```
+
+- **Combine compile + run in ONE call** → one rsync round-trip (it pushes the
+  fresh `kernel.cu`, runs the command on the remote, pulls the binary back).
+- `KERNEL_RESULT` / `KERNEL_RESULT_REFERENCE` appear on stdout exactly as if local
+  (rsync chatter goes to stderr). Parse them the same way.
+- **No `pick_gpu.sh`** for the remote — the remote GPU is `FERRET_REMOTE_CUDA_DEVICES`
+  (default 0). `pick_gpu.sh` only picks a LOCAL GPU.
+- When `FERRET_REMOTE_HOST` is UNSET the script runs the command **locally**
+  (transparent), so you can always use this wrapper form.
+- Prereq (host side): the remote has this ferret repo at the SAME absolute path
+  with `resources/` staged + nvcc + a working GPU, and passwordless ssh.
+
 These go into the commit body (the orchestrator parses them).
 
 ## 6. Benchmark harness — read before measuring

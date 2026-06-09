@@ -87,6 +87,12 @@ fi
 # ── Required env for the mainthread ───────────────────────────────────────
 export FERRET_WORKSPACE="workspace$N"
 export FERRET_ROOT="$FERRET_DIR"
+# Remote-GPU self-submit (scripts/remote_run.sh): pass through if the launcher
+# set them, so the mainthread can run its compile+benchmark on a remote GPU box
+# without bouncing back to a Mirage session. Unset ⇒ all GPU work stays local.
+[ -n "${FERRET_REMOTE_HOST:-}" ]         && export FERRET_REMOTE_HOST
+[ -n "${FERRET_REMOTE_CUDA_DEVICES:-}" ] && export FERRET_REMOTE_CUDA_DEVICES
+[ -n "${FERRET_REMOTE_ENV:-}" ]          && export FERRET_REMOTE_ENV
 # `python -m ferret.state` / `ferret.profile` need ferret's parent dir on
 # PYTHONPATH so the `ferret` package is importable, even though the
 # mainthread's cwd is `ferret/` itself. Without this, every subagent

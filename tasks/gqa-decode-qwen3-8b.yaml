@@ -1,0 +1,250 @@
+# ferret task — GQA Decode for Qwen3-8B on B200
+#
+# Goal: reproduce FlashInfer's CuTe-DSL gqa_decode schedule as a hand-written
+# CUDA kernel (tcgen05 UMMA + TMA + warp specialization), then BEAT it.
+
+name: gqa-decode-qwen3-8b
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    Grouped-Query-Attention DECODE for Qwen3-8B.
+
+    Shapes:
+      hidden_dim   = 4096
+      num_q_heads  = 32
+      num_kv_heads = 8        (GQA ratio = 4 q-heads per kv-head)
+      head_dim     = 128
+      dtype        = bf16     (FP8 KV optional; not required for first win)
+      seqlen_q     = 1 per batch entry (pure decode)
+      kv_len       in {512, 2048, 8192}   (production short-context: <=512)
+      batch_size   in {1, 16}
+      KV cache layout: PAGED  (page_size=64, NHD = [num_pages, 2, PS, NKH, HD])
+
+    The kernel must implement the SAME schedule family as FlashInfer's
+    CuTe-DSL gqa_decode (flashinfer/cute_dsl/attention/gqa_decode.py in
+    flashinfer ≥ 0.7), restated below in concrete CUDA terms:
+
+    Warp specialization (16 warps / 4 warpgroups = 512 threads per CTA):
+      - 2x SOFTMAX warpgroups       (8 warps total)
+          per-row online softmax: max, exp via FMA cubic poly, l-sum.
+      - 1x CORRECTION warpgroup     (4 warps)
+          rescales O[prev] by exp2(m_old - m_new) ONCE per softmax round.
+          Lives off the QK^T critical path.
+      - 1x MMA + TMA warpgroup      (4 warps)
+          - 1 launcher thread issues tcgen05.mma.cta_group::1 for QK^T and P*V.
+          - Other threads issue TMA loads of next K/V tile into SMEM staging.
+      - Named barriers (mbarrier nbar 3/4/5/7/9/10) gate softmax <-> correction
+        <-> mma handoffs. Use mbarrier.try_wait + parity flips.
+
+    TMEM/SMEM staging:
+      - S (QK^T result, after softmax-numerator)         lives in TMEM, staged.
+      - O (PV accumulator)                                lives in TMEM, staged.
+      - K, V tiles                                        live in SMEM, staged.
+      - Stage counts (s_stages, o_stages) sized by
+        `get_max_tmem_alloc_cols("sm_100")` minus the launcher reserved cols.
+      - Q tile resident in registers per softmax warp (small, h_q_grp * d).
+
+    Split-KV / FlashDecode reduction:
+      - Each CTA handles one (batch, kv_head, kv_chunk) tuple.
+      - kv chunk size chosen so launch wave packs SMs efficiently
+        (148 SMs on B200).
+      - GQA group of 4 q-heads loaded once per kv-head -> 4x reuse of K/V.
+      - Partial (m_partial, l_partial, O_partial) -> separate reduction
+        kernel produces final O. OR fuse via grid-level mbarrier signal.
+
+    Kernel signature (host-side):
+      Inputs (device pointers):
+        Q:                bf16 [batch, num_q_heads, head_dim]
+        paged_KV_cache:   bf16 [num_pages, 2, PS, num_kv_heads, head_dim]
+                          (NHD layout, [K_page; V_page] interleaved)
+        kv_indptr:        int32 [batch+1]
+        kv_indices:       int32 [total_pages]
+        kv_last_page_len: int32 [batch]
+      Output:
+        Out: bf16 [batch, num_q_heads, head_dim]
+      Scalar: sm_scale = 1/sqrt(head_dim)
+
+  shapes:
+    HEAD_DIM:       128
+    NUM_QO_HEADS:   32
+    NUM_KV_HEADS:   8
+    GQA_GROUP:      4
+    PAGE_SIZE:      64
+    HIDDEN_DIM:     4096
+
+baseline:
+  # FlashInfer's `auto` backend picks the open CuTe-DSL gqa_decode at this
+  # shape regime per the user-traced dispatch path. The baseline.py invokes
+  # it explicitly so the ratio is reproducible.
+  source: "FlashInfer auto decode (resolves to CuTe-DSL gqa_decode at short-context, FA2 fallback elsewhere) — run: python3 baselines/gqa-decode-qwen3-8b/baseline.py"
+  reference_commit: "flashinfer >= 0.7 (cute_dsl attention path)"
+
+references:
+  # FlashMLA (BF16 + FP8 MLA decode) — closest open analog: FA4-style
+  # warp-specialized tcgen05 + TMA + TMEM staging. Read the schedule.
+  - resources/flashmla-main/csrc
+
+  # CUTLASS Blackwell FMHA example — sm_100a BF16 attention, gives the
+  # tcgen05.mma.cta_group::1 + utccp + named-barrier idioms.
+  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
+
+  # FA4 prefill (paper code) — Blackwell-specific numerics: S/P in TMEM,
+  # exp via FMA cubic polynomial, single-thread UMMA issue. Decode here
+  # is the seqlen_q=1 degenerate case.
+  - resources/flash-attention-fa4-v4.0.0.beta8
+
+  # Saved FA4-style FP8 MLA artifact ferret produced previously — a working
+  # 3-warpgroup BF16-on-FP8 tcgen05 decode skeleton. The schedule (loader /
+  # launcher / softmax / store) is exactly what this task needs, just
+  # parametrized for GQA instead of MLA.
+  - examples/fp8-mla-decode-dsv4/v033_partial_match_785.cu
+
+  # FlashInfer source — read the existing FA2 batch-decode (open) so the
+  # baseline numerics are clear. DO NOT link against it; reimplement.
+  - resources/flashinfer-0.6.7.post3
+
+  # PTX ISA + tcgen05 docs
+  - docs/ptx-isa-9.2
+  - docs/architecture
+  - docs/patterns
+
+configs:
+  # Production target is short-context decode (kv_len <= 512); user's
+  # benchmark shows CuTe-DSL beats trtllm-gen there (19.9us vs 27.1us at
+  # bs=1, kv=512). Target ratios are calibrated against CuTe-DSL (the open
+  # baseline) using the user-measured numbers below — agent must MATCH then
+  # BEAT them.
+  #
+  # User-measured CuTe-DSL reference (B200, bf16, us/call):
+  #   bs1_kv512:  19.9   bs1_kv2k:  20.4   bs1_kv8k:  21.0
+  #   bs16_kv512: 20.5   bs16_kv2k: 51.0   bs16_kv8k: 178.4
+  # (For comparison: trtllm-gen closed:  bs1_kv512=27.1, bs1_kv2k=25.3,
+  #  bs1_kv8k=28.5, bs16_kv512=24.9, bs16_kv2k=25.3, bs16_kv8k=78.5.
+  #  trtllm-gen WINS at long-context large-batch — NOT a target for this run.)
+
+  # ── Short-context regime (kv<=512): the production target. ───────────
+  - name: bs1_kv512
+    args: { B: 1,  KV_LEN: 512,  NUM_QO_HEADS: 32, NUM_KV_HEADS: 8, HEAD_DIM: 128, PAGE_SIZE: 64 }
+    target_ratio: 1.10        # beat CuTe-DSL by 10%
+    weight: 2.0               # weighted up: this is the production shape
+
+  - name: bs16_kv512
+    args: { B: 16, KV_LEN: 512,  NUM_QO_HEADS: 32, NUM_KV_HEADS: 8, HEAD_DIM: 128, PAGE_SIZE: 64 }
+    target_ratio: 1.10
+    weight: 2.0
+
+  # ── Medium-context (kv=2k) ─────────────────────────────────────────────
+  - name: bs1_kv2k
+    args: { B: 1,  KV_LEN: 2048, NUM_QO_HEADS: 32, NUM_KV_HEADS: 8, HEAD_DIM: 128, PAGE_SIZE: 64 }
+    target_ratio: 1.10
+    weight: 1.0
+
+  - name: bs16_kv2k
+    args: { B: 16, KV_LEN: 2048, NUM_QO_HEADS: 32, NUM_KV_HEADS: 8, HEAD_DIM: 128, PAGE_SIZE: 64 }
+    target_ratio: 1.10        # CuTe-DSL 51us; beating it requires split-KV
+    weight: 1.0
+
+  # ── Long-context (kv=8k) ──────────────────────────────────────────────
+  - name: bs1_kv8k
+    args: { B: 1,  KV_LEN: 8192, NUM_QO_HEADS: 32, NUM_KV_HEADS: 8, HEAD_DIM: 128, PAGE_SIZE: 64 }
+    target_ratio: 1.10
+    weight: 1.0
+
+  - name: bs16_kv8k
+    args: { B: 16, KV_LEN: 8192, NUM_QO_HEADS: 32, NUM_KV_HEADS: 8, HEAD_DIM: 128, PAGE_SIZE: 64 }
+    target_ratio: 1.10        # CuTe-DSL 178us; trtllm-gen 78us — split-KV
+                              #   reduction is the only path here
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.50
+  strict: false
+
+constraints:
+  # ── compilation + scoring infra ────────────────────────────────────────
+  - "Single self-contained CUDA file kernel.cu that compiles standalone with: nvcc -arch=sm_100a -std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr -I resources/cutlass-4.4.2/include -o kernel kernel.cu -lcuda -lcudart. NO additional -l flags, NO external library links. The .cu MUST contain main() + fp32 reference + correctness check + benchmark + emit KERNEL_RESULT line for ALL 6 configs."
+  - "Your kernel.cu may NOT link against, #include, or call FlashInfer's compiled kernels. You MAY read FlashInfer/FlashMLA/CUTLASS source via read_reference(...) but must IMPLEMENT the kernel yourself. Failure → INVALID."
+  - "Single CUDA stream only. No CUDA graphs."
+
+  # ── HARD architecture constraints (the whole point of this task) ──────
+  - "NO CUDA-core (FFMA/IMAD-only) attention. All QK^T and P*V matmuls MUST go through tcgen05 UMMA (tcgen05.mma.kind::f16 with bf16 operands, cta_group::1). If the compiled SASS contains FFMA in the QK^T or PV inner loop, the kernel is INVALID. Use UTCCP/cp.async.bulk to move K/V from SMEM into TMEM-adjacent layouts as needed."
+  - "NO synchronous global->SMEM copies for K/V. All KV loads MUST be TMA (cp.async.bulk.tensor with mbarrier completion). Element-wise __ldg() into SMEM or naive cp.async.ca per-thread loops are INVALID for KV tile staging. (Per-thread loads are fine for Q since seqlen_q=1.)"
+  - "Warp specialization is REQUIRED. The kernel must have at least 3 distinct warp roles dispatched via warp-id: (a) softmax/consumer, (b) MMA+TMA producer/launcher, (c) correction or storer. Single-role kernels (every warp does everything) are INVALID. Use setmaxnreg.inc / setmaxnreg.dec to split registers between roles."
+  - "S (softmax output) and O (PV accumulator) MUST live in TMEM, not in registers. Storing the full O accumulator in registers (oa[QL][4] / float oa[16] style) is INVALID — it's the architecture we are explicitly moving AWAY from. K/V tiles stage in SMEM; S/O stage in TMEM."
+
+  # ── numerics ──────────────────────────────────────────────────────────
+  - "BF16 input Q + bf16 KV cache, BF16 output. FP32 accumulators inside softmax/MMA."
+  - "KV cache layout MUST be NHD: shape [num_pages, 2, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM] where the second dim is [K_page; V_page]. PAGE_SIZE=64."
+  - "sm_scale = 1.0 / sqrt(HEAD_DIM) = 1.0/sqrt(128)."
+  - "Output must match fp32 reference within max relative error < 1e-2 AND max absolute error < 1.0 AND mean absolute error < 1e-2."
+  - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include a reference comparison and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). Use distinct values per KV position so a bug in the attention pattern shows up in mre."
+
+  # ── measurement methodology ───────────────────────────────────────────
+  - "TFLOPS measured as: flops = 4 * batch * num_q_heads * head_dim * kv_len  (per call). seqlen_q=1, so no causal mask among Q tokens. Report time as median over NI=300 timed iterations."
+  - "MANDATORY L2 FLUSH: kernel benchmark MUST flush a 128 MB device buffer (cudaMemset) immediately before each timed iteration. Use a continuous warmup of >= 2.0 seconds BEFORE the timed loop. See baselines/gqa-decode-qwen3-8b/baseline.py for the exact methodology — match it bit-for-bit."
+
+hints:
+  - |
+    ## REPRODUCE-stage roadmap (do NOT try to skip steps)
+
+    Step 1 (~iter 1-3): read FlashMLA's csrc/flash_fwd_mla_kernel.h to absorb
+    the FA4-style schedule pattern (producer/consumer warps, mbarrier
+    pipeline, TMEM staging). It's the closest open analog.
+
+    Step 2 (~iter 3-6): port the schedule to GQA bf16. The simplest first
+    cut:
+      - 3 warpgroups: 1 mma+tma producer, 1 softmax consumer, 1 corrector.
+      - kv chunk = 64 tokens, TMA loads K and V per chunk into SMEM.
+      - 1 softmax CTA computes (m, l, O) for one (batch, kv_head).
+      - GQA group = 4 q-heads packed in a single tcgen05 QK tile (q tile is
+        4 x 128 = 512 elts, fits easily in a single warpgroup's register file).
+
+    Step 3 (~iter 6-10): split-KV reduction. Multiple CTAs per (batch, kv_head)
+    each take a kv-chunk-range, emit (m_partial, l_partial, O_partial), one
+    reduction kernel produces final O. This is the only way bs=1 long-KV
+    saturates B200's 148 SMs.
+
+    ## OPTIMIZE-stage levers
+
+    a) S and O staging in TMEM. Read FA4 paper section on Blackwell-specific
+       numerics. The shape (S = h_q_grp x kv_chunk, O = h_q_grp x head_dim)
+       fits easily in TMEM with stages=2 for double-buffering.
+
+    b) exp via FMA cubic polynomial (FA4 trick) frees SFU ports for the
+       reduction. exp2f intrinsic uses SFU; cubic poly uses FMA only.
+
+    c) For bs=16 long-context (kv=8k), trtllm-gen wins 2-3x because it
+       SM-parallelizes (split-KV) within a single decode call. CuTe-DSL
+       does not. Implementing split-KV + reduction is the only way to
+       close this gap.
+
+    ## What NOT to do (will regress and be reverted)
+
+    - Stuffing the QK^T into CUDA-core FFMA "because it's simpler". Hard
+      constraint above — this fails the SASS check.
+    - Keeping O in registers ("just float oa[16]"). Hard constraint above
+      — this is the v1 regression mode.
+    - Trying to beat trtllm-gen at bs=16 long-context BEFORE matching
+      CuTe-DSL at bs=1 short-context. The production shape is short-context;
+      that's where the wins matter.
+    - One-CTA-does-everything kernels with no warp specialization. Hard
+      constraint above.
+
+budget:
+  max_iterations: 80
+  max_wall_minutes: 360
+
+output:
+  result_format: kernel_result_json
+  result_keys:
+    - bs1_kv512
+    - bs1_kv2k
+    - bs1_kv8k
+    - bs16_kv512
+    - bs16_kv2k
+    - bs16_kv8k

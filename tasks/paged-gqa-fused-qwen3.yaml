@@ -100,14 +100,17 @@ configs:
   # agent to address ALL regimes, not just the easy wins.
 
   # ===== Q=1 (decode wrapper) =====
+  # SMALL-SEQ FOCUS: targets raised above v011's current ratios to force the
+  # agent to push beyond launch-overhead floor. v011 hits 125% at q1_seq128,
+  # 146% at q1_seq512 — so any iteration must beat those AND new targets.
   - name: q1_seq128
     args: { B: 1, Q_LEN: 1, SEQ_LEN: 128, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
-    target_ratio: 0.85   # v012 ties FlashInfer here (launch-overhead floor)
-    weight: 1.0
+    target_ratio: 1.50   # was 0.85 — pushing past 12us launch floor
+    weight: 2.0          # weighted up
   - name: q1_seq512
     args: { B: 1, Q_LEN: 1, SEQ_LEN: 512, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
-    target_ratio: 1.00
-    weight: 1.0
+    target_ratio: 1.35   # was 1.00 — push close to FI's 16us
+    weight: 2.0
   - name: q1_seq4k
     args: { B: 1, Q_LEN: 1, SEQ_LEN: 4096, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
     target_ratio: 1.50   # v012 hits 2.18x here, easy headroom
@@ -120,12 +123,12 @@ configs:
   # ===== Q=2 (prefill wrapper, causal) =====
   - name: q2_seq128
     args: { B: 1, Q_LEN: 2, SEQ_LEN: 128, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
-    target_ratio: 1.20   # workspace v009 hits 1.27x here
-    weight: 1.0
+    target_ratio: 1.50   # v011 hits 154%, push slightly past
+    weight: 2.0
   - name: q2_seq512
     args: { B: 1, Q_LEN: 2, SEQ_LEN: 512, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
-    target_ratio: 1.00
-    weight: 1.0
+    target_ratio: 1.35   # v011 hits 147%, push slightly past
+    weight: 2.0
   - name: q2_seq4k
     args: { B: 1, Q_LEN: 2, SEQ_LEN: 4096, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
     target_ratio: 1.50   # v007 hits 2x here
@@ -138,12 +141,12 @@ configs:
   # ===== Q=3 (prefill wrapper, causal) =====
   - name: q3_seq128
     args: { B: 1, Q_LEN: 3, SEQ_LEN: 128, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
-    target_ratio: 1.30   # v009 hits 1.41x here
-    weight: 1.0
+    target_ratio: 1.50   # v011 hits 153%, push slightly past
+    weight: 2.0
   - name: q3_seq512
     args: { B: 1, Q_LEN: 3, SEQ_LEN: 512, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
-    target_ratio: 1.00
-    weight: 1.0
+    target_ratio: 1.35   # v011 hits 153%, push slightly past
+    weight: 2.0
   - name: q3_seq4k
     args: { B: 1, Q_LEN: 3, SEQ_LEN: 4096, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
     target_ratio: 1.50   # v007 hits 3x here
@@ -156,12 +159,12 @@ configs:
   # ===== Q=4 (prefill wrapper, causal) =====
   - name: q4_seq128
     args: { B: 1, Q_LEN: 4, SEQ_LEN: 128, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
-    target_ratio: 1.30   # v009 hits 1.35x here
-    weight: 1.0
+    target_ratio: 1.50   # v011 hits 153%, push slightly past
+    weight: 2.0
   - name: q4_seq512
     args: { B: 1, Q_LEN: 4, SEQ_LEN: 512, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
-    target_ratio: 1.00
-    weight: 1.0
+    target_ratio: 1.35   # v011 hits 139%, push slightly past
+    weight: 2.0
   - name: q4_seq4k
     args: { B: 1, Q_LEN: 4, SEQ_LEN: 4096, NUM_QO_HEADS: 8, NUM_KV_HEADS: 1, HEAD_DIM: 128, PAGE_SIZE: 4096 }
     target_ratio: 1.50   # v007 hits 3x here
@@ -194,6 +197,60 @@ constraints:
   - "Reuse the EXACT same benchmark harness shape (cudaMemset flush, 2-sec warmup, 300-iter median, sorted median) as baselines/paged-gqa-fused-qwen3/baseline.py. Mismatched measurement methodology gives false ratios."
 
 hints:
+  - |
+    ## SMALL-SEQ FOCUS (2026-05-30 restart)
+
+    The v011 kernel currently in workspace/ already achieves min_ratio=1.147
+    (q2_seq32k bottleneck). At small seq (seq=128 and seq=512) v011 hits:
+      q1_seq128: 125% (12.6us vs FI 16.2us)   <- AT B200 launch floor
+      q1_seq512: 146%
+      q2_seq128: 154% (12.4us vs FI 16.6us)   <- AT B200 launch floor
+      q3_seq128: 153%
+      q4_seq128: 153%
+      q4_seq512: 139%
+
+    Targets are raised to 1.50x at seq=128 and 1.35x at seq=512 to push beyond
+    v011. These configs are launch-overhead-dominated (~10-12us floor on B200
+    for any minimal kernel launch). To beat 12us at q*_seq128 requires
+    eliminating launches, not making the launched kernel faster.
+
+    Concrete ideas to explore — measure each, do not guess:
+
+    1. Extend single-launch atomic-combine path: currently `paged_gqa_fused`
+       (Q>1) only runs for seq<=128, and `paged_gqa_decode_fused` (Q=1) also
+       only for seq<=128. At seq=512, ns = 512/8 = 64 splits — atomic combine
+       MIGHT still be numerically OK at 64 splits (it fails at 4096). Test it.
+       If yes, this saves a kernel launch (~3-5us) at seq=512.
+
+    2. tcgen05 (BF16 WGMMA on tensor cores) — the open question. PRIORS:
+       - Setup cost: ~8-15us per launch for TMEM alloc + MMA pipeline fill +
+         WS warpgroup state. At q1_seq128 (current 12us) this LIKELY regresses.
+       - At q4_seq512 (current 19.5us with 4 query rows x 512 KV tokens) the
+         compute is large enough that WGMMA throughput MIGHT amortize setup.
+       - WGMMA atom on B200 is M=64 minimum (cta_group::1). Q=4 means heavy
+         padding (M=4 effective, M=64 allocated, 16x waste). Q=8+ would help
+         more — but we don't support Q=8 in this task.
+       - The MLA decode task (examples/fp8-mla-decode-dsv4/v033) shows a
+         working 3-warpgroup tcgen05 attention skeleton — use it as reference.
+       - DECISION RULE: test tcgen05 at q4_seq512 first (most favorable
+         shape for WGMMA). If it regresses there, no point trying smaller.
+         If it wins at q4_seq512, then try q3_seq512, q2_seq512. Almost
+         certainly will NOT help at any seq=128 config.
+
+    3. Single-launch dispatcher: currently host dispatches to one of 9 kernels
+       per (q,seq). Each launch is a separate cudaLaunchKernel. A single
+       __global__ that branches on q_len at the start could save ~1-2us in
+       launch overhead pipelining (back-to-back submissions). RISKY — adds
+       register pressure from supporting all paths.
+
+    4. Driver API (cuLaunchKernel) vs runtime API (<<<>>>): marginal but real.
+       The runtime <<<>>> syntax inserts an extra synchronization layer; raw
+       cuLaunchKernel saves ~0.5-1us. Probably noise but worth testing once.
+
+    HARD CONSTRAINT: every optimization must beat v011 on ALL 16 configs
+    after measurement. If it regresses anywhere, revert. v011 is the floor.
+    Save v011 as a baseline tag before experimenting.
+
   - |
     Empirical baseline numbers (FlashInfer, B200, measured 2026-05-28):
       q1_seq128: ~11us   q1_seq512: ~13us   q1_seq4k: ~47us   q1_seq32k: ~57us

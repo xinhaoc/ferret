@@ -1,15 +1,28 @@
 # ferret
 
-Autonomous CUDA kernel optimization agent on top of **Claude Code**.
-Structured task specs, per-config scoring, two-stage REPRODUCE→OPTIMIZE
-workflow, git-tagged version tracking, scoped subagents driving
-planner / iterator / profiler / reviewer / codex-dispatcher / memory-keeper /
-kernel-extractor responsibilities.
+**Autonomous CUDA-kernel agent. Give it a problem, get a kernel that beats the vendor library.**
+
+![Paged GQA speedup over FlashInfer](docs/assets/paged_gqa_vs_flashinfer.png)
+
+Above: an attention kernel produced by ferret on a fresh `task.yaml` —
+**1.21× to 3.56× faster than FlashInfer** across all 16 (Q × seq) configurations
+of Qwen3-30B-A3B (B200, bf16). 22 iterations, 1 self-contained binary, all 16
+correctness-passing. Numbers measured against FlashInfer 0.6.8 using identical
+2-sec warmup + 128 MB L2 flush + 300-iter median harness in both kernel and
+baseline.
+
+## What ferret does
+
+ferret reads a YAML task spec (problem shape, baseline, target ratios) and runs
+a structured **REPRODUCE → OPTIMIZE** loop with a Claude agent under the hood.
+Each iteration the agent edits CUDA, ferret compiles + benchmarks + checks
+correctness against an in-binary fp32 reference, then scores against the
+baseline. Wins get git-tagged; regressions get reverted.
 
 ## How ferret is invoked (the dispatch model)
 
-ferret is not run by hand in the normal flow — **it is dispatched as a separate
-Claude Code session, on demand, from Mirage.**
+In the production flow ferret is not run by hand — **it is dispatched as a
+separate Claude Code session, on demand, from Mirage.**
 
 1. **The whole coding agent runs as its own Claude Code session.** One ferret run
    = one headless `claude` mainthread bound to a single workspace
@@ -30,9 +43,25 @@ Claude Code session, on demand, from Mirage.**
    of view, "optimize this kernel" is a single subagent call; ferret is the
    separate Claude-Code session that call spins up.
 
-> **`api/` is NOT this path.** The directory `api/` preserves the older
-> programmatic / `motus`-API invocation form (`python -m ferret.api.main`) for
-> reference only — the Claude-Code agent **ignores** it. See `api/README.md`.
+> **`api/` is the older path, not this one.** The directory `api/` preserves the
+> original programmatic / `motus`-API invocation form (`python -m ferret.api.main`,
+> incl. the `--remote-host` ssh+rsync routing) for reference — the Claude-Code
+> agent **ignores** it. See `api/README.md`.
+
+## Verified wins
+
+Three representative workloads, each measured on B200 (one GPU, same physical
+session), saved under `examples/`:
+
+| Workload | Baseline | Speedup | Artifact |
+|---|---|---|---|
+| **Paged GQA decode** (Qwen3-30B-A3B, 16 configs Q×seq) | FlashInfer 0.6.8 | **1.21× – 3.56×** (geomean 1.93×) | [`paged-gqa-fused-qwen3/v011_fused_all16_115x.cu`](examples/paged-gqa-fused-qwen3/v011_fused_all16_115x.cu) |
+| **FP8 MLA decode** (DeepSeek-V4 MODEL1, b=2, h_q=64) | FlashMLA | **1.14×** | [`fp8-mla-decode-dsv4/v033_partial_match_785.cu`](examples/fp8-mla-decode-dsv4/v033_partial_match_785.cu) |
+| **Decode linear projections** (Qwen3-8B, M=16, GateUp) | cuBLAS BF16 | **1.17×** | [`qwen3-8b-decode-linear-bs16/v019_swapab_cg2_l2hints.cu`](examples/qwen3-8b-decode-linear-bs16/v019_swapab_cg2_l2hints.cu) |
+
+All wins are reproducible from the saved `.cu` — each binary self-contains its
+benchmark harness, fp32 correctness check, and (where applicable) the baseline
+measurement.
 
 ## Requirements
 
@@ -45,7 +74,7 @@ Claude Code session, on demand, from Mirage.**
 ## Install
 
 ```bash
-pip install pyyaml         # ferret has zero runtime deps beyond stdlib + pyyaml
+pip install pyyaml         # the Claude-Code path has zero runtime deps beyond stdlib + pyyaml
 git submodule update --init resources/kernelwiki && bash scripts/update_kernelwiki.sh
 ```
 
@@ -54,7 +83,8 @@ ferret runs in place — no pip install of the package itself. `cc-run.sh` expor
 ferret.{state,profile,task_spec,cc_goal}` from any cwd. The `resources/` library
 sources + `resources/kernelwiki` are git submodules — run the submodule-update +
 `update_kernelwiki.sh` once after cloning (KernelWiki content is NOT vendored,
-only the upstream pointer is tracked).
+only the upstream pointer is tracked). *(The `api/` path additionally needs
+`lithosai-motus` + `ANTHROPIC_API_KEY` — see `api/README.md`.)*
 
 ## Usage
 
@@ -93,30 +123,6 @@ PYTHONPATH=/home/$USER python3 -m ferret.cc_goal workspace<N>/                  
 PYTHONPATH=/home/$USER python3 -m ferret.profile workspace<N>/                          # one-shot ncu profile
 ```
 
-## Layout
-
-```
-ferret/
-├── CLAUDE.md            mainthread system prompt — what to do in a session
-├── cc_goal.py           task.yaml → concrete /goal text (SOTA + targets)
-├── profile.py           ncu wrapper CLI (used by profiler subagent)
-├── state.py             RunState + compute_state (git → decision)
-├── task_spec.py         spec schema + loader + scoring + result parser
-├── pick_gpu.sh          multi-GPU picker for shared machines
-├── tools/               leaf helpers (ncu CSV parsing only)
-├── tasks/               authored task.yaml specs (+ template.yaml)
-├── baselines/           reference baseline.py scripts the kernel re-runs
-├── examples/            saved best kernels from prior runs
-├── docs/                dev-memory(-seed) + architecture/patterns/ptx-isa refs
-├── resources/           git-submodule library sources (CUTLASS, FlashInfer,
-│                        … + kernelwiki, upstream-tracked, run the update script)
-├── scripts/             cc-init.sh / cc-run.sh / update_kernelwiki.sh / check_resource_refs.py
-├── .claude/agents/      planner · iterator · profiler · reviewer ·
-│                        codex-dispatcher · memory-keeper · kernel-extractor
-├── api/                 PRESERVED API-form (motus) path — agent IGNORES it (see api/README.md)
-└── workspace<N>/        (gitignored) per-run kernel.cu + kernel.cuh + progress.md + own .git
-```
-
 ## How the loop works (one workspace)
 
 1. `cc-init.sh <N> <task.yaml>` creates `workspace<N>/` with its own `.git`,
@@ -137,6 +143,36 @@ ferret/
 6. Goal met → reviewer records `convergence:` → mainthread exits cleanly; the
    Mirage dispatcher collects `kernel.cuh`.
 
+Design choices that matter: **structured `task.yaml`** is the single source of
+truth (the agent can't rewrite its own spec — `workspace/task.yaml` is
+read-only); **per-config scoring** (`min_ratio` / `weighted_avg` / `focus`, no
+`max()` masquerading as "best TFLOPS"); **constraints re-injected every
+iteration**; **stage gate + budget driven by the spec**.
+
+## Layout
+
+```
+ferret/
+├── CLAUDE.md            mainthread system prompt — what to do in a session
+├── cc_goal.py           task.yaml → concrete /goal text (SOTA + targets)
+├── profile.py           ncu wrapper CLI (used by profiler subagent)
+├── state.py             RunState + compute_state (git → decision)
+├── task_spec.py         spec schema + loader + scoring + result parser
+├── pick_gpu.sh          multi-GPU picker for shared machines
+├── tools/               leaf helpers (ncu CSV parsing only)
+├── tasks/               authored task.yaml specs (+ template.yaml)
+├── baselines/           reference baseline.py scripts the kernel re-runs
+├── examples/            saved best kernels from prior runs
+├── docs/                dev-memory(-seed) + architecture/patterns/ptx-isa refs + assets
+├── resources/           git-submodule library sources (CUTLASS, FlashInfer,
+│                        … + kernelwiki, upstream-tracked, run the update script)
+├── scripts/             cc-init.sh / cc-run.sh / update_kernelwiki.sh / check_resource_refs.py
+├── .claude/agents/      planner · iterator · profiler · reviewer ·
+│                        codex-dispatcher · memory-keeper · kernel-extractor
+├── api/                 PRESERVED API-form (motus) path — agent IGNORES it (see api/README.md)
+└── workspace<N>/        (gitignored) per-run kernel.cu + kernel.cuh + progress.md + own .git
+```
+
 ## Submodule maintenance
 
 ```bash
@@ -148,10 +184,10 @@ python3 scripts/check_resource_refs.py --verbose # per-submodule ref counts
 
 ferret v0.2 migrated v0.1's `motus` / Anthropic-API path
 (`orchestrator.py` + `agents.py` + `main.py` + `prompts.py` + `cost_tracker.py`)
-onto the Claude-Code subscription + subagents design. That v0.1 API form is
-**preserved under `api/`** (not active; the agent ignores it). The surviving
-shared core is the **state CLI + task spec loader + scoring + ncu wrapper +
-profile CLI** at the repo root.
+onto the Claude-Code subscription + subagents design. That v0.1 API form (incl.
+the `--remote-host` ssh+rsync routing) is **preserved under `api/`** (not active;
+the agent ignores it). The surviving shared core is the **state CLI + task spec
+loader + scoring + ncu wrapper + profile CLI** at the repo root.
 
 ## See also
 

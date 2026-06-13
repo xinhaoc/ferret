@@ -202,7 +202,7 @@ constraints:
   - "INT4 nibble decode: nibbles are stored offset-8 unsigned. Convert to signed via signed_value = raw_nibble - 8, giving range [-8, 7]. Apply per-row group-32 BF16 scale to obtain the BF16 weight element. Group boundaries: scale index for K-position k of row r is scales[r, k/32]. Do this conversion ON-CHIP after TMA load; do NOT do it in a pre-pass kernel."
   - "BF16 input activations + BF16 dequantized weights (after INT4→BF16). FP32 accumulator inside the MMA. BF16 output."
   - "FUSED silu·mul epilogue is REQUIRED. The kernel MUST emit [num_routed_pairs, I_r=256] BF16 with values silu(gate) * up, where gate is the first I_r=256 columns of the GEMM output and up is the second I_r=256 columns. Emitting an unfused [P, 2I_r=512] intermediate (separate activation kernel afterward) is INVALID — the baseline measures Marlin's moe_wna16_marlin_gemm + apply_moe_activation(SILU) as a fused-equivalent reference, so the kernel must match that output for an apples-to-apples comparison."
-  - "Output must match the dequant→BF16 oracle within max relative error < 5e-3 AND max absolute error < 1.0 on the same random-input distribution used for benchmarking. Use distinct nibble patterns per expert so a per-expert dispatch bug shows up in the error metric."
+  - "Output must match the dequant→BF16 oracle within max absolute error < 0.05 (HARD). Relative-error metrics are NOT used by the validator because for K=7168 BF16 GEMM with silu·mul, many outputs are near-zero (silu(very_negative)*up ≈ 0) and any near-zero residue blows up the relative metric — Marlin itself has maxre ≈ 2.0 against the FP32 oracle. Use distinct nibble patterns per expert so a per-expert dispatch bug shows up in the absolute error. Reference precision target: Marlin achieves maxae ≈ 0.006-0.009 on this workload — the kernel should aim for the same precision CLASS (maxae < 0.012, ~1.3× Marlin), not just to clear the 0.05 ceiling. Note: the OLD `re<5e-3 AND ae<1.0` rule was unsatisfiable for any BF16 W4A16 GEMM at K=7168; do not try to satisfy it. Relative error against the oracle is still printed for diagnostic purposes but is NOT a pass/fail gate."
   - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include the dequant→BF16 fp32-accumulate reference and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). DO NOT remove this guard. ALL 4 configs MUST pass correctness, including the routing edge cases (single-expert assignment, balanced assignment, sparse assignment) — exercise at least 2 routing distributions in the validation pass."
 
   # ── measurement methodology ─────────────────────────────────────────────
@@ -212,6 +212,51 @@ constraints:
 
 hints:
   - |
+    ## TOP PRIORITY (resuming from v040 on 2026-06-13): close the precision gap to Marlin.
+
+    v040 is a working kernel saved in workspace/kernel.cu, score min_ratio = 1.285
+    (T1 = 132.4%, T8 = 128.5% of Marlin). However, INDEPENDENT verification on the
+    same B200 + the dequant→BF16 fp32-accumulate oracle shows:
+
+      v040 :  T1 maxae = 0.0232    T8 maxae = 0.0217
+      Marlin:  T1 maxae = 0.0064    T8 maxae = 0.0091
+              ─────────────────────────────────────────
+      v040 is 3.6× (T1) / 2.4× (T8) NOISIER than Marlin.
+
+    Both pass the new validator (ae < 0.05) but the kernel is measurably less
+    precise than the production baseline it's beating in latency. Investigate
+    and FIX. Likely sources, in descending order of suspicion:
+
+      1) Split-K reduction at T=1 uses atomicAdd into FP32 workspace
+         (k_split=4, grid=128). The atomic FP32 adds happen in non-deterministic
+         order → 4 partial sums of ~1792 elements each are summed in arbitrary
+         order. Marlin uses a separate fp32-reduce kernel with FIXED order
+         (vllm's use_fp32_reduce=True path) — that's the precision trick to copy.
+         Action: replace atomicAdd with a separate ordered reduction kernel
+         (or use Stream-K with deterministic CTA-id ordering).
+
+      2) MMA tile/K-iteration ordering. The swapAB orientation (tokens on N=8,
+         weights on M=64) is correct, but the K-iteration grouping inside the
+         tcgen05.mma calls may chunk the 7168-K dot product differently from
+         Marlin's, producing different rounding patterns. Lower priority — at
+         T=8 (no split-K) v040 still has 2.4× more maxae, so the K-ordering
+         contributes a real share.
+
+      3) Verify nothing in the dequant or SMEM staging accidentally drops to
+         FP16 precision. cuobjdump SASS check: look for HFMA2/HMUL2/HADD2 in
+         the mainloop OUTSIDE the dequant (the dequant should use them — but
+         the accumulator pipe must stay FFMA32 / tcgen05.mma fp32 accum).
+
+    Concrete goal:
+      - Bring maxae below 0.012 at both T1 and T8 (within 1.3× of Marlin's
+        ~0.009) WITHOUT regressing the latency win (keep min_ratio >= 1.25).
+      - If you can't close the gap without latency cost, document the
+        precision/latency tradeoff explicitly in progress.md and stop —
+        don't ship a noisier-than-Marlin kernel under the guise of beating it.
+
+    Skip the OR-vs-AND validator workaround. The validator now uses AND with
+    a saner epsilon (see constraints) — both v040 and Marlin pass it.
+
     ## REPRODUCE-stage roadmap (do NOT try to skip steps)
 
     Step 0 (~iter 1): read the MARLIN baseline source. THIS IS WHAT YOU ARE

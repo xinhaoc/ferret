@@ -93,13 +93,19 @@ classify_exit() {
 
 launch_ferret() {
     # Launch ferret in the background. Echoes the launched PID on stdout.
-    local keep="$1"; shift
+    #
+    # NOTE on workspace persistence: ferret.main does NOT have a
+    # --keep-workspace flag (that's a scripts/run.sh wrapper option).
+    # When we launch python -m ferret.main directly here, the workspace
+    # files persist UNLESS we explicitly wipe them. The watchdog never
+    # wipes, so passing a "keep" argument is implicit: just don't add
+    # a wipe step. The `_unused_keep` arg is kept for caller readability.
+    local _unused_keep="$1"; shift
     cd "$(dirname "$FERRET_DIR")"  # parent of ferret/
     if [[ -f "$FERRET_DIR/.env" ]]; then
         set -a; . "$FERRET_DIR/.env"; set +a
     fi
     local args=("$TASK")
-    [[ "$keep" == "keep" ]] && args+=("--keep-workspace")
     args+=("${EXTRA_ARGS[@]}")
     setsid nohup "$PYTHON" -m ferret.main "${args[@]}" \
         > "$FERRET_DIR/run.log" 2>&1 < /dev/null &

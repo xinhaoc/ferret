@@ -101,11 +101,24 @@ launch_ferret() {
     # wipes, so passing a "keep" argument is implicit: just don't add
     # a wipe step. The `_unused_keep` arg is kept for caller readability.
     local _unused_keep="$1"; shift
-    cd "$(dirname "$FERRET_DIR")"  # parent of ferret/
+    cd "$(dirname "$FERRET_DIR")"  # parent of ferret/ — required for `python -m ferret.main`
     if [[ -f "$FERRET_DIR/.env" ]]; then
         set -a; . "$FERRET_DIR/.env"; set +a
     fi
-    local args=("$TASK")
+    # Resolve the task path relative to the CWD we just cd'd to (= parent of ferret/).
+    # User-provided $TASK may be "tasks/foo.yaml" (relative to ferret/) or an absolute
+    # path or already prefixed with "ferret/". Normalize.
+    local task_rel
+    if [[ "$TASK" == /* ]]; then
+        task_rel="$TASK"                      # absolute path
+    elif [[ -f "$TASK" ]]; then
+        task_rel="$(realpath "$TASK")"        # already valid from CWD
+    elif [[ -f "$FERRET_DIR/$TASK" ]]; then
+        task_rel="$(basename "$FERRET_DIR")/$TASK"   # was relative to ferret/
+    else
+        task_rel="$TASK"                      # fall through; ferret.main will error
+    fi
+    local args=("$task_rel")
     args+=("${EXTRA_ARGS[@]}")
     setsid nohup "$PYTHON" -m ferret.main "${args[@]}" \
         > "$FERRET_DIR/run.log" 2>&1 < /dev/null &

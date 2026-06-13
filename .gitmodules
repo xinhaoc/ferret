@@ -28,3 +28,7 @@
 [submodule "resources/tensorrt-llm-1.2.0"]
 	path = resources/tensorrt-llm-1.2.0
 	url = https://github.com/NVIDIA/TensorRT-LLM.git
+[submodule "resources/kernelwiki"]
+	path = resources/kernelwiki
+	url = https://github.com/mit-han-lab/KernelWiki
+	branch = master

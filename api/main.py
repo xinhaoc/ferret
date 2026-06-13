@@ -19,9 +19,11 @@ import os
 import sys
 from pathlib import Path
 
-from .task_spec import load_task_spec
+from ..task_spec import load_task_spec  # api/ moved under ferret/ → .. = ferret root
 
-AGENT_ROOT = Path(__file__).parent.resolve()
+# api/ now lives one level under the ferret root; AGENT_ROOT must still point at
+# the ferret root (resources/, workspace/, .env live there), so go up TWICE.
+AGENT_ROOT = Path(__file__).parent.parent.resolve()
 
 logging.basicConfig(
     level=logging.INFO,

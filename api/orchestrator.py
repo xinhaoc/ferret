@@ -22,7 +22,7 @@ from pathlib import Path
 import yaml
 
 from .cost_tracker import CostTracker
-from .state import RunState, compute_state
+from ..state import RunState, compute_state  # state.py stays at the ferret root
 from .tools.compiler import Compiler
 from .tools.doc_loader import DocLoader
 

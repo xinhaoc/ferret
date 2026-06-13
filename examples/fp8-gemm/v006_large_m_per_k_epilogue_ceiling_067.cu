@@ -456,7 +456,7 @@ int main(){
 
     // Run baseline reference
     fflush(stdout);
-    (void)system("cd /home/xinhaoc/repos/ferret && python3 baselines/fp8-gemm/baseline_prefill_large_m.py 2>/dev/null | grep TFLOPS > /tmp/ref_out.txt");
+    (void)system("cd \"$FERRET_ROOT\" && python3 baselines/fp8-gemm/baseline_prefill_large_m.py 2>/dev/null | grep TFLOPS > /tmp/ref_out.txt");
     FILE* rf = fopen("/tmp/ref_out.txt","r");
     if(rf){
         double ref_vals[5] = {0};

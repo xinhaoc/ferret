@@ -16,8 +16,9 @@
 
 set -euo pipefail
 
-FERRET_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PYTHON="${PYTHON:-/home/xinhaoc/miniconda3/bin/python3}"
+# api/scripts/run.sh → ferret root is TWO levels up (api/ moved under ferret/).
+FERRET_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+PYTHON="${PYTHON:-python3}"   # override with PYTHON=/path/to/python if needed
 
 KEEP_WS=0
 DETACH=1
@@ -80,7 +81,7 @@ if git -C "$FERRET_DIR/workspace" log --oneline 2>/dev/null | grep -q .; then
 fi
 
 # ── 3. Launch ────────────────────────────────────────────────────────────────
-# `python -m ferret.main` requires cwd to be the parent of ferret/.
+# `python -m ferret.api.main` requires cwd to be the parent of ferret/.
 RUN_DIR="$(dirname "$FERRET_DIR")"
 LOG="$FERRET_DIR/run.log"
 REL_TASK="$(realpath --relative-to="$RUN_DIR" "$TASK")"
@@ -92,8 +93,8 @@ echo "log         : $LOG"
 
 cd "$RUN_DIR"
 if [[ "$DETACH" -eq 1 ]]; then
-    nohup "$PYTHON" -m ferret.main "$REL_TASK" "${EXTRA_ARGS[@]}" > "$LOG" 2>&1 &
+    nohup "$PYTHON" -m ferret.api.main "$REL_TASK" "${EXTRA_ARGS[@]}" > "$LOG" 2>&1 &
     echo "launched PID $! — tail -f $LOG"
 else
-    exec "$PYTHON" -m ferret.main "$REL_TASK" "${EXTRA_ARGS[@]}"
+    exec "$PYTHON" -m ferret.api.main "$REL_TASK" "${EXTRA_ARGS[@]}"
 fi

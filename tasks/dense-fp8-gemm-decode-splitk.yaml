@@ -1,0 +1,152 @@
+# ferret task — INTERNAL split-K FP8 dense GEMM for DeepSeek-V3 DECODE.
+# Re-authored 2026-05-29 after calibration + ablation-logic-reviewer audit +
+# Explore ground-truth shapes. Key corrections vs the original draft:
+#   - BASELINE is MPK's in-tree fp8_gemm_dense_MEDIUMM @NS=3 (the kernel being
+#     REPLACED), NOT cuBLAS/DeepGEMM. mediumm beats DeepGEMM 1.14-3.82x, so an
+#     external-SOTA baseline was the wrong (2.3-2.5x too hard) bar. User's bar:
+#     "standalone not worse, or >=10% better than the replaced kernel" = mediumm.
+#   - DECODE COST = one full 128-row MMA tile (the kernel computes all 128 rows,
+#     write-gated to active_rows=1 at TPOT). So bench at M=128 LATENCY, not M=1.
+#   - TARGET qkv_a + gate_up ONLY (K=7168, large -> split-K fills idle SMs and
+#     WINS: calib showed 1.70x / 1.22x vs mediumm at M=128). o_proj (K=1792 per
+#     rank, TP=4) is TOO SHORT to split -> split-K LOSES (0.75x) -> o_proj stays
+#     on mediumm; included here as a REPORTED-ONLY tripwire, NOT a target.
+#   - NS=3, NE=2 (what MPK's task_register hardcodes). NOT NS=5 (the harness
+#     default that made v002 look good standalone but crash in MPK).
+
+name: dense-fp8-gemm-decode-splitk
+gpu: B200
+arch: sm_100a
+precision: FP8
+
+problem:
+  description: |
+    Block-scaled FP8 dense GEMM for DeepSeek-V3 DECODE, with INTERNAL split-K,
+    to REPLACE MPK's fp8_gemm_dense_mediumm on the LARGE-K decode projections
+    (qkv_a down-proj, gate_up shared-expert).
+
+    At decode the GEMM processes ONE 128-row MMA tile (mbt=128 compile-time M;
+    active_rows=1 at single-token TPOT, so 127 rows are computed-then-discarded
+    — the cost is the full row-tile). A plain dense GEMM then tiles only N into
+    N/128 CTAs (qkv_a: 17, gate_up: 72) and leaves the other ~60-119 of 136 B200
+    SMs IDLE while a long K=7168 reduction runs serially per CTA. Split-K
+    decomposes K across SPLIT_K extra CTAs per (m_tile,n_tile), each summing
+    K/SPLIT_K, filling the idle SMs and cutting per-call latency.
+
+    CRITICAL — the split-K reduction MUST be INTERNAL to this single kernel
+    (inter-CTA accumulation via `red.global.add.noftz.bf16x2` into a pre-zeroed
+    BF16 output, like MPK's existing-but-CRASHING decode_splitk kernel). NO
+    separate reduce task — the whole value is removing the reduce hop vs the
+    builder-side external split-K.
+
+    A:   [M, K]      FP8 e4m3, K-major
+    B:   [N, K]      FP8 e4m3, K-major  (weight, row=output-channel)
+    SFA: [M, K/128]  FP32 1x128 block activation scale
+    SFB: [N/128, K/128] FP32 128x128 block weight scale
+    D:   [M, N]      BF16, FP32 accumulate, pre-zeroed for atomic accumulation
+    block-scaled FP8 e4m3, tcgen05.mma.kind::mxf8f6f4.block_scale, cta_group::1.
+
+  shapes:
+    HIDDEN: 7168
+
+  # Structured MPK-format I/O contract (machine-readable interface spec). Symbolic
+  # dims (K/128, N/128) resolve per-config from args. Mirrors the ASCII block above.
+  io:
+    inputs:
+      - { name: A,   shape: [M, K],          dtype: fp8_e4m3, layout: k_major }
+      - { name: B,   shape: [N, K],          dtype: fp8_e4m3, layout: k_major }   # weight, row = output channel
+      - { name: SFA, shape: [M, "K/128"],    dtype: fp32,     layout: k_major, role: act_scale_1x128 }
+      - { name: SFB, shape: ["N/128", "K/128"], dtype: fp32,  layout: k_major, role: weight_scale_128x128 }
+    outputs:
+      # D is PRE-ZEROED by the caller so the kernel's internal split-K reduce can
+      # accumulate partials via red.global atomics (see problem.reduce below).
+      - { name: D,   shape: [M, N],          dtype: bf16,     layout: row_major, prezeroed: true }
+
+  # K-reduction strategy hint. Split-K MUST be INTERNAL (one kernel, no reduce
+  # task). internal_atomic = current MPK decode_splitk path; tma_reduce is the
+  # PREFERRED faster alternative on Blackwell if the agent can land it.
+  reduce:
+    method: internal_atomic          # PREFER tma_reduce if it lands correctly + faster
+    op: "red.global.add.noftz.bf16x2"
+    separate_task: false             # MANDATORY: no separate reduce kernel/task
+
+baseline:
+  # The kernel being REPLACED, benched in-process at MPK's params (NS=3, NE=4,
+  # grid=136 worker model). A ready-made harness that already benches split-K +
+  # mediumm + smallm + cuBLAS with host-FP32 validation + 128MB L2 flush exists
+  # at $FERRET_ROOT/calib_scratch/calib.cu — START FROM IT. It uses
+  # local verbatim copies of the 3 dense headers (to dodge the NVSHMEM transitive
+  # include) with the GEMM bodies UNCHANGED. KERNEL_RESULT_REFERENCE must be
+  # MEDIUMM (fp8_gemm_dense_mediumm_sm100_task_impl<128,3>), NOT cuBLAS.
+  source: "MPK in-tree fp8_gemm_dense_mediumm @ <128,NS=3,NE=4>; harness seed at $FERRET_ROOT/calib_scratch/calib.cu"
+
+references:
+  - $FERRET_ROOT/calib_scratch/calib.cu
+  - $MIRAGE_ROOT/include/mirage/persistent_kernel/tasks/blackwell/fp8_gemm_dense_decode_splitk_sm100.cuh
+  - $MIRAGE_ROOT/include/mirage/persistent_kernel/tasks/blackwell/fp8_gemm_dense_mediumm_sm100.cuh
+  - $MIRAGE_ROOT/include/mirage/persistent_kernel/tasks/blackwell/fp8_gemm_dense_sm100_common.cuh
+  - examples/fp8-gemm/v009_large_m_block_scale_mma_080.cu
+
+configs:
+  # DECODE BENCH = M=128 (one full row-tile = the real decode compute cost;
+  # the kernel write-gates to active_rows=1 but COMPUTES all 128 rows).
+  # TARGET (gates delivery, min_ratio): the two LARGE-K projections where
+  # split-K wins. Bar = beat mediumm (>=1.00 not-worse; >=1.10 is the stretch
+  # the user actually wants and the run REPORTS, but 1.00 is the deliver gate).
+  - name: qkv_a_M128
+    args: { M: 128, K: 7168, N: 2176, SPLIT_K: 8 }
+    target_ratio: 1.00
+    # Absolute decode-latency goal (μs) the agent iterates TOWARD, in addition to
+    # the relative-vs-mediumm bar. Indicative (mediumm is benched live each run;
+    # calib put split-K at ~1.70x mediumm here). Scoring folds in
+    # min(tflops_ratio, target_us/measured_us), so this only tightens the gate.
+    target_latency_us: 16.0
+    weight: 1.0
+  - name: gate_up_M128
+    args: { M: 128, K: 7168, N: 9216, SPLIT_K: 2 }
+    target_ratio: 1.00
+    target_latency_us: 68.0   # indicative absolute goal; calib ~1.22x mediumm here
+    weight: 1.0
+  # REPORTED-ONLY tripwire (NOT in min_ratio, weight 0): o_proj's per-rank K=1792
+  # is too short for split-K to help (calib: 0.75x vs mediumm). If a future change
+  # makes split-K win here too, great; today it documents "keep o_proj on mediumm".
+  - name: o_proj_M128_tripwire
+    args: { M: 128, K: 1792, N: 7168, SPLIT_K: 2 }
+    target_ratio: 0.01   # reported-only tripwire; weight=0 so excluded from min_ratio gate
+    weight: 0.0
+  # Small-M reported view (spec-decode / MTP active_rows=2-4 regime). Reported,
+  # not gated — the kernel path is identical (1 row-tile), so M=128 is the signal.
+  - name: qkv_a_M4
+    args: { M: 4, K: 7168, N: 2176, SPLIT_K: 8 }
+    target_ratio: 0.01   # reported-only; weight=0 so excluded from min_ratio gate
+    weight: 0.0
+
+scoring: weighted_avg   # weight=0 configs (tripwires) fully excluded from aggregate; weight=1.0 configs (qkv_a_M128 + gate_up_M128) drive the score
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only. No CUDA graphs. cta_group::1 only (MPK's 1-SM-per-worker model)."
+  - "FP8 e4m3 input, BF16 output, FP32 accumulator. Block-scaled (act 1x128, weight 128x128)."
+  - "MANDATORY: split-K reduction is INTERNAL to ONE kernel via inter-CTA atomics (red.global.add.noftz.bf16x2 into a pre-zeroed BF16 output). NO separate reduce kernel/task. SPLIT_K is a template/arg >= 2 and is a TUNING knob — pick it per shape so n_tiles*SPLIT_K saturates ~136 workers WITHOUT massive over-dispatch (qkv_a N=2176 -> 17 n-tiles, SPLIT_K~8; gate_up N=9216 -> 72 n-tiles, SPLIT_K~2). Over-dispatch beyond HBM saturation gives no further benefit."
+  - "MANDATORY NS/NE = MPK's REGISTER VALUES: instantiate the split-K kernel at <BN=128, NS=3, NE=2> — the exact params task_register.cc hardcodes. Do NOT tune NS/NE to make standalone numbers look good (NS=5 made the prior v002 look fast standalone but it CRASHED in MPK at NS=3). The mediumm reference uses <128,NS=3,NE=4>."
+  - "MANDATORY CORRECTNESS ACROSS WAVES: correct when total CTAs (n_tiles*SPLIT_K) EXCEEDS num_workers (multi-tile-iteration / multi-wave). This is the EXACT B36 bug in MPK's current split-K kernel: the common task_impl's mbarrier ph/gki cycle-state is not reset between tile iterations. gate_up (72*2=144 > 136) exercises this. Fix = reset phase/gki at the top of each tile iter, OR restructure so each CTA owns exactly one (m_tile,n_tile,k_slice). Validate vs host FP32 at max rel err < 1e-2 for EVERY config; emit INVALID (parsed 0.0) on any mismatch — do NOT remove this guard."
+  - "MANDATORY L2 FLUSH: flush a 128 MB device buffer immediately before each timed iteration; report median over NI per-iteration measurements (the seed harness already does this)."
+  - "TFLOPS over REAL FLOPs (2*M*N*K). At M=128 the ratio_vs_mediumm = latency ratio (same FLOPs), which is the decode-latency win we care about."
+  - "Output ABI foldable into MPK: device function `__device__ __noinline__`, CUtensorMap const* pointer args, worker_idx + num_workers params, no extern C, no host launch code. Mirror fp8_gemm_dense_decode_splitk_sm100_task_impl<BN,NS,NE,SPLIT_K>."
+  - "MANDATORY MPK-FAITHFUL HARNESS (the seed calib.cu already follows this): launch grid_dim.x = num_workers = 136, worker_idx = blockIdx.x, num_workers = 136 (so total = n_tiles*SPLIT_K can exceed 136 -> exercises multi-tile-iter); pre-zero the BF16 output before launch; instantiate at NS=3/NE=2. A kernel that passes correctness UNDER THIS HARNESS is what MPK will actually run."
+
+hints:
+  - "START from $FERRET_ROOT/calib_scratch/calib.cu — it already builds split-K + mediumm + smallm + cuBLAS with host-FP32 validation, L2 flush, and the local NVSHMEM-free header copies. Change: (1) instantiate the split-K kernel at NS=3/NE=2 (the seed ran it at NS=5); (2) make KERNEL_RESULT = split-K and KERNEL_RESULT_REFERENCE = mediumm@<128,3>; (3) update the config shapes to the ones above; (4) fix the multi-tile-iter mbarrier bug so it's correct at NS=3."
+  - "The split-K device body comes from MPK's fp8_gemm_dense_decode_splitk_sm100.cuh — its red.global atomic accumulation + ABI are correct; the ONLY bug is the multi-tile-iteration mbarrier cycle-state (ph/gki declared before the tile loop, never reset). The cleanest fix: reset ph/gki at the top of each tile iteration, OR derive phase from a continuous global counter (gk/NS)&1 instead of a toggle."
+  - "split-K helps in proportion to K. qkv_a/gate_up (K=7168) is the sweet spot. o_proj (K=1792) is the tripwire — don't chase it; if it can't beat mediumm that's expected and fine (it stays on mediumm in MPK)."
+
+budget:
+  max_iterations: 50
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [qkv_a_M128, gate_up_M128, o_proj_M128_tripwire, qkv_a_M4]

@@ -136,7 +136,7 @@ Same as V1 but adds:
 
 9. **Progress tracking across sessions**: Git history shows what was tried. progress.md (append-only) shows plans and analysis that weren't committed. Both needed for continuity.
 
-10. **NCU broken by /tmp permissions**: On catalyst-fleet1, ncu failed with "Unknown error on device 0". Fix: `TMPDIR=/tmp/$USER`. Wasted multiple sessions.
+10. **NCU broken by /tmp permissions**: On this cluster, ncu failed with "Unknown error on device 0". Fix: `TMPDIR=/tmp/$USER`. Wasted multiple sessions.
 
 ## Key Technical Findings
 
@@ -173,6 +173,6 @@ Same as V1 but adds:
 - V2: `lithos-cuda-example/examples/cuda_agent_v2/`
 - V3: `lithos-cuda-example/examples/cuda_agent_v3/` (both original + lite)
 - Entry: `cuda_agent_v3/main_v2.py` (run from cuda_agent_v3/ directory)
-- Remote: `catalyst-fleet1:~/repos/lithos/examples/cuda_agent_v3/`
+- Remote: `<host>:~/repos/lithos/examples/cuda_agent_v3/`
 - Saved workspaces: workspace_gemm, workspace_v2_run1, workspace_mla_decode_v2, workspace (current prefill)
 - Best kernels: v024.cu (decode, 46.2 TFLOPS), v016_prefill.cu (prefill, 260 TFLOPS)

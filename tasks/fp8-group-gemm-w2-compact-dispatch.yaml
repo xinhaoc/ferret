@@ -1,0 +1,147 @@
+# ferret task spec — W2 MoE Down-Projection Compact Dispatch
+# Root cause: skip-loop overhead in fp8_group_gemm_largem_sm100 at decode.
+# Target: beat MPK's OWN incumbent kernel at the faithful in-MPK harness.
+
+name: fp8-group-gemm-w2-compact-dispatch
+gpu: B200
+arch: sm_100a
+precision: FP8
+
+problem:
+  description: |
+    W2 MoE down-projection grouped FP8 GEMM (fp8_group_gemm_largem_sm100),
+    DeepSeek V3 decode at TP=4, EP=2.
+
+    EXACT SHAPES AT TARGET REGIME (TP=4, EP=2, mbt=1 decode):
+      E_local = 256 experts / EP=2 = 128 local experts per EP-rank
+      M_total = E_local * BM_PADDING = 128 * 128 = 16384 (padded rows)
+      K       = MOE_INTERMEDIATE_SIZE / routed_tp_size = 2048 / 2 = 1024 (reduction dim)
+      N       = HIDDEN_SIZE = 7168 (output dim)
+      Active experts at decode mbt=1: top-k=8 global, EP=2 -> 4 experts per EP-rank
+      Each active expert gets exactly 1 token row (4 real rows out of 16384 padded).
+
+    Data layout (MPK convention):
+      A:         (M_total=16384, K=1024)   fp8_e4m3, K innermost
+      B:         (E_local=128, N=7168, K=1024) fp8_e4m3 — flattened to (E*N, K) for TMA
+      SFA:       (num_sf_k=ceil(1024/128)/ceil(4/1)=2, M_total=16384) uint32 UE8M0-packed
+                 (num_sf_k = ceil(K/128) packed as ceil(nk/4) uint32s per row)
+                 Actually: nk=ceil(1024/128)=8, num_sf_k=ceil(8/4)=2. Shape: (2, 16384)
+      SFB:       (num_sf_k=2, E_local*N=128*7168=917504) uint32 UE8M0-packed
+      m_indices: (M_total=16384) int32, expert id per row (contiguous blocks of BM=128)
+      active_expert_mask: (E_local=128) int32, 0/1 per expert (written by moe_permute)
+      Output:    (M_total=16384, N=7168) bf16
+
+    The incumbent MPK kernel (fp8_group_gemm_largem_sm100, BN=128, NS=6) uses a flat
+    tile loop over nm*nn = 128*56 = 7168 total tiles strided by num_workers=128.
+    Each worker iterates 56 times. With only 4/128 experts active, 54/56 iters
+    per worker are cheap skips (active_expert_mask check + continue). Skip overhead
+    is ~6.75us per worker (54 * ~125ns), making the kernel 27us total vs 16us for
+    vLLM's dedicated dispatch over only the 4 active experts.
+
+    THE FIX (compact dispatch): Replace the flat nm*nn loop with an expert-outer loop
+    that only iterates over the num_active_experts * nn active tiles:
+      1. At kernel start, build a compact active_expert_ids[MAX_E] list from
+         active_expert_mask (a prefix-scan over E=128 entries).
+      2. Outer loop: for each active expert `ae_idx` in 0..num_active:
+         for each bn in 0..nn: compute bm = active_expert_ids[ae_idx], dispatch tile.
+      3. Persistent striding: worker processes tiles at positions
+         (ae_idx * nn + bn) strided by num_workers — same as before but only
+         over the active subset.
+    Expected: 0 skip-loop overhead -> ~16us -> matches vLLM.
+
+    MPK-FAITHFUL HARNESS REQUIREMENTS:
+      - M_total MUST be 16384 (padded, not just active rows). Active rows are
+        scattered at expert positions determined by moe_permute output.
+      - active_expert_mask MUST be provided (ptr to int32[E_local], 0/1).
+        Set 4 experts to active=1, 124 to active=0 (decode mbt=1 scenario).
+      - num_workers=128 (MPK default, must NOT dedicate all workers to this task).
+      - Bench at the decode-faithful active_experts=4 case. Also bench
+        active_experts=32 (prefill with mbt=128, top-k=8, E_local=128,
+        128*8/EP=2=512 routings but capped at 128 active experts max).
+      - Grid: (num_workers=128, 1, 1). Block: (256, 1, 1).
+      - Output must match a host FP32 reference within max rel error < 1e-2.
+        Emit INVALID if validation fails (score 0.0 for that config).
+      - L2 flush (128 MB cudaMemset) before each timed iteration.
+
+    CORRECTNESS: The compact-dispatch variant must produce bit-identical output
+    to the incumbent kernel (within FP8 rounding, max relative error < 1e-2)
+    for BOTH the active expert rows (non-zero A rows) AND the padding rows
+    (which may contain arbitrary values from previous iterations — the unpermute
+    downstream ignores padding via out_weights=0, so the output values for
+    padding rows are don't-care, but must not segfault).
+
+  shapes:
+    E_LOCAL: 128
+    M_TOTAL: 16384
+    K: 1024
+    N: 7168
+    NUM_WORKERS: 128
+    BM: 128
+
+baseline:
+  source: |
+    MPK incumbent fp8_group_gemm_largem_sm100 (BN=128, NS=6) with M_total=16384,
+    active_expert_mask provided, num_workers=128. This is the EXACT kernel
+    currently called by MPK for W2 at TP=4 EP=2 decode — measured in the
+    same harness as the candidate. Source:
+    $MIRAGE_ROOT/include/mirage/persistent_kernel/tasks/blackwell/fp8_group_gemm_largem_sm100.cuh
+    and fp8_group_gemm_sm100_common.cuh. Do NOT bench vs DeepGEMM or cuBLAS —
+    they dispatch differently and are not the kernel being replaced.
+
+references:
+  - $MIRAGE_ROOT/include/mirage/persistent_kernel/tasks/blackwell/fp8_group_gemm_sm100_common.cuh
+  - $MIRAGE_ROOT/include/mirage/persistent_kernel/tasks/blackwell/fp8_group_gemm_largem_sm100.cuh
+  - $FERRET_ROOT/workspace2/kernel.cu
+
+configs:
+  # PRIMARY: decode mbt=1 regime, 4/128 experts active per EP-rank
+  - name: decode_4active
+    args: { ACTIVE_EXPERTS: 4, E_LOCAL: 128, M_TOTAL: 16384, K: 1024, N: 7168, NUM_WORKERS: 128 }
+    target_ratio: 1.30
+    weight: 2.0
+
+  # SECONDARY: larger active fraction (prefill-like), must not regress
+  - name: decode_32active
+    args: { ACTIVE_EXPERTS: 32, E_LOCAL: 128, M_TOTAL: 16384, K: 1024, N: 7168, NUM_WORKERS: 128 }
+    target_ratio: 1.05
+    weight: 1.0
+
+  # SECONDARY: moderate active fraction
+  - name: decode_16active
+    args: { ACTIVE_EXPERTS: 16, E_LOCAL: 128, M_TOTAL: 16384, K: 1024, N: 7168, NUM_WORKERS: 128 }
+    target_ratio: 1.10
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only."
+  - "No CUDA graphs."
+  - "cta_group::1 only. No 2-CTA clusters."
+  - "Grid must be (num_workers=128, 1, 1). Block must be (256, 1, 1)."
+  - "M_total=16384 ALWAYS padded (do not reduce M_total to active rows at dispatch time)."
+  - "active_expert_mask[E_local] is a runtime int32 array (not compile-time constant)."
+  - "Output must match host FP32 reference within max rel error 1e-2. MANDATORY INVALID emission."
+  - "MANDATORY L2 FLUSH: 128 MB cudaMemset before each timed iteration."
+  - "The compact active-expert list must be built at kernel start from active_expert_mask (shared-mem prefix scan over E_local=128 entries — one __syncthreads, 128 threads, O(1) scan with warp ballots)."
+  - "All four warp roles (TMA-load / UTCCP-transpose / MMA-issue / epilogue) must participate in the compact iteration to maintain mbarrier consistency."
+  - "BN=128, NS=6 (largem variant parameters — do not change)."
+  - "Incumbent baseline: the fp8_group_gemm_largem_sm100_task_impl from fp8_group_gemm_sm100_common.cuh. Build it as a __global__ wrapper for benching. Candidate is the compact-dispatch variant."
+
+hints:
+  - "The compact active-expert list can be built with warp-ballot __popc in a single pass over E_local=128 entries at kernel start. 4 warps of 32 threads each scan 32 entries; lane 0 of each warp writes its local hits to shared mem; then a __syncthreads and sequential prefix-sum over the 4 warp counts. Total: ~2us overhead at kernel start, saves ~6.75us per call."
+  - "The key invariant: all four warp roles MUST make the same skip/compute decision for each bidx (identical to the current per-tile active_expert_mask check). With compact dispatch the loop only visits active tiles so there are no skips — all warps always compute."
+  - "The compact expert list lives in shared memory (int compact_experts[MAX_ACTIVE] where MAX_ACTIVE = E_local = 128 slots, but only num_active entries are valid). Use a smem int for num_active, read it before the main loop."
+  - "Measure the incumbent with the SAME active_expert_mask setup: M_total=16384, 4 active experts at positions spread across the 128-expert range (e.g., experts 3, 37, 71, 105 to simulate non-contiguous routing). Contiguous active experts would be too favorable to the incumbent's access pattern."
+
+budget:
+  max_iterations: 40
+  max_wall_minutes: 90
+
+output:
+  result_format: kernel_result_json
+  result_keys: [decode_4active, decode_32active, decode_16active]

@@ -1,0 +1,97 @@
+# ferret task spec — DeepSeek-V3 MoE routing-gate GEMM, decode regime
+#
+# Context: in MPK this GEMM runs as TASK_SPLITK_LINEAR_SM100.
+# Current MPK cost: ~12.6 us/layer at decode. cuBLAS reference: ~3 us.
+# Gap factor ~4x. Root cause: split-K dispatch over-sends CTAs (112 CTAs
+# for M=1 N=256 K=7168), most of which are idle.
+# This task asks ferret to find a low-M skinny-N BF16 GEMM that beats
+# cuBLAS by >=10% at M=1/4/8 (the real decode batch sizes in DSv3).
+
+name: dsv3-router-gemm-decode
+gpu: B200
+arch: sm_100a
+precision: BF16
+
+problem:
+  description: |
+    DeepSeek-V3 MoE routing-gate linear projection (DECODE regime).
+    Projects the post-attention hidden state to expert logits:
+
+      logits[M, 256] = x[M, 7168] @ W_gate[256, 7168]^T
+
+    M = number of active decode rows. Decode TPOT (batch=1) → M=1.
+    Also bench M=4 and M=8 for spec-decode / small-batch regimes.
+
+    Shapes:
+      x      : [M, 7168]   BF16, row-major
+      W_gate : [256, 7168] BF16, row-major (stored as N×K, transposed on read)
+      logits : [M, 256]    BF16, row-major, FP32 accumulator
+
+    This is a skinny-N GEMM (N=256) latency-bound on B200. The weight
+    matrix W_gate[256, 7168] is only 3.5 MB and fits entirely in L2/SMEM.
+    At M=1 the operation is a pure GEMV (7168 FP32 MACs → 7168 BF16 reads
+    of x plus 3.5 MB BF16 weight reads = ~3.5 MB total HBM). B200 peak
+    HBM ~8 TB/s → theoretical floor ~0.4 us; practical cuBLAS lands ~3 us.
+    Kernel should stream x as a vector, tile W_gate in SMEM, and avoid
+    over-dispatch. The "swapab" trick (compute C^T = W @ x^T so MMA "A"
+    = W, MMA "B" = x) lets the weight tile be the large operand loaded
+    via TMA and avoids transposing the output.
+
+    Output must match a host reference (naive FP32-accumulate BF16 GEMM)
+    within max relative error < 1e-2.
+
+  shapes:
+    M: 1       # primary decode batch size
+    K: 7168    # hidden dimension
+    N: 256     # number of routed experts
+
+baseline:
+  source: "cuBLAS BF16 GEMM (cublasGemmEx, CUBLAS_OP_T for W^T, BF16 I/O, FP32 accum)"
+
+references:
+  - examples/qwen3-8b-decode-linear-bs16/v006_cg1_swapab_l2hints.cu
+  - examples/tcgen05-gemm/05b_cg2_swapab_small_m.cu
+  - examples/tcgen05-gemm/04_warp_specialization.cu
+
+configs:
+  - name: M1
+    args: { M: 1, K: 7168, N: 256 }
+    target_ratio: 1.10
+    weight: 1.0
+
+  - name: M4
+    args: { M: 4, K: 7168, N: 256 }
+    target_ratio: 1.10
+    weight: 1.0
+
+  - name: M8
+    args: { M: 8, K: 7168, N: 256 }
+    target_ratio: 1.10
+    weight: 1.0
+
+scoring: min_ratio
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only. No cudaStreamCreate, no cudaEvent overlap."
+  - "No CUDA graphs."
+  - "cta_group::1 only. 2-CTA clusters NOT supported on this build."
+  - "BF16 input (x and W_gate), BF16 output (logits), FP32 accumulator."
+  - "Output must match a host reference (FP32-accumulate BF16 GEMM) within max relative error < 1e-2."
+  - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include host reference comparison and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). DO NOT remove this guard."
+  - "MANDATORY L2 FLUSH: benchmark MUST flush a 128 MB buffer (cudaMemset on a 128 MB device buffer) immediately before each timed iteration. Reported TFLOPS must be the median across NI per-iteration measurements (each: flush, record start, kernel, record stop, sync). This mirrors the L2-cold state between consecutive MoE router calls in real inference. No single-event batch around all iterations."
+
+hints:
+  - "This is a latency-bound GEMV for M=1. W_gate[256, 7168] is only 3.5 MB — it fits in L2 across iterations but the flush requirement disables L2 reuse, so treat every call as HBM-bound. The fastest path is: one CTA (or a small fixed CTA count), load x[1,7168] broadcast to all warps via shared memory, stream W_gate rows via TMA into SMEM, accumulate into FP32 per-output-element, write BF16. The swapab trick (C^T[N,M] = W[N,K] @ x[K,M]^T) lets you use W as the large MMA 'A' tile and x as the small 'B' tile, which matches tcgen05 usage in examples/qwen3-8b-decode-linear-bs16/v006_cg1_swapab_l2hints.cu."
+  - "For M=4 and M=8, the same swapab persistent kernel from v006 should scale without change — x is still smaller than W. Target: all three configs beat cuBLAS by >=10%. Do not add split-K at M=1: over-dispatch is the existing bug in MPK. Start with 1 or 2 CTAs only."
+
+budget:
+  max_iterations: 60
+  max_wall_minutes: 120
+
+output:
+  result_format: kernel_result_json
+  result_keys: [M1, M4, M8]

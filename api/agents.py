@@ -12,7 +12,7 @@ from motus.models.base import CachePolicy
 from motus.tools import FunctionTool
 
 from .prompts import OPTIMIZER_PROMPT
-from .tools.profiler import extract_kernel_names
+from ..tools.profiler import extract_kernel_names  # profiler stays at the ferret root
 
 
 def create_optimizer(

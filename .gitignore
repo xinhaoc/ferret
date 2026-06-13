@@ -17,11 +17,32 @@ Thumbs.db
 
 # Agent runtime state (per-run, not source)
 workspace/
+workspace[0-9]/
+workspace[0-9][0-9]/
 *.log
 cache_trace.jsonl
 tool_calls.jsonl
 conversation.jsonl
 file_reads.json
+
+# Shared machine-level knowledge for Claude-Code subagents — populated at
+# runtime by the memory-keeper agent. Not source. (The tracked template
+# lives in docs/dev-memory-seed/ and is copied into here by cc-init.sh.)
+docs/dev-memory/
+
+# Claude Code runtime artefacts. The committed subagents live in
+# .claude/agents/, so we ignore everything else under .claude/.
+.claude/*
+!.claude/agents/
+.claude/agents/*.lock
+# ...plus the committed kernelwiki skill (the rest of .claude/skills/ stays local).
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/kernelwiki/
+!.claude/skills/kernelwiki/**
+
+# Runtime logs (e.g. scripts/update_kernelwiki.sh writes logs/kernelwiki-update.log)
+logs/
 
 # Build artifacts
 *.cubin
@@ -35,3 +56,9 @@ kernel.cubin
 resources/**/__pycache__/
 resources/**/*.pyc
 resources/**/build/
+
+# Session-local files (per-run scratch, not source). *.log and __pycache__/
+# are already covered above.
+docs/WORKFLOW_AUDIT.md
+calib_scratch/
+*.pid

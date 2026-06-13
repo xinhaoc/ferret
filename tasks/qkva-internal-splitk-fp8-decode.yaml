@@ -1,0 +1,165 @@
+# ferret task — qkv_a INTERNAL split-K FP8 dense GEMM, B200, decode.
+#
+# 2026-06-01: authored after ablation-logic-reviewer + Codex cleared the design.
+#
+# KEY SPEC: this replaces the CRASHED red.relaxed.gpu.global.add.bf16x2 kernel
+# (Heisenbug: memcheck-hidden race in the TP=4 megakernel, retired 2026-05-29).
+# The NEW kernel uses EXCLUSIVE FP32 partial slots + device-scope atomicInc
+# last-arriver + fence.sc.gpu — a CORRECT inter-CTA reduction design.
+#
+# SCOPE = qkv_a ONLY (N=2176, K=7168).
+#   gate_up (N=9216) already fills ~80 workers at S=1 -> no under-occupancy gap.
+#   o_proj (K=1792 per rank) too short for split-K gain (calib: 0.75x vs mediumm).
+#
+# BASELINE = MPK in-tree fp8_gemm_dense_mediumm_sm100 at <128,NS=3,NE=4>,
+#            benched MPK-faithfully (num_workers=136, worker_idx=blockIdx.x,
+#            pre-zeroed output, multi-tile-iter exercised).
+# MECHANISM under-occupancy: nn = N/128 = 17 CTAs while ~80 workers sit idle;
+#            each CTA serializes K=7168 (nk=56 tiles at ~0.53μs each) alone.
+#            Split S=2..4 fills idle workers and cuts per-call latency.
+#            CALIB RESULT (2026-05-29): splitK beats mediumm 2.29x@M=128, 1.60x
+#            (ws7/v001 NS=3 harness). Reviewer-confirmed −12..−16μs in-MPK.
+
+name: qkva-internal-splitk-fp8-decode
+gpu: B200
+arch: sm_100a
+precision: FP8
+
+problem:
+  description: |
+    INTERNAL split-K FP8 e4m3 dense GEMM for DeepSeek-V3 qkv_a decode projection.
+    Replaces fp8_gemm_dense_mediumm_sm100 on the qkv_a shape (N=2176, K=7168).
+
+    At decode the megakernel runs ONE 128-row MMA tile (compile-M=128=mbt;
+    active_rows=1 at TPOT). The decode cost = LATENCY of one 128-row tile.
+    mediumm dispatches nn=N/128=17 CTAs from ~80 workers, each computing the
+    full K=7168 (~29.6μs serial), leaving 63 workers idle.
+
+    SPLIT-K (S∈{2,4}, nk=56 divisible by both): SPLIT_K extra CTAs per (m,n)
+    tile, each computing K/(SPLIT_K) = 7168/S K-tiles. Total CTAs = 17*S
+    (S=2→34, S=4→68), filling idle workers and cutting latency ~2x/4x.
+
+    REDUCTION DESIGN (CORRECT, replaces the crashed bf16x2-atomic pattern):
+      - Allocate SPLIT_K exclusive FP32 partial output buffers: C_partial[S][M*N].
+        Each K-slice CTA writes its partial tile to C_partial[ks][...] via direct
+        store (no atomic contention, each slot is exclusively owned by one CTA).
+      - Last-arriver election via a GENERATION-TAGGED atomicInc counter per output
+        tile: each CTA atomicInc(&arrive_cnt[tile_id]) → if result == SPLIT_K-1,
+        this CTA is the last arriver. The counter is generation-tagged (packed
+        [gen|count] in a uint64, or a separate gen array) to avoid stale-counter
+        reuse across megakernel task iterations.
+      - Last-arriver CTA reduces the S FP32 partials in FIXED order (ks=0..S-1)
+        accumulating in float; casts result to BF16 once; writes the final
+        output tile to C[M*N] via direct store.
+      - BEFORE the last-arriver writes to C (and certainly before it contributes
+        to the MPK task-completion mbarrier), emit:
+          asm volatile("fence.sc.gpu;" ::: "memory");
+        This is a DEVICE-SCOPE sequentially-consistent fence (NOT membar.gl which
+        is L1-only). It guarantees that C_partial writes from ALL K-slice CTAs are
+        visible to the last-arriver's reduction loads on the SAME GPU.
+      - A fence.sc.gpu AFTER writing C ensures the final BF16 result is globally
+        visible before the MPK producer event fires.
+
+    DATA TYPES:
+      A:   [M, K]         FP8 e4m3, K-major (row-major)
+      B:   [N, K]         FP8 e4m3, K-major
+      SFA: [M, K/128]     FP32, 1x128-per-group activation scale
+      SFB: [N/128, K/128] FP32, 128x128-per-group weight scale
+      D:   [M, N]         BF16 final output, row-major
+
+    ABI: device function __device__ __noinline__ matching
+      fp8_gemm_dense_decode_splitk_sm100_task_impl<BN=128, NS, NE, SPLIT_K>.
+    Signature (EXACT, must match the mediumm ABI + new SPLIT_K param):
+      template <int BN, int NS, int NE, int SPLIT_K>
+      __device__ __noinline__ void
+      fp8_gemm_dense_qkva_splitk_sm100_task_impl(
+          CUtensorMap const *ta_ptr,
+          CUtensorMap const *tb_ptr,
+          float const *__restrict__ sa,
+          float const *__restrict__ sb,
+          __nv_bfloat16 *__restrict__ C,
+          float *__restrict__ C_partial,   // [SPLIT_K, M, N] FP32 partial buffer
+          uint64_t *__restrict__ arrive_cnt, // [ceil(M/128)*ceil(N/128)] gen-tagged counter
+          int const M, int const N, int const K,
+          int const worker_idx, int const num_workers);
+
+    NOTE: C_partial and arrive_cnt are MPK-allocated scratch buffers zeroed once
+    per megakernel launch (not per GEMM call). The generation tag isolates
+    successive decode iterations.
+
+  shapes:
+    M: 128   # compile-time row-tile = mbt; active_rows=1 at TPOT but full tile computed
+    K: 7168  # qkv_a input hidden dimension
+    N: 2176  # qkv_a output (kv_lora_rank(512) + q_lora_rank(1536) = 2048 + 128 nope = 2176)
+    SPLIT_K_CANDIDATES: [2, 4]   # nk=56 divisible by 2 and 4
+
+baseline:
+  source: "MPK in-tree fp8_gemm_dense_mediumm_sm100_task_impl<128,NS=3,NE=4>; harness seed at $FERRET_ROOT/calib_scratch/calib.cu"
+
+references:
+  - $FERRET_ROOT/calib_scratch/calib.cu
+  - $MIRAGE_ROOT/include/mirage/persistent_kernel/tasks/blackwell/fp8_gemm_dense_mediumm_sm100.cuh
+  - $MIRAGE_ROOT/include/mirage/persistent_kernel/tasks/blackwell/fp8_gemm_dense_decode_splitk_sm100.cuh
+  - $MIRAGE_ROOT/include/mirage/persistent_kernel/tasks/blackwell/fp8_gemm_dense_sm100_common.cuh
+
+configs:
+  # PRIMARY target: qkv_a at DECODE regime (M=128 = one full MMA tile).
+  # Ratio vs mediumm at same shape+NS. Bar=1.00 (not-worse gate for delivery).
+  # Calib result 2026-05-29: ws7/v001 1.60x vs mediumm@NS=3 -> 1.00 bar is achievable.
+  - name: qkv_a_S2
+    args: { M: 128, K: 7168, N: 2176, SPLIT_K: 2 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  - name: qkv_a_S4
+    args: { M: 128, K: 7168, N: 2176, SPLIT_K: 4 }
+    target_ratio: 1.00
+    weight: 1.0
+
+  # Reported-only: small-M view for spec-decode / MTP regime.
+  - name: qkv_a_M4_S4
+    args: { M: 4, K: 7168, N: 2176, SPLIT_K: 4 }
+    target_ratio: 0.01
+    weight: 0.0
+
+  # Tripwire: o_proj (K=1792) must NOT regress. This shape has its own kernel
+  # path (mediumm, no split-K). Include as a correctness smoke only (weight=0).
+  - name: o_proj_tripwire
+    args: { M: 128, K: 1792, N: 7168, SPLIT_K: 1 }
+    target_ratio: 0.01
+    weight: 0.0
+
+scoring: weighted_avg  # weight=0 configs excluded; weight=1.0 configs (S2+S4) drive score
+
+stage_gate:
+  ratio: 0.85
+  strict: false
+
+constraints:
+  - "Single CUDA stream only. No CUDA graphs. cta_group::1 (MPK 1-SM-per-worker model)."
+  - "FP8 e4m3 input, BF16 final output, FP32 accumulators. Block-scaled: act 1x128, weight 128x128."
+  - "MANDATORY REDUCTION DESIGN — NO red.global.add.bf16x2 INTO PRE-ZEROED BUFFER (that design is a confirmed Heisenbug: passes memcheck, crashes TP=4 megakernel at runtime). USE THE CORRECT PATTERN: (1) exclusive FP32 partial output slots C_partial[SPLIT_K][M_tile*N_tile] — each K-slice CTA writes its tile to its own slot via DIRECT STORE; (2) per-tile generation-tagged atomicInc arrive counter; (3) last-arriver (the CTA whose atomicInc returns SPLIT_K-1) does a fixed-order FP32 sum over the S partials, casts once to BF16, writes final C; (4) fence.sc.gpu (device-scope SC fence, NOT membar.gl) before and after the last-arriver write to guarantee partial-buffer visibility."
+  - "MANDATORY fence.sc.gpu: use 'asm volatile(\"fence.sc.gpu;\" ::: \"memory\");' for device-scope ordering around the inter-CTA reduction. Do NOT substitute membar.gl (L1-only, insufficient for inter-CTA) or fence.acq_rel (weaker than SC, allows reordering under non-TSO)."
+  - "MANDATORY GENERATION TAGGING: the arrive_cnt[tile_id] counter must encode a generation so that two successive decode steps (tile_id recycled) cannot confuse each other. Use a packed uint64: low 32 bits = arrived count (atomicAdd/atomicInc), high 32 bits = generation (incremented by the last-arriver after writing C). Last-arriver checks (val & 0xFFFFFFFF) == SPLIT_K-1. On next iteration, last-arriver of the previous step has incremented generation -> counter is now at new_gen<<32 | 0, so arrivals for the new step start fresh."
+  - "MANDATORY NS/NE = MPK register values: instantiate at <BN=128, NS=3, NE=2>. Do NOT tune NS/NE for standalone appearance. Reference kernel (mediumm) uses NS=3, NE=4."
+  - "MANDATORY CORRECTNESS GUARD: validate each config against host FP32 reference (max rel err < 1e-2). Emit INVALID on ANY mismatch — the parser treats INVALID as 0.0 (zero score). Do NOT remove or skip this guard to make numbers look better."
+  - "MANDATORY MPK-FAITHFUL HARNESS: launch grid_dim.x = num_workers = 136, worker_idx = blockIdx.x. For the split-K variant, total CTAs = ceil(M/128)*ceil(N/128)*SPLIT_K; when total > 136 this exercises multi-tile-iter (N=2176 S=2 -> 17*2=34 <= 136, single-wave; S=4 -> 68 <= 136, single-wave — both within worker budget at this shape). Allocate and zero C_partial + arrive_cnt before each timed iteration."
+  - "MANDATORY L2 FLUSH: flush 128 MB device buffer immediately before each timed iteration. Report median over NI=25 iterations. TFLOPS = 2*M*N*K / (median_us * 1e-6 * 1e12)."
+  - "MANDATORY MULTI-TILE-ITER STRESS: additionally validate at a reduced worker count (e.g. 17 workers) that forces multi-wave execution for the split-K kernel. Both the mediumm reference and the split-K candidate must pass this stress. The B36 mbarrier-phase-carry bug (per ws7 fix) MUST remain fixed: drive bf/be slot+parity from a continuous gk counter, not a per-tile-reset ki%NS+ph."
+  - "Output ABI: __device__ __noinline__, CUtensorMap const* pointer args, worker_idx + num_workers params. The kernel-extractor will strip host/main() and produce the Mirage-ready .cuh. Keep the device function namespace and name consistent with fp8_gemm_dense_decode_splitk (or a new namespace fp8_gemm_dense_qkva_splitk) so the extractor can locate it."
+  - "TUNING: try SPLIT_K in {2, 4}. nk=56 is divisible by both. Report both; the one with better median latency is the deliverable. Do NOT try SPLIT_K=8 (total=17*8=136 tiles exactly fills workers but gives only nk_slice=7 K-tiles/CTA -> atomicInc overhead may dominate)."
+
+hints:
+  - "START from $FERRET_ROOT/calib_scratch/calib.cu which already has the correct B36 fix (continuous gk/gki counters), the mediumm reference lines, host-FP32 validation, and L2 flush. The ONLY changes needed: (1) replace the red.relaxed.gpu.global.add.bf16x2 epilogue with the FP32-partial + atomicInc last-arriver pattern; (2) add C_partial + arrive_cnt parameters and allocations to main(); (3) adjust KERNEL_RESULT_REFERENCE to be mediumm@<128,NS=3,NE=4>; (4) bench both S=2 and S=4."
+  - "The B36 fix from ws7 is ALREADY in calib.cu (lines ~200-228 producer gk counter, ~230-269 MMA gki). Keep it. Do not revert to per-tile ki%NS + ph toggle."
+  - "For the arrive_cnt generation pattern, a simple uint64_t per tile works: tile_idx = bm*nn+bn; old = atomicAdd(&arrive_cnt[tile_idx], 1ULL); is_last = (old & 0xFFFFFFFFULL) == (uint64_t)(SPLIT_K-1). After writing C, the last arriver does arrive_cnt[tile_idx] += (1ULL << 32) to bump generation and zero the low word: arrive_cnt[tile_idx] = (arrive_cnt[tile_idx] + (1ULL<<32)) & ~0xFFFFFFFFULL (or use a separate atomicExch). Simpler alternative: use separate arrive_cnt[tile]*4 bytes (uint32) + gen[tile]*4 bytes (uint32), where last-arriver does gen[tile]++ + arrive_cnt[tile]=0 with a fence.sc.gpu between."
+  - "The partial buffer layout: C_partial is float[SPLIT_K * M_tiles * N_tiles * BM * BN] where each K-slice CTA (ks) writes to C_partial + ks*M_tiles*N_tiles*BM*BN + (bm*nn+bn)*BM*BN. With M=128=BM, M_tiles=1, nn=17, BN=128, total = SPLIT_K*17*128*128*4 bytes = S*17*64KB. At S=4: 4*17*64KB = 4.25MB — fits comfortably in device memory."
+  - "fence.sc.gpu PTX: 'asm volatile(\"fence.sc.gpu;\" ::: \"memory\");' — use this before the last-arriver reads C_partial[0..S-1] (to see all partial writes) and after writing C (to make the BF16 result globally visible). This is the correct SM100 device-scope SC fence."
+
+budget:
+  max_iterations: 30
+  max_wall_minutes: 90
+
+output:
+  result_format: kernel_result_json
+  result_keys: [qkv_a_S2, qkv_a_S4, qkv_a_M4_S4, o_proj_tripwire]

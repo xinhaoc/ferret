@@ -9,6 +9,19 @@
 
 MAX_MEM_PCT=${MAX_MEM_PCT:-50}
 
+# Avoid GPUs already pinned by another running ferret cc-run / workspace session.
+# Their CUDA_VISIBLE_DEVICES is baked at launch and NOT re-picked, so without this
+# two concurrent dispatches both grab the lowest-mem GPU (all ~0 MiB at launch) and
+# collide on benchmarks, corrupting each other's perf numbers. Self-maintaining:
+# reflects live procs, no lease files. Set FERRET_NO_EXCLUDE=1 to disable.
+EXCLUDE_GPUS=" "
+if [ "${FERRET_NO_EXCLUDE:-0}" != "1" ]; then
+    for _p in $(pgrep -u "$(whoami)" -f "cc-run|workspace[0-9]" 2>/dev/null); do
+        _cvd=$(tr '\0' '\n' < "/proc/$_p/environ" 2>/dev/null | sed -n 's/^CUDA_VISIBLE_DEVICES=//p')
+        [ -n "$_cvd" ] && EXCLUDE_GPUS="$EXCLUDE_GPUS${_cvd//,/ } "
+    done
+fi
+
 best_gpu=""
 best_mem=999999
 
@@ -18,6 +31,9 @@ while IFS=, read -r idx used total; do
     total=$(echo "$total" | xargs | sed 's/ MiB//')
 
     if [ "$total" -eq 0 ] 2>/dev/null; then continue; fi
+
+    # Skip GPUs pinned by another running ferret session
+    case "$EXCLUDE_GPUS" in *" $idx "*) continue;; esac
 
     pct=$((used * 100 / total))
 

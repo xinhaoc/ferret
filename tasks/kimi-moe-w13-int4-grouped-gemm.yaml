@@ -113,36 +113,51 @@ baseline:
     moe_wna16 backend and note the substitution in run.log.
 
 references:
-  # ── Marlin baseline source — read this FIRST to understand the playbook ──
-  # vLLM's Marlin INT4 W4A16 grouped-MoE GEMM (the kernel the baseline calls):
+  # ── Tier 1: Marlin baseline source — read FIRST. This is the playbook. ─
+  # vLLM's Marlin MoE (the kernel baseline_marlin.py invokes):
   - resources/vllm-csrc-marlin/csrc/libtorch_stable/moe/moe_wna16.cu                          # MoE entry point
   - resources/vllm-csrc-marlin/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h    # MoE-specific Marlin template
   - resources/vllm-csrc-marlin/csrc/libtorch_stable/moe/moe_wna16_utils.h
-  # vLLM's underlying Marlin (non-MoE) — same mainloop, simpler wrapper:
-  - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/marlin.cu             # main launcher
-  - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/marlin.cuh            # core defs
-  - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/marlin_template.h     # the inner kernel template
-  - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/marlin_mma.h          # MMA wrappers
-  - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/marlin_dtypes.cuh     # int4 unpack helpers
-  - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/gptq_marlin_repack.cu # the K-tile permutation
+  # vLLM's underlying non-MoE Marlin — same mainloop, simpler scaffold:
+  - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/marlin.cu             # launcher
+  - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/marlin.cuh
+  - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/marlin_template.h     # inner kernel template
+  - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/marlin_mma.h
+  - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/marlin_dtypes.cuh     # int4 unpack (lop3+PRMT)
+  - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/gptq_marlin_repack.cu # K-tile permutation
   # Original IST-DASLab Marlin — single-file, cleanest reference (SM80/SM90):
-  - resources/marlin-standalone/marlin/marlin_cuda_kernel.cu                                  # 822 lines, the canonical hand-tuned reference
+  - resources/marlin-standalone/marlin/marlin_cuda_kernel.cu                                  # 822 lines, canonical
 
-  # ── Hardware programming model — tcgen05 / TMA / setmaxnreg ────────────
-  - resources/cutlass-4.4.2/examples/77_blackwell_fmha
-  - resources/cutlass-4.4.2/include/cute/atom/mma_traits_sm100.hpp
-  - docs/ptx-isa-9.2
+  # ── Tier 2: CUTLASS Blackwell GEMM examples — directly relevant ────────
+  # The MOST RELEVANT CUTLASS examples for this task (INT4 MoE GEMM on B200):
+  - resources/cutlass-4.4.2/examples/92_blackwell_moe_gemm           # ← MoE GEMM on Blackwell — exact shape match
+  - resources/cutlass-4.4.2/examples/86_blackwell_mixed_dtype_gemm   # ← INT4-weight × BF16-act with on-chip dequant
+  - resources/cutlass-4.4.2/examples/75_blackwell_grouped_gemm       # ← grouped GEMM template (variable M per group)
+  - resources/cutlass-4.4.2/examples/74_blackwell_gemm_streamk       # Stream-K scheduling — fills SMs at low active-expert count
+  - resources/cutlass-4.4.2/examples/81_blackwell_gemm_blockwise     # blockwise scales — closest analog to group-32 scale layout
+  - resources/cutlass-4.4.2/examples/91_fp4_gemv                     # small-M (GEMV-shaped) Blackwell — relevant for T=1
+  - resources/cutlass-4.4.2/examples/70_blackwell_gemm               # basic Blackwell GEMM with tcgen05 (start here if 92 is too dense)
 
-  # ── FA4 + FlashMLA warp-spec patterns (mbarrier pipeline, TMA bulk) ────
-  - resources/flash-attention-fa4-v4.0.0.beta8
-  - resources/flashmla-main/csrc
+  # ── Tier 3: DeepGEMM SM100 GEMM implementations ────────────────────────
+  - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh   # BF16 grouped GEMM (no quant — for scaffold)
+  - resources/deepgemm-2.1.1.post3/deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d1d.cuh # FP8 grouped GEMM with scales
 
-  # ── Prior ferret artifacts: SAME swapAB tcgen05 N=8/16 pattern ─────────
-  - examples/gqa-decode-qwen3-8b/v036_transposed_n8_qwen3_8b_1.15x_min.cu   # N=8 swapAB, TMA, warp-spec
-  - examples/qwen3-8b-decode-linear-bs16/v019_swapab_cg2_l2hints.cu          # swapAB for M=16 GEMM, closest GEMM analogue
+  # ── Tier 4: Prior ferret GEMM artifacts (in-repo wins on similar shapes) ─
+  - examples/qwen3-8b-decode-linear-bs16/v019_swapab_cg2_l2hints.cu  # swapAB cg2 GEMM at M=16 — CLOSEST in-repo win, study first
+  - examples/tcgen05-gemm/05b_cg2_swapab_small_m.cu                  # cg2 swapAB for small-M GEMM — the swapAB pattern
+  - examples/tcgen05-gemm/06_persistent_kernel.cu                    # persistent kernel scaffold (for empty-expert skip schedule)
+  - examples/tcgen05-gemm/07_cg2_persistent_large_m.cu               # cg2 + persistent
+  - examples/fp8-gemm/v009_large_m_block_scale_mma_080.cu            # block-scale FP8 GEMM (group-K scale handling)
 
-  # ── FlashInfer reference (for INT4 unpack idioms if not in Marlin) ─────
-  - resources/flashinfer-0.6.7.post3
+  # ── Tier 5: HW programming model — only the parts that matter for GEMM ─
+  - resources/cutlass-4.4.2/include/cute/atom/mma_traits_sm100.hpp   # tcgen05 atom definitions (find the right N=8/16 atom)
+  - docs/ptx-isa-9.2                                                  # tcgen05.mma, cp.async.bulk.tensor, mbarrier reference
+
+  # Deliberately NOT in this list (would mislead the agent into attention
+  # patterns that don't apply to a GEMM): FlashMLA, FA4, 77_blackwell_fmha,
+  # FlashInfer (mostly attention), gqa-decode-qwen3-8b/v036 (attention — has
+  # the N=8 atom but the surrounding superstructure is online-softmax,
+  # irrelevant here).
 
 configs:
   # 2 configs: T=1 (BS=1 decode) and T=8 (speculative decode K=8 lookahead).
@@ -221,17 +236,28 @@ hints:
         (the actual lop3+PRMT dequant code you can port directly)
 
     Step 1 (~iter 2-3): read examples/qwen3-8b-decode-linear-bs16/v019_swapab_cg2_l2hints.cu
-    — this is the closest in-repo GEMM analogue. It already uses swapAB,
-    tcgen05.mma.cta_group::1 with N tile size adapted for small token counts,
-    TMA cp.async.bulk.tensor weight loads, and warp specialization. The INT4
-    dequant is the ONLY new piece on top of this skeleton.
+    — closest in-repo GEMM win. Already does swapAB, tcgen05.mma.cta_group::2,
+    TMA cp.async.bulk.tensor weight loads, warp specialization, L2 cache hints.
+    The INT4 dequant + grouped-MoE scheduling are the ONLY new pieces on
+    top of this skeleton.
 
-    Step 2 (~iter 3-5): read examples/gqa-decode-qwen3-8b/v036_transposed_n8_qwen3_8b_1.15x_min.cu
-    — uses the EXACT N=8 swapAB atom (SM100_MMA_NOWS_SS_NE bf16 N=8) you want
-    for the T=1 case. Steal the atom + warp-spec scaffold; replace the QK^T
-    + softmax mainloop with INT4-dequant + BF16-MMA mainloop.
+    Step 2 (~iter 3-5): read the CUTLASS GEMM examples in order:
+      - 70_blackwell_gemm        — basic tcgen05 GEMM, the simplest scaffold
+      - 86_blackwell_mixed_dtype_gemm — INT4 weight × BF16 act with on-chip
+                                       dequant; PORT the dequant fragment
+                                       directly (lop3+PRMT) into the agent's
+                                       mainloop
+      - 75_blackwell_grouped_gemm — grouped GEMM with variable M per group;
+                                    PORT the per-group tile schedule
+      - 92_blackwell_moe_gemm    — full MoE GEMM scaffold (closest possible
+                                   match, may be more general than this task
+                                   needs)
+    Also: deepgemm sm100_fp8_gemm_1d1d.cuh shows a clean SM100 grouped GEMM
+    with scale handling (FP8 not INT4, but the scale-application skeleton
+    is similar to group-32).
 
-    Step 3 (~iter 5-7): wire the INT4 unpack. The pattern (Marlin's playbook):
+    Step 3 (~iter 5-7): wire the INT4 unpack. The pattern (Marlin's playbook
+    + CUTLASS 86_blackwell_mixed_dtype_gemm):
       - TMA-load weight as INT32-typed tensor (8 nibbles/word, K-major).
       - In the consumer warps, unpack 8 nibbles → 8 bf16 via lop3.b32 + PRMT
         (search "int4 to bf16 dequant lop3 PRMT" or "Marlin dequant trick").

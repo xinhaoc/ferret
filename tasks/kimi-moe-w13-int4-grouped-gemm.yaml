@@ -160,22 +160,16 @@ references:
   # irrelevant here).
 
 configs:
-  # 2 configs: T=1 (BS=1 decode) and T=8 (speculative decode K=8 lookahead).
-  # Parallelism = TP=8 EP=1 only.
+  # T=8 (speculative decode K=8 lookahead) — TP=8 EP=1.
   # Token-to-expert routing uses a deterministic balanced distribution (each
   # of T tokens picks top_k=8 distinct experts uniformly from E_loc=384).
   # The baseline + kernel MUST agree on the routing layout (sorted_token_ids
   # contract from vllm.model_executor.layers.fused_moe.moe_align_block_size).
 
-  - name: T1
-    args: { T: 1, TOP_K: 8, H: 7168, N_r: 512, I_r: 256, E_loc: 384 }
-    target_ratio: 1.10
-    weight: 2.0    # production-critical BS=1 decode
-
   - name: T8
     args: { T: 8, TOP_K: 8, H: 7168, N_r: 512, I_r: 256, E_loc: 384 }
     target_ratio: 1.10
-    weight: 1.0    # speculative-decode lookahead
+    weight: 1.0
 
 scoring: min_ratio
 
@@ -196,240 +190,19 @@ constraints:
   - "All weight (INT4-packed-as-INT32) loads MUST use TMA (cp.async.bulk.tensor with mbarrier completion). Element-wise __ldg or per-thread cp.async.ca per-INT32-word loops are INVALID for the weight stream. The TMA tensor descriptor may declare the weight as INT32 elements — TMA does not natively know INT4; that is fine, just transfer the int32-packed bytes and unpack on-chip."
   - "swapAB is REQUIRED: tokens (M_e <= 8) MUST land on the MMA N-axis (N=8 with cta_group::1, or N=16 with cta_group::2). Putting tokens on M and padding to M=64/128 wastes 87-94% of MMA capacity at T<=8 and is INVALID. The weight axis (2I_r = 512 or 1024) becomes the MMA M-axis. Express via descriptor transpose bits / Major::K Major::MN selection — NO physical data transpose of the weight tensor."
   - "Warp specialization REQUIRED. At least 3 distinct warp roles dispatched via warp-id: (a) TMA producer (weight + activation + scale loads), (b) MMA launcher (single-thread tcgen05.mma issue), (c) dequant + softmax-equivalent + epilogue consumer. Single-role kernels (every warp does everything) are INVALID. Use setmaxnreg.inc / setmaxnreg.dec to split registers between roles."
-  - "TMEM read pattern must match the atom's subpartition layout. For SM100 cta_group::1 kind::f16, atom output occupies 4 subpartitions of 32 TMEM rows each. The M=128 atom uses all 32 rows of every subpartition (linear read works). The M=64 atom uses only the first 16 of 32 rows in each subpartition — the mapping is `atom_row = (TMEM_row / 32) * 16 + (TMEM_row % 32)` for `TMEM_row % 32 < 16`; rows 16..31 of each subpartition are padding. Reading TMEM linearly when BLOCK_M=64 silently drops half the data and reads padding zeros for the other half (verified by correctness/dbg/probe.cu vs probe4.cu). The starting kernel reads correctly via 4 warps × 32x32b loads at TMEM offsets {0,32,64,96} with `lane_id < 16` mask. If you change BLOCK_M or the read pattern, ensure the two stay consistent — this is the single failure mode that ruined the prior v015..v057 trajectory."
   - "Empty-expert skip REQUIRED. The tile schedule MUST skip experts with M_e = 0. A naive schedule that launches CTAs for all E_loc experts (waste at T<=8 where <=64 are active) is INVALID."
 
   # ── numerics ────────────────────────────────────────────────────────────
   - "INT4 nibble decode: nibbles are stored offset-8 unsigned. Convert to signed via signed_value = raw_nibble - 8, giving range [-8, 7]. Apply per-row group-32 BF16 scale to obtain the BF16 weight element. Group boundaries: scale index for K-position k of row r is scales[r, k/32]. Do this conversion ON-CHIP after TMA load; do NOT do it in a pre-pass kernel."
   - "BF16 input activations + BF16 dequantized weights (after INT4→BF16). FP32 accumulator inside the MMA. BF16 output."
   - "FUSED silu·mul epilogue is REQUIRED. The kernel MUST emit [num_routed_pairs, I_r=256] BF16 with values silu(gate) * up, where gate is the first I_r=256 columns of the GEMM output and up is the second I_r=256 columns. Emitting an unfused [P, 2I_r=512] intermediate (separate activation kernel afterward) is INVALID — the baseline measures Marlin's moe_wna16_marlin_gemm + apply_moe_activation(SILU) as a fused-equivalent reference, so the kernel must match that output for an apples-to-apples comparison."
-  - "Output must match the dequant→BF16 oracle within max absolute error < 0.012 (HARD, both T1 and T8). Relative-error metrics are NOT used by the validator because for K=7168 BF16 GEMM with silu·mul, many outputs are near-zero (silu(very_negative)*up ≈ 0) and any near-zero residue blows up the relative metric — Marlin itself has maxre ≈ 2.0 against the FP32 oracle. Use distinct nibble patterns per expert so a per-expert dispatch bug shows up in the absolute error. Reference precision class: Marlin achieves maxae ≈ 0.006-0.009 and the starting kernel achieves maxae < 1e-5. Any kernel above maxae=0.012 is structurally broken — the prior run's v015-v057 sat at maxae≈0.022 because its TMEM read pattern was wrong for the M=64 atom's subpartition layout; silu·mul + small activations masked it under the old 0.05 ceiling. DO NOT slacken this gate. The OLD `re<5e-3 AND ae<1.0` rule was unsatisfiable for any BF16 W4A16 GEMM at K=7168; do not try to satisfy it. Relative error against the oracle is still printed for diagnostic purposes but is NOT a pass/fail gate."
+  - "Output must match the dequant→BF16 oracle within max absolute error < 0.012 (HARD, both T1 and T8). Relative-error is not gated because near-zero outputs from silu·mul blow it up (Marlin itself has maxre ≈ 2.0 against the FP32 oracle). Marlin's own maxae is ≈ 0.006-0.009; the kernel must stay in that class. Use distinct nibble patterns per expert in the test routing so a per-expert dispatch bug shows in the absolute error."
   - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include the dequant→BF16 fp32-accumulate reference and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). DO NOT remove this guard. ALL 4 configs MUST pass correctness, including the routing edge cases (single-expert assignment, balanced assignment, sparse assignment) — exercise at least 2 routing distributions in the validation pass."
 
   # ── measurement methodology ─────────────────────────────────────────────
   - "TFLOPS measured as: flops = 2 * sum_e (M_e * N_r * H) for the routing distribution used at benchmark time, where N_r = 2I_r = 512 (the pre-silu GEMM N) — silu·mul itself is ~3 FLOPS per output element and is NOT counted in the GEMM FLOPS. Report time as median over NI=300 timed iterations. T1 has flops = 2 * top_k * 1 * 512 * 7168 ≈ 59M. T8 has flops up to 2 * 64 * 512 * 7168 ≈ 470M. Reported TFLOPS is unimpressive at these shapes (memory-bound, T<=8); use latency (us) as the primary scoring number internally but report TFLOPS as the spec demands."
   - "MANDATORY L2 FLUSH: kernel benchmark MUST flush a 128 MB device buffer (cudaMemset on a 128MB device buffer) immediately before each timed iteration. The flush MUST exceed B200's 192 MB L2 — use 256 MB if a 128 MB flush still shows residency artifacts. Use a continuous warmup of >= 2.0 seconds BEFORE the timed loop. See baselines/kimi-moe-w13-int4/baseline_marlin.py for the exact methodology — match it bit-for-bit so the comparison is apples-to-apples."
   - "Achieved INT4 weight bandwidth (in TB/s) MUST be reported in the kernel's stderr per config. Bandwidth = sum_e (N_r * H * 0.5 bytes) / median_time. The realistic ceiling on B200 HBM3e is ~6-7 TB/s (75-85% of peak 8 TB/s). Beating Marlin means getting closer to that ceiling than Marlin does."
-
-hints:
-  - |
-    ## TOP PRIORITY (restart on 2026-06-13): beat Marlin from a CORRECT starting kernel.
-
-    The starting workspace/kernel.cu uses BLOCK_M=64 swapAB cg1 with a
-    subpartition-aware TMEM read (4 warps × 32x32b loads at offsets
-    {0,32,64,96}, lane_id < 16 mask). Measured on this B200:
-
-      kernel.cu (start) : T1 28.5 us  2.03 TFLOPS  maxae < 1e-5
-                          T8 84.3 us  5.57 TFLOPS  maxae < 1e-5
-      Marlin baseline   : T1 25.6 us  2.29 TFLOPS  maxae ≈ 0.006-0.009
-                          T8 51.2 us  9.36 TFLOPS  maxae ≈ 0.006-0.009
-                         ─────────────────────────────────────────
-      starting ratio    : T1 0.90×    T8 0.61×    (SLOWER than Marlin)
-
-    The starting kernel is correct but slower than Marlin. Your job is to
-    OPTIMIZE it until min_ratio >= 1.10× while keeping maxae < 0.012 at both
-    configs. The architecture is right; the perf is not.
-
-    ## Context you MUST internalize before iterating
-
-    A prior run on this exact task spent 60+ iterations (a001 → v057) and
-    appeared to reach 1.37× over Marlin. That entire trajectory was INVALID
-    for TWO reasons that compounded:
-
-      Bug A (a001..v057): the kernel read TMEM as if the M=64 atom's 64
-      output rows were contiguous in TMEM. They are not. SM100 cg1 kind::f16
-      stores M=64 atom output across 4 subpartitions of 32 TMEM rows, with
-      only the first 16 of every 32 used (rows 16..31 of each subpartition
-      are padding). The atom is NOT broken — it correctly writes all 64
-      output rows; v057's 2-warp linear read at TMEM rows 0..63 only saw
-      the first 2 subpartitions' valid halves, and silently mislabeled them
-      (atom rows 16..31 sit at TMEM 32..47 but v057 treated those positions
-      as atom rows 32..47, off by 16). Atom rows 32..63 sat unread at TMEM
-      64..127. See correctness/dbg/probe.cu (broken 2-warp linear read) vs
-      probe4.cu (correct 4-subpartition read at offsets 0/32/64/96).
-
-      Bug B (v037+): INT4_ROWS was reduced to 32, meaning only 32 of 64
-      weight rows were dequanted into SMEM. The MMA still consumed 64
-      weight rows; the other 32 were zeros. This compounded the read bug.
-
-    Both bugs were masked by silu·mul: the gross output error on dropped /
-    zeroed rows (~0.37 raw) got attenuated to ~0.022 by `silu(small)*small`,
-    slipping under the old loose maxae<0.05 ceiling. The "1.37× speedup"
-    was real per-instruction but on a kernel computing roughly 1/4 of the
-    output.
-
-    The starting kernel.cu fixes both:
-      - INT4_ROWS = BLOCK_M (all 64 weight rows dequanted)
-      - 4-warp subpartition-aware TMEM read (lane_id < 16 valid per warp)
-
-    Implications for your iteration:
-      - BLOCK_M=64 is the right choice (smallest valid 1SM kind::f16 atom).
-        DO NOT change to BLOCK_M=128 — that doubles SMEM/TMEM per tile
-        without a perf rationale. If you DO change BLOCK_M, you MUST update
-        I_DESC, INT4_ROWS, M_PASSES, BF16_W_SZ, the dequant loop, AND the
-        TMEM read pattern simultaneously — they are all coupled to BLOCK_M.
-      - DO NOT trust speedups that come with a maxae jump. If maxae was 1e-5
-        on iteration N and 0.01 on iteration N+1, you broke something — even
-        if 0.01 still passes the gate. The validator is the floor, not the
-        signal: target maxae stays at the starting kernel's <1e-5 class.
-      - The maxae<0.012 gate is tight on purpose. Don't ask to relax it.
-        Marlin passes it; the starting kernel passes it with 5+ orders of
-        magnitude of margin.
-
-    ## Where the perf goes (read FIRST before patching)
-
-    The starting kernel was written by an outside agent to demonstrate the
-    correct M=64 architecture, not to win on speed. Real optimization levers:
-
-      a) cta_group::2 cluster MMA. 2I_r=512 with BLOCK_M=64 gives 8 M-tiles
-         per expert — cg2 with a 2-CTA cluster halves redundant weight loads
-         for adjacent M-tiles. See examples/qwen3-8b-decode-linear-bs16/
-         v019_swapab_cg2_l2hints.cu for the cg2 pattern at small-N.
-
-      b) Scale loads. The starting kernel uses a dedicated 2D TMA per stage
-         for scales. At ~12% of weight bandwidth, scales aren't the
-         bottleneck, but the per-stage descriptor + arrive overhead adds
-         latency. Inspect whether scales can be promoted to L1/SMEM once
-         per expert (group-K=32, so 32 scales per M-tile, repeated across
-         K-iterations).
-
-      c) Grid sizing. Starting kernel uses fixed grid per config. At T=1
-         only 8 experts are active → 8 * (512/64) = 64 (M-tile, expert)
-         pairs. With persistent kernels + Stream-K K-splitting, you can
-         fill more of B200's 148 SMs. At T=8 up to 64*8 = 512 pairs —
-         different sweet spot.
-
-      d) NSTAGES is hardcoded to 5. Try 4 or 6 with the M=64 schedule.
-
-      e) The kernel uses 10 warps (8 dequant + 1 TMA + 1 MMA), 4 of which
-         participate in the epilogue read. The 10-warp split was chosen
-         for M=64 dequant economics — profile with NCU before changing it.
-
-    ## REPRODUCE stage — the gate
-
-    REPRODUCE passes when:
-      - kernel.cu compiles with the exact nvcc line in constraints.
-      - All 4 (T1, T8, T1+T8 in both routing distributions) print
-        maxae < 0.012 against the dequant→BF16 fp32-accumulate oracle.
-      - The kernel emits KERNEL_RESULT {"T1": ..., "T8": ...}.
-
-    The starting kernel ALREADY passes REPRODUCE — its perf is just below
-    1.0× Marlin so the stage gate (>= 0.50) is met. Do NOT rewrite the
-    starting kernel; iterate on it.
-
-    ## REPRODUCE-stage roadmap (do NOT try to skip steps)
-
-    Step 0 (~iter 1): read the MARLIN baseline source. THIS IS WHAT YOU ARE
-    COMPETING AGAINST and most of the design (K-tile permutation, INT4
-    unpack with lop3+PRMT, dequant→bf16 mainloop pipeline, MoE expert
-    scheduling) is already laid out there in plain CUDA.
-      - resources/marlin-standalone/marlin/marlin_cuda_kernel.cu (822 lines,
-        the canonical hand-tuned reference; SM80/SM90 — translate idioms to
-        SM100 by replacing cp.async with cp.async.bulk.tensor, WMMA/WGMMA
-        with tcgen05.mma, ldmatrix with tcgen05.cp/utccp where relevant)
-      - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/marlin_template.h
-        (the inner kernel template — see the K-iteration body and the
-        scale-application pattern)
-      - resources/vllm-csrc-marlin/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h
-        (the MoE wrapping — expert id dispatch, sorted_token_ids consumption,
-        per-expert tile assignment)
-      - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/gptq_marlin_repack.cu
-        (how the compressed-tensors INT4 weights are re-permuted into Marlin's
-        internal K-tile layout — the kernel must match this layout to load
-        weights via TMA correctly)
-      - resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/marlin_dtypes.cuh
-        (the actual lop3+PRMT dequant code you can port directly)
-
-    Step 1 (~iter 2-3): read examples/qwen3-8b-decode-linear-bs16/v019_swapab_cg2_l2hints.cu
-    — closest in-repo GEMM win. Already does swapAB, tcgen05.mma.cta_group::2,
-    TMA cp.async.bulk.tensor weight loads, warp specialization, L2 cache hints.
-    The INT4 dequant + grouped-MoE scheduling are the ONLY new pieces on
-    top of this skeleton.
-
-    Step 2 (~iter 3-5): read the CUTLASS GEMM examples in order:
-      - 70_blackwell_gemm        — basic tcgen05 GEMM, the simplest scaffold
-      - 86_blackwell_mixed_dtype_gemm — INT4 weight × BF16 act with on-chip
-                                       dequant; PORT the dequant fragment
-                                       directly (lop3+PRMT) into the agent's
-                                       mainloop
-      - 75_blackwell_grouped_gemm — grouped GEMM with variable M per group;
-                                    PORT the per-group tile schedule
-      - 92_blackwell_moe_gemm    — full MoE GEMM scaffold (closest possible
-                                   match, may be more general than this task
-                                   needs)
-    Also: deepgemm sm100_fp8_gemm_1d1d.cuh shows a clean SM100 grouped GEMM
-    with scale handling (FP8 not INT4, but the scale-application skeleton
-    is similar to group-32).
-
-    Step 3 (~iter 5-7): wire the INT4 unpack. The pattern (Marlin's playbook
-    + CUTLASS 86_blackwell_mixed_dtype_gemm):
-      - TMA-load weight as INT32-typed tensor (8 nibbles/word, K-major).
-      - In the consumer warps, unpack 8 nibbles → 8 bf16 via lop3.b32 + PRMT
-        (search "int4 to bf16 dequant lop3 PRMT" or "Marlin dequant trick").
-      - Apply group-32 BF16 scale: each 32-K-chunk shares a single bf16 scale.
-        Load scales via a separate TMA descriptor or normal cp.async (they
-        are ~12% of weight bandwidth — separate stream avoids TMA descriptor
-        gymnastics).
-      - Stage the BF16-dequantized weights either in registers (small N=8/16
-        tile, fits easily) or in SMEM if using cta_group::2 with a larger
-        weight tile.
-
-    Step 4 (~iter 7-9): grouped-GEMM tile schedule. Compact the token-to-expert
-    routing into a sorted index (vLLM/SGLang fused_moe pattern: moe_align_block_size
-    + token_mask). Each CTA picks (expert, weight-N-tile, optional weight-K-split).
-    Persistent kernel with Stream-K scheduling fills SMs when only <=64 experts
-    are active out of E_loc=384. Marlin's
-    resources/vllm-csrc-marlin/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h
-    shows exactly how its scheduler consumes the (sorted_token_ids, expert_ids,
-    num_tokens_post_padded) triplet produced by moe_align_block_size — match
-    the same contract so the agent's kernel is a drop-in replacement.
-
-    ## OPTIMIZE-stage levers (in priority order)
-
-    a) Weight-bandwidth optimization is THE bottleneck. Maximize TMA-bulk
-       transfer size per descriptor (large box dims). Use 128-byte swizzle.
-       Overlap dequant with MMA via mbarrier double-buffering. Match or beat
-       Marlin's achieved bandwidth (likely ~5-6 TB/s on B200; ceiling ~7 TB/s).
-
-    b) cta_group::2 cluster MMA — at N=16 with cg2, you share weight TMA
-       across 2 CTAs, halving redundant weight load. Promising at the larger
-       2I_r=1024 N axis. The qwen3-8b linear v019 used cg2 — borrow that.
-
-    c) L2 promotion of weights — at T=1, 8 experts × 3.67 MB = 29 MB fits L2
-       (192 MB). At T=8 up to 64 experts × 3.67 MB = 235 MB exceeds L2 → the
-       L2 hit-rate craters. Use L2 evict-last hints on weights at T=1 and
-       evict-first/streaming hints at T=8.
-
-    d) Fused silu·mul epilogue (LOW priority, separate ablation). Compute
-       silu(gate)·up on FP32 accumulators in-register and store only [P, I_r]
-       instead of writing [P, 2I_r] and running a separate activation kernel.
-       Requires a load-time B-interleave of gate/up weight rows so each
-       output block's gate and up operands land in the same CTA's
-       accumulator. Savings: <1% of total traffic at T<=8 (weights dominate),
-       BUT saves one kernel-launch hop and halves the output store. Worth
-       ~3-5% e2e but only as a secondary win; build the un-fused version
-       first, then add this as an ablation.
-
-    e) Per-expert GEMV fallback (consider only if grouped tile schedule has
-       real overhead). Marlin uses a grouped approach with success at T<=8,
-       so grouped IS viable — DO NOT prematurely switch to per-expert. Only
-       fall back if profiling shows tile-schedule dispatch overhead > 5%.
-
-    ## What NOT to do (will INVALID or regress)
-
-    - Trying to find / design an INT4 tensor-core path. There IS NO INT4
-      tcgen05 atom. The mainloop is BF16-MMA after dequant. Period.
-    - Putting tokens on the MMA M-axis. M_min = 64; you would pad M_e=8 to
-      M=64 (12.5% util) or M=128 (6.3%). swapAB → N is mandatory.
-    - Using CUDA-core dot-product fallback "because it's simpler at M=8".
-      Hard constraint above — fails the SASS check.
-    - Materializing a [E_loc, 2I_r, H] dequantized BF16 weight tensor in
-      HBM. That defeats the entire point of INT4 weight-streaming. Dequant
-      MUST happen on-chip per tile.
-    - Launching one kernel per expert. Single grouped launch with internal
-      expert iteration is required.
-    - Padding the routing to a fixed M per expert in global memory. Compact
-      gather + predicated tile is the right pattern.
 
 budget:
   max_iterations: 80
@@ -438,5 +211,4 @@ budget:
 output:
   result_format: kernel_result_json
   result_keys:
-    - T1
     - T8

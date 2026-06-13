@@ -95,7 +95,7 @@ problem:
       random-input distribution).
 
 baseline:
-  source: "vLLM Marlin MoE. Run: /home/xinhaoc/vllm-venv/bin/python3 baselines/kimi-moe-w13-int4/baseline_marlin.py — calls ops.moe_wna16_marlin_gemm + apply_moe_activation(MoEActivation.SILU) directly to time the w13+silu·mul fused operation in isolation (NOT the full fused_marlin_moe, which also includes w2 down-proj)."
+  source: "vLLM Marlin MoE. Run: /home/xinhaoc/vllm-venv/bin/python3 baselines/kimi-moe-w13-int4/baseline_marlin.py — calls ops.moe_wna16_marlin_gemm + apply_moe_activation(MoEActivation.SILU) directly to time the w13+silu·mul fused operation in isolation (NOT the full fused_marlin_moe, which also includes w2 down-proj). Marlin source code (read these to learn the algorithm before designing your kernel): resources/marlin-standalone/marlin/marlin_cuda_kernel.cu (canonical 822-line single-file kernel); resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/marlin_template.h (inner K-iteration body + INT4 unpack); resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/marlin_dtypes.cuh (lop3+PRMT INT4→BF16 dequant trick); resources/vllm-csrc-marlin/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h (MoE wrapper: expert dispatch + sorted_token_ids); resources/vllm-csrc-marlin/csrc/libtorch_stable/quantization/marlin/gptq_marlin_repack.cu (the K-tile weight permutation Marlin needs)."
   reference_commit: "vllm 0.20.1 (catalyst /home/xinhaoc/vllm-venv); Marlin permuted INT4 weight layout via gptq_marlin_moe_repack."
   measured_on_b200_jun_2026:
     T1:  { latency_us: 25.60, tflops: 2.29, weight_bw_tbs: 0.57 }
@@ -138,10 +138,6 @@ configs:
     weight: 1.0
 
 scoring: min_ratio
-
-stage_gate:
-  ratio: 0.50
-  strict: false
 
 constraints:
   # ── compilation + scoring infra ─────────────────────────────────────────

@@ -194,15 +194,16 @@ constraints:
   - "CRITICAL HARDWARE FACT: SM100 tcgen05.mma does NOT support int4/uint4 inputs. Supported kinds: f16/bf16/tf32, i8/u8, fp8 (e4m3/e5m2), fp6 (e2m3/e3m2), fp4 (e2m1). There is NO INT4 tensor-core path. INT4 is WEIGHT-STORAGE-ONLY: the mainloop MUST dequantize INT4 → BF16 on-chip (in registers or TMEM staging), then run a BF16 tcgen05.mma. The INT4 format buys WEIGHT BANDWIDTH only; do NOT design around a nonexistent INT4 MMA atom."
   - "All matmul operations MUST go through tcgen05.mma (tcgen05.mma.cta_group::1.kind::f16 with bf16 operands, or cta_group::2 variant). If the compiled SASS contains FFMA in the K-iteration mainloop after dequant, the kernel is INVALID. CUDA-core fallback is forbidden."
   - "All weight (INT4-packed-as-INT32) loads MUST use TMA (cp.async.bulk.tensor with mbarrier completion). Element-wise __ldg or per-thread cp.async.ca per-INT32-word loops are INVALID for the weight stream. The TMA tensor descriptor may declare the weight as INT32 elements — TMA does not natively know INT4; that is fine, just transfer the int32-packed bytes and unpack on-chip."
-  - "swapAB is REQUIRED: tokens (M_e <= 8) MUST land on the MMA N-axis (N=8 with cta_group::1, or N=16 with cta_group::2). Putting tokens on M and padding to M=64/128 wastes 87-94% of MMA capacity at T<=8 and is INVALID. The weight axis (2I_r = 512 or 1024) becomes the MMA M-axis (filled to multiples of 64 or 128 — naturally aligned). Express via descriptor transpose bits / Major::K Major::MN selection — NO physical data transpose of the weight tensor."
+  - "swapAB is REQUIRED: tokens (M_e <= 8) MUST land on the MMA N-axis (N=8 with cta_group::1, or N=16 with cta_group::2). Putting tokens on M and padding to M=64/128 wastes 87-94% of MMA capacity at T<=8 and is INVALID. The weight axis (2I_r = 512 or 1024) becomes the MMA M-axis (filled to multiples of 128 — see next constraint). Express via descriptor transpose bits / Major::K Major::MN selection — NO physical data transpose of the weight tensor."
   - "Warp specialization REQUIRED. At least 3 distinct warp roles dispatched via warp-id: (a) TMA producer (weight + activation + scale loads), (b) MMA launcher (single-thread tcgen05.mma issue), (c) dequant + softmax-equivalent + epilogue consumer. Single-role kernels (every warp does everything) are INVALID. Use setmaxnreg.inc / setmaxnreg.dec to split registers between roles."
+  - "BLOCK_M (MMA M-block) MUST be >= 128. The M=64 atom encoded by I_DESC bit `(BLOCK_M>>4 << 24)` with BLOCK_M=64 is OBSERVED-BROKEN on this B200/CUDA 13.x toolchain: a controlled probe (correctness/dbg/probe.cu, identity matmul A[m,k]=m × B=1) shows it writes correct values only to TMEM rows 0-15 and 32-47, leaving rows 16-31 and 48-63 ZERO. The same probe with BLOCK_M=128 (probe3.cu) returns the full identity. The prior kimi-moe-w13 run (a001 → v057) used BLOCK_M=64 from its first commit and never escaped this footgun — its 'wins over Marlin' were only computing ~1/4 of the real output, with silu·mul squashing the rest under a loose maxae<0.05 gate. Use BLOCK_M=128 (M=128 atom). The starting kernel.cu already does this. DO NOT 'optimize' by reducing BLOCK_M to 64 to gain occupancy or shave SMEM — that path is a known dead end documented in PROGRESS.md."
   - "Empty-expert skip REQUIRED. The tile schedule MUST skip experts with M_e = 0. A naive schedule that launches CTAs for all E_loc experts (waste at T<=8 where <=64 are active) is INVALID."
 
   # ── numerics ────────────────────────────────────────────────────────────
   - "INT4 nibble decode: nibbles are stored offset-8 unsigned. Convert to signed via signed_value = raw_nibble - 8, giving range [-8, 7]. Apply per-row group-32 BF16 scale to obtain the BF16 weight element. Group boundaries: scale index for K-position k of row r is scales[r, k/32]. Do this conversion ON-CHIP after TMA load; do NOT do it in a pre-pass kernel."
   - "BF16 input activations + BF16 dequantized weights (after INT4→BF16). FP32 accumulator inside the MMA. BF16 output."
   - "FUSED silu·mul epilogue is REQUIRED. The kernel MUST emit [num_routed_pairs, I_r=256] BF16 with values silu(gate) * up, where gate is the first I_r=256 columns of the GEMM output and up is the second I_r=256 columns. Emitting an unfused [P, 2I_r=512] intermediate (separate activation kernel afterward) is INVALID — the baseline measures Marlin's moe_wna16_marlin_gemm + apply_moe_activation(SILU) as a fused-equivalent reference, so the kernel must match that output for an apples-to-apples comparison."
-  - "Output must match the dequant→BF16 oracle within max absolute error < 0.05 (HARD). Relative-error metrics are NOT used by the validator because for K=7168 BF16 GEMM with silu·mul, many outputs are near-zero (silu(very_negative)*up ≈ 0) and any near-zero residue blows up the relative metric — Marlin itself has maxre ≈ 2.0 against the FP32 oracle. Use distinct nibble patterns per expert so a per-expert dispatch bug shows up in the absolute error. Reference precision target: Marlin achieves maxae ≈ 0.006-0.009 on this workload — the kernel should aim for the same precision CLASS (maxae < 0.012, ~1.3× Marlin), not just to clear the 0.05 ceiling. Note: the OLD `re<5e-3 AND ae<1.0` rule was unsatisfiable for any BF16 W4A16 GEMM at K=7168; do not try to satisfy it. Relative error against the oracle is still printed for diagnostic purposes but is NOT a pass/fail gate."
+  - "Output must match the dequant→BF16 oracle within max absolute error < 0.012 (HARD, both T1 and T8). Relative-error metrics are NOT used by the validator because for K=7168 BF16 GEMM with silu·mul, many outputs are near-zero (silu(very_negative)*up ≈ 0) and any near-zero residue blows up the relative metric — Marlin itself has maxre ≈ 2.0 against the FP32 oracle. Use distinct nibble patterns per expert so a per-expert dispatch bug shows up in the absolute error. Reference precision class: Marlin achieves maxae ≈ 0.006-0.009 and the starting kernel (M=128 atom) achieves maxae < 1e-5. Any kernel above maxae=0.012 is structurally broken — the prior run's v015-v057 sat at maxae≈0.022 because the M=64 MMA atom only writes half of TMEM rows; silu·mul + small activations masked it under the old 0.05 ceiling. DO NOT slacken this gate. The OLD `re<5e-3 AND ae<1.0` rule was unsatisfiable for any BF16 W4A16 GEMM at K=7168; do not try to satisfy it. Relative error against the oracle is still printed for diagnostic purposes but is NOT a pass/fail gate."
   - "MANDATORY OUTPUT VALIDATION: kernel.cu MUST include the dequant→BF16 fp32-accumulate reference and emit 'INVALID' for any failing config (parsed as 0.0 TFLOPS). DO NOT remove this guard. ALL 4 configs MUST pass correctness, including the routing edge cases (single-expert assignment, balanced assignment, sparse assignment) — exercise at least 2 routing distributions in the validation pass."
 
   # ── measurement methodology ─────────────────────────────────────────────
@@ -212,50 +213,95 @@ constraints:
 
 hints:
   - |
-    ## TOP PRIORITY (resuming from v040 on 2026-06-13): close the precision gap to Marlin.
+    ## TOP PRIORITY (restart on 2026-06-13): beat Marlin from a CORRECT starting kernel.
 
-    v040 is a working kernel saved in workspace/kernel.cu, score min_ratio = 1.285
-    (T1 = 132.4%, T8 = 128.5% of Marlin). However, INDEPENDENT verification on the
-    same B200 + the dequant→BF16 fp32-accumulate oracle shows:
+    The starting workspace/kernel.cu is a verified-correct kernel using the
+    BLOCK_M=128 swapAB cg1 architecture. Measured on this B200:
 
-      v040 :  T1 maxae = 0.0232    T8 maxae = 0.0217
-      Marlin:  T1 maxae = 0.0064    T8 maxae = 0.0091
-              ─────────────────────────────────────────
-      v040 is 3.6× (T1) / 2.4× (T8) NOISIER than Marlin.
+      kernel.cu (start) : T1 28.5 us  2.03 TFLOPS  maxae < 1e-5
+                          T8 84.3 us  5.57 TFLOPS  maxae < 1e-5
+      Marlin baseline   : T1 25.6 us  2.29 TFLOPS  maxae ≈ 0.006-0.009
+                          T8 51.2 us  9.36 TFLOPS  maxae ≈ 0.006-0.009
+                         ─────────────────────────────────────────
+      starting ratio    : T1 0.90×    T8 0.61×    (SLOWER than Marlin)
 
-    Both pass the new validator (ae < 0.05) but the kernel is measurably less
-    precise than the production baseline it's beating in latency. Investigate
-    and FIX. Likely sources, in descending order of suspicion:
+    The starting kernel is correct but slower than Marlin. Your job is to
+    OPTIMIZE it until min_ratio >= 1.10× while keeping maxae < 0.012 at both
+    configs. The architecture is right; the perf is not.
 
-      1) Split-K reduction at T=1 uses atomicAdd into FP32 workspace
-         (k_split=4, grid=128). The atomic FP32 adds happen in non-deterministic
-         order → 4 partial sums of ~1792 elements each are summed in arbitrary
-         order. Marlin uses a separate fp32-reduce kernel with FIXED order
-         (vllm's use_fp32_reduce=True path) — that's the precision trick to copy.
-         Action: replace atomicAdd with a separate ordered reduction kernel
-         (or use Stream-K with deterministic CTA-id ordering).
+    ## Context you MUST internalize before iterating
 
-      2) MMA tile/K-iteration ordering. The swapAB orientation (tokens on N=8,
-         weights on M=64) is correct, but the K-iteration grouping inside the
-         tcgen05.mma calls may chunk the 7168-K dot product differently from
-         Marlin's, producing different rounding patterns. Lower priority — at
-         T=8 (no split-K) v040 still has 2.4× more maxae, so the K-ordering
-         contributes a real share.
+    A prior run on this exact task spent 60+ iterations (a001 → v057) and
+    appeared to reach 1.37× over Marlin. That entire trajectory was INVALID:
+    the kernel used BLOCK_M=64 (the M=64 tcgen05.mma atom), which on this
+    B200/CUDA 13.x toolchain only writes correct values to 32 of every 64
+    output rows. The other rows came out as zeros. Because the kernel
+    multiplies its output by silu(gate) — and silu of small values is small —
+    the gross GEMM error of ~0.37 collapsed to a post-silu maxae ≈ 0.022,
+    which slipped under the old maxae<0.05 ceiling. The "1.37× speedup" was
+    fake: the kernel was doing ~1/4 of the real work.
 
-      3) Verify nothing in the dequant or SMEM staging accidentally drops to
-         FP16 precision. cuobjdump SASS check: look for HFMA2/HMUL2/HADD2 in
-         the mainloop OUTSIDE the dequant (the dequant should use them — but
-         the accumulator pipe must stay FFMA32 / tcgen05.mma fp32 accum).
+    The bug is reproducible: see correctness/dbg/probe.cu (BLOCK_M=64 identity
+    matmul → rows 16-31, 48-63 are zero) vs correctness/dbg/probe3.cu
+    (BLOCK_M=128 → full identity).
 
-    Concrete goal:
-      - Bring maxae below 0.012 at both T1 and T8 (within 1.3× of Marlin's
-        ~0.009) WITHOUT regressing the latency win (keep min_ratio >= 1.25).
-      - If you can't close the gap without latency cost, document the
-        precision/latency tradeoff explicitly in progress.md and stop —
-        don't ship a noisier-than-Marlin kernel under the guise of beating it.
+    Implications for your iteration:
+      - DO NOT use BLOCK_M=64. The hard constraint forbidding it is in the
+        constraints block. The M=128 atom is the smallest correct option.
+      - DO NOT trust speedups that come with a maxae jump. If maxae was 1e-5
+        on iteration N and 0.01 on iteration N+1, you broke something — even
+        if 0.01 still passes the gate.
+      - The maxae<0.012 gate is tight on purpose. Don't ask to relax it.
+        Marlin passes it; the starting kernel passes it with 5+ orders of
+        magnitude of margin; you should be able to too.
 
-    Skip the OR-vs-AND validator workaround. The validator now uses AND with
-    a saner epsilon (see constraints) — both v040 and Marlin pass it.
+    ## Where the perf goes (read FIRST before patching)
+
+    The starting kernel was written by an outside agent to demonstrate the
+    correct architecture, not to win on speed. It has known inefficiencies
+    you can attack:
+
+      a) Single-CTA MMA (cg1) with BLOCK_M=128 forces a BLOCK_M-aligned
+         iteration that doesn't fully overlap dequant with TMA. Look at
+         examples/qwen3-8b-decode-linear-bs16/v019_swapab_cg2_l2hints.cu —
+         the cg2 + cluster pattern halves redundant weight loads when the
+         M dimension exceeds one CTA's BLOCK_M. At 2I_r=512, BLOCK_M=128
+         gives 4 M-tiles per expert — cg2 with M=128 atom and 2-CTA cluster
+         could be a big win. (cg2 with M=128 is also worth probing for the
+         same correctness reasons cg1+M=64 fails.)
+
+      b) Scale loads. The starting kernel loads scales via a dedicated 2D
+         TMA per stage. At 12% of weight bandwidth, scales aren't the
+         bottleneck, but the descriptor + arrive overhead per stage adds
+         latency. Inspect whether scales can be promoted to L1/SMEM once
+         per expert (group-K=32, so 32 scales per M-tile, repeated across
+         K-iterations).
+
+      c) Grid sizing. Starting kernel uses fixed grid sizing per config.
+         At T=1 only 8 experts are active → 8 * (512/128) = 32 (M-tile,
+         expert) pairs. With persistent kernels + Stream-K K-splitting,
+         you can fill more SMs at T=1 (B200 has 148 SMs). At T=8 up to
+         64*4 = 256 (M-tile, expert) pairs — different sweet spot.
+
+      d) NSTAGES is hardcoded to 5. Try 4 or 6 with the M=128 schedule.
+
+      e) The kernel uses 10 warps (8 dequant + 1 TMA + 1 MMA). With M=128
+         doubling the dequant work per stage vs M=64, this may be too few
+         warps or too many. Profile with NCU.
+
+    None of these justify reverting to M=64. None of them.
+
+    ## REPRODUCE stage — the gate
+
+    REPRODUCE passes when:
+      - kernel.cu compiles with the exact nvcc line in constraints.
+      - All 4 (T1, T8, T1+T8 in both routing distributions) print
+        maxae < 0.012 against the dequant→BF16 fp32-accumulate oracle.
+      - The kernel emits KERNEL_RESULT {"T1": ..., "T8": ...}.
+
+    The starting kernel ALREADY passes REPRODUCE — its perf is just below
+    1.0× Marlin so the stage gate (>= 0.50) is met. Do NOT rewrite the
+    starting kernel; iterate on it.
 
     ## REPRODUCE-stage roadmap (do NOT try to skip steps)
 

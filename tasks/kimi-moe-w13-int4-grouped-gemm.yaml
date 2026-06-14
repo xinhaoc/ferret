@@ -166,6 +166,68 @@ constraints:
   - "MANDATORY L2 FLUSH: kernel benchmark MUST flush a 128 MB device buffer (cudaMemset on a 128MB device buffer) immediately before each timed iteration. The flush MUST exceed B200's 192 MB L2 — use 256 MB if a 128 MB flush still shows residency artifacts. Use a continuous warmup of >= 2.0 seconds BEFORE the timed loop. See baselines/kimi-moe-w13-int4/baseline_marlin.py for the exact methodology — match it bit-for-bit so the comparison is apples-to-apples."
   - "Achieved INT4 weight bandwidth (in TB/s) MUST be reported in the kernel's stderr per config. Bandwidth = sum_e (N_r * H * 0.5 bytes) / median_time. The realistic ceiling on B200 HBM3e is ~6-7 TB/s (75-85% of peak 8 TB/s). Beating Marlin means getting closer to that ceiling than Marlin does."
 
+hints:
+  - |
+    ## CRITICAL: validator was silently passing NaN output. You were cheating without knowing.
+
+    Your tagged versions v022 through v059 have been independently audited (see
+    correctness/w13_audit.md not in workspace, but findings below). Every version
+    from v022 onward produces ALL-NaN output for kernel.cu. The old validator's
+    `if (ae > maxae)` was silently no-op on NaN (IEEE 754: NaN > x is false), so
+    maxae stayed at 0.000000 and the gate passed. Your "11.36 TFLOPS / 1.21× Marlin"
+    claim at v047/v059 is fabricated — kernel is fast because it computes NaN garbage.
+
+    The validator in workspace/kernel.cu has been patched externally:
+    - Added isfinite(g) && isfinite(r2) check; NaN now counts as error.
+    - Added nan_count to output, valid requires nan_count == 0.
+
+    On your next iter you WILL see INVALID (with nan=16384/16384 reported).
+
+    ## Four bugs identified
+
+    Bug 1 (v022): lop3 immediate. The intrinsic `lop3.b32 ..., 0xfa` was for
+    (a & b) | c, but 0xfa is the LUT for (a | c). Correct LUT is **0xEA**.
+    Already patched in workspace/kernel.cu externally.
+
+    Bug 2 (v036, "interleaved gate+up"): scale TMA loads 128 channels per K-group
+    (BLOCK_M*2), but dequant code reads with old stride BLOCK_M and half-offset
+    SCALE_HALF=512. Correct: K-stride BLOCK_M*2, half-offset BLOCK_M*2 (= 128 bytes).
+    NOT YET patched — fix yourself.
+
+    Bug 3 (v046, TMEM-A intro): in the dequant warp, each thread reads only
+    `uint16_t q_lo_2b` (2 bytes = 4 nibbles). But `dequant_pair` expects uint32_t
+    and uses MASK=0x000f000f which extracts bits[0..3] AND bits[16..19].
+    Zero-extension of uint16_t makes bits[16..19] = 0, so every dequanted cell
+    is (bf16(nibble), bf16(0)) — half the K data is zero. Read uint32_t (4 bytes
+    = 8 nibbles) and emit TWO tcgen05.st calls per group (one at st_col=grp*16,
+    one at grp*16+8) to fill the full 16 cols. NOT YET patched.
+
+    Bug 4 (v046, K-layout in TMEM cells): EVEN AFTER fixing bugs 1+2+3, output
+    still has maxae ≈ 0.021 because the lane→(M-row, K-col) mapping for
+    `tcgen05.st.16x256b.x1.b32` does not produce the K-position layout that
+    `SM100_MMA_F16BF16_TS` expects to read. The exact correct mapping is
+    undocumented in CUTLASS C++ headers (only in Python CuTeDSL). You will
+    need to derive it empirically: run a controlled probe with A=identity
+    (e.g. A[m,k] = m*256+k), B=identity, single MMA, dump TMEM via tcgen05.ld,
+    infer which (lane, reg_idx) maps to which (M-row, K-col). This is
+    research-grade and may take many iters.
+
+    ## Recommended path
+
+    1. Run kernel as-is on iter 1. It will print INVALID and nan=16384/16384.
+       This confirms the validator now catches the bug.
+    2. Best fast-recovery: revert to v021 (last fully-honest tag, 0.834× of Marlin)
+       OR apply lop3 fix to v022 (already done in current kernel.cu) to recover
+       to 0.86× of Marlin honestly. This is 8.075 TFLOPS, validator passes.
+    3. From there, you may attempt TMEM-A again — but DO NOT trust any version
+       past v021 in your git tags as a starting point for TMEM-A logic. They
+       carry bug 3 (uint16_t read) and bug 4 (K-layout). Both must be fixed.
+    4. Specifically for bug 4: write a standalone probe BEFORE re-doing TMEM-A.
+       Verify each (lane, reg_idx) → (M-row, K-position) mapping with an
+       identity input. The agent's "from empirical test" comment in v046 line 270
+       was incomplete — the mapping it documents is only for M-row direction;
+       the K-position pairing per cell was not verified.
+
 budget:
   max_iterations: 80
   max_wall_minutes: 360
